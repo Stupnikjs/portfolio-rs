@@ -1,0 +1,2421 @@
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : cost_basis.rs
+# Chemin relatif : ledger/cost_basis.rs
+################################################################################
+
+//! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
+//! revient) par méthode FIFO, et du P&L réalisé à la vente.
+//!
+//! FIFO plutôt que coût moyen pondéré : méthode retenue par défaut par
+//! l'administration fiscale française pour les cessions de valeurs
+//! mobilières.
+//!
+//! Le coût/produit de chaque transaction est dérivé de `value_eur` (champ
+//! immutable qui fait autorité) plutôt que de `quantity * price` : `price`
+//! est optionnel et parfois exprimé dans la devise locale de l'actif
+//! plutôt qu'en EUR (cas XTB).
+
+use std::collections::{HashMap, VecDeque};
+
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+
+use crate::schema::TransactionKind;
+use crate::store::serialize::TxStore;
+
+const EPSILON: f64 = 1e-12;
+
+fn unit_value_eur(quantity: f64, value_eur: f64) -> Result<f64> {
+    if quantity <= 0.0 {
+        return Err(anyhow!("quantity doit être positive, reçu {quantity}"));
+    }
+    Ok(value_eur / quantity)
+}
+
+/// Un lot FIFO : une tranche de quantité acquise à un prix donné.
+#[derive(Debug, Clone)]
+pub struct Lot {
+    pub quantity: f64,
+    pub unit_cost_eur: f64,
+    pub acquired_at: DateTime<Utc>,
+    pub external_id: Option<String>,
+}
+
+/// Résultat d'une vente rapprochée avec un ou plusieurs lots FIFO.
+#[derive(Debug, Clone)]
+pub struct RealizedGain {
+    pub symbol: String,
+    pub sell_time: DateTime<Utc>,
+    pub quantity: f64,
+    pub proceeds_eur: f64,
+    pub cost_eur: f64,
+    pub pnl_eur: f64,
+    pub external_id: Option<String>,
+    pub lots_consumed: Vec<Lot>,
+    /// True si la vente dépasse les lots connus (transfert entrant non
+    /// tracé, données historiques incomplètes...).
+    pub incomplete: bool,
+}
+
+/// Sortie complète du calcul FIFO pour un wallet.
+#[derive(Debug, Default)]
+pub struct CostBasisResult {
+    pub open_lots: HashMap<String, Vec<Lot>>,
+    pub realized_gains: Vec<RealizedGain>,
+    pub fees_eur_by_symbol: HashMap<String, f64>,
+}
+
+impl CostBasisResult {
+    pub fn open_quantity(&self, symbol: &str) -> f64 {
+        self.open_lots.get(symbol).map(|lots| lots.iter().map(|l| l.quantity).sum()).unwrap_or(0.0)
+    }
+
+    /// Coût de revient total des lots encore ouverts pour `symbol`.
+    pub fn open_cost_basis(&self, symbol: &str) -> f64 {
+        self.open_lots
+            .get(symbol)
+            .map(|lots| lots.iter().map(|l| l.quantity * l.unit_cost_eur).sum())
+            .unwrap_or(0.0)
+    }
+
+    /// Prix de revient moyen par unité sur les lots ouverts (None si rien détenu).
+    pub fn average_cost(&self, symbol: &str) -> Option<f64> {
+        let qty = self.open_quantity(symbol);
+        if qty <= 0.0 {
+            return None;
+        }
+        Some(self.open_cost_basis(symbol) / qty)
+    }
+
+    pub fn total_realized_pnl(&self, symbol: Option<&str>) -> f64 {
+        self.realized_gains
+            .iter()
+            .filter(|g| symbol.map_or(true, |s| g.symbol == s))
+            .map(|g| g.pnl_eur)
+            .sum()
+    }
+
+    pub fn total_fees(&self, symbol: Option<&str>) -> f64 {
+        match symbol {
+            Some(s) => *self.fees_eur_by_symbol.get(s).unwrap_or(&0.0),
+            None => self.fees_eur_by_symbol.values().sum(),
+        }
+    }
+}
+
+/// Rejoue les transactions du wallet dans l'ordre chronologique et
+/// applique la méthode FIFO : chaque SELL/WITHDRAW consomme les lots
+/// BUY/DEPOSIT les plus anciens en premier.
+///
+/// `at = None` -- comme pour `holdings_at` -- rejoue toutes les
+/// transactions connues.
+///
+/// Les FEE ne sont pas rattachés à un lot précis : accumulés séparément
+/// par actif (`fees_eur_by_symbol`) -- à soustraire soi-même du P&L pour
+/// un résultat net de frais.
+///
+/// Si une vente dépasse la quantité connue en lots ouverts, le reliquat
+/// est valorisé à un coût de 0 et le `RealizedGain` correspondant est
+/// marqué `incomplete = true` -- son `pnl_eur` est donc surestimé d'autant.
+pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<CostBasisResult> {
+    let mut lots: HashMap<String, VecDeque<Lot>> = HashMap::new();
+    let mut realized: Vec<RealizedGain> = Vec::new();
+    let mut fees: HashMap<String, f64> = HashMap::new();
+
+    let mut transactions: Vec<&crate::schema::Transaction> = tx_store.transactions.iter().collect();
+    transactions.sort_by_key(|tx| tx.time);
+
+    for tx in transactions {
+        if let Some(at) = at {
+            if tx.time > at {
+                break;
+            }
+        }
+
+        let symbol = tx.asset.symbol.clone();
+
+        match tx.kind {
+            TransactionKind::Buy | TransactionKind::Deposit => {
+                let queue = lots.entry(symbol).or_default();
+                queue.push_back(Lot {
+                    quantity: tx.quantity,
+                    unit_cost_eur: unit_value_eur(tx.quantity, tx.value_eur)?,
+                    acquired_at: tx.time,
+                    external_id: tx.external_id.clone(),
+                });
+            }
+            TransactionKind::Sell | TransactionKind::Withdraw => {
+                let queue = lots.entry(symbol.clone()).or_default();
+                let mut remaining = tx.quantity;
+                let mut consumed: Vec<Lot> = Vec::new();
+                let mut cost_eur = 0.0;
+                let mut incomplete = false;
+
+                while remaining > EPSILON {
+                    let Some(lot) = queue.front_mut() else { break };
+                    let take = lot.quantity.min(remaining);
+
+                    cost_eur += take * lot.unit_cost_eur;
+                    consumed.push(Lot {
+                        quantity: take,
+                        unit_cost_eur: lot.unit_cost_eur,
+                        acquired_at: lot.acquired_at,
+                        external_id: lot.external_id.clone(),
+                    });
+
+                    lot.quantity -= take;
+                    remaining -= take;
+                    if lot.quantity <= EPSILON {
+                        queue.pop_front();
+                    }
+                }
+
+                if remaining > EPSILON {
+                    // Pas de lot connu pour couvrir le reliquat : coût
+                    // inconnu, traité comme 0 -- signalé via `incomplete`
+                    // plutôt que silencieusement absorbé dans le P&L.
+                    consumed.push(Lot {
+                        quantity: remaining,
+                        unit_cost_eur: 0.0,
+                        acquired_at: tx.time,
+                        external_id: None,
+                    });
+                    incomplete = true;
+                }
+
+                let proceeds_eur = tx.value_eur;
+                realized.push(RealizedGain {
+                    symbol,
+                    sell_time: tx.time,
+                    quantity: tx.quantity,
+                    proceeds_eur,
+                    cost_eur,
+                    pnl_eur: proceeds_eur - cost_eur,
+                    external_id: tx.external_id.clone(),
+                    lots_consumed: consumed,
+                    incomplete,
+                });
+            }
+            TransactionKind::Fee => {
+                *fees.entry(symbol).or_insert(0.0) += tx.value_eur;
+            }
+        }
+    }
+
+    let open_lots: HashMap<String, Vec<Lot>> = lots
+        .into_iter()
+        .filter(|(_, queue)| !queue.is_empty())
+        .map(|(symbol, queue)| (symbol, queue.into_iter().collect()))
+        .collect();
+
+    Ok(CostBasisResult { open_lots, realized_gains: realized, fees_eur_by_symbol: fees })
+}
+
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : mod.rs
+# Chemin relatif : ledger/mod.rs
+################################################################################
+
+pub mod positions;
+pub mod cost_basis;
+pub mod portfolio;
+
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : portfolio.rs
+# Chemin relatif : ledger/portfolio.rs
+################################################################################
+
+//! Portage de src/ledger/portfolio.py -- valorisation du portefeuille à
+//! une date donnée. Combine les positions (quantités) avec les prix de
+//! marché historiques.
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+
+use crate::ledger::positions::holdings_at;
+use crate::market::prices::historical_price_eur;
+use crate::schema::AssetKind;
+use crate::store::serialize::TxStore;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AssetSnapshot {
+    pub symbol: String,
+    pub quantity: f64,
+    pub price_eur: f64,
+    pub value_eur: f64,
+    pub kind: AssetKind,
+    pub ticker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PortfolioSnapshot {
+    pub date: String,
+    pub total_value_eur: f64,
+    pub assets: Vec<AssetSnapshot>,
+}
+
+pub fn portfolio_snapshot_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> PortfolioSnapshot {
+    let at = at.unwrap_or_else(Utc::now);
+
+    let holdings = holdings_at(tx_store, Some(at));
+    let mut total_value_eur = 0.0;
+    let mut details: Vec<AssetSnapshot> = Vec::new();
+
+    for (symbol, quantity) in holdings {
+        if quantity.abs() < 1e-12 {
+            continue;
+        }
+
+        let asset = tx_store.assets.get(&symbol);
+        let ticker = asset.and_then(|a| a.identifiers.ticker.clone());
+        let kind = asset.map(|a| a.kind).unwrap_or(AssetKind::Crypto); // fallback défensif
+
+        let price_eur = historical_price_eur(&symbol, at, kind, ticker.as_deref());
+        let value_eur = quantity * price_eur;
+        total_value_eur += value_eur;
+
+        details.push(AssetSnapshot { symbol, quantity, price_eur, value_eur, kind, ticker });
+    }
+
+    details.sort_by(|a, b| b.value_eur.partial_cmp(&a.value_eur).unwrap_or(std::cmp::Ordering::Equal));
+
+    PortfolioSnapshot { date: at.format("%Y-%m-%d").to_string(), total_value_eur, assets: details }
+}
+
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : positions.rs
+# Chemin relatif : ledger/positions.rs
+################################################################################
+
+//! Portage de src/ledger/positions.py -- reconstruction des positions
+//! (quantités détenues) à partir du log de transactions. Pattern
+//! event-sourcing : serialized_tx.json ne stocke jamais de solde calculé,
+//! seulement les transactions brutes. `holdings_at` est la seule source
+//! de vérité pour "combien j'ai de X à telle date".
+
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+
+use crate::schema::TransactionKind;
+use crate::store::serialize::TxStore;
+
+fn sign(kind: TransactionKind) -> i8 {
+    match kind {
+        TransactionKind::Buy => 1,
+        TransactionKind::Deposit => 1,
+        TransactionKind::Sell => -1,
+        TransactionKind::Withdraw => -1,
+        TransactionKind::Fee => -1,
+    }
+}
+
+/// Quantité détenue par symbole à la date `at` (incluse). `at = None`
+/// signifie "maintenant" au sens de "toutes les transactions connues".
+///
+/// Les quantités quasi nulles issues d'arrondis flottants (< 1e-12) sont
+/// ramenées à zéro pour éviter les faux positifs de type "je détiens
+/// encore 0.0000000000003 BTC".
+pub fn holdings_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> HashMap<String, f64> {
+    let mut holdings: HashMap<String, f64> = HashMap::new();
+
+    let mut sorted: Vec<&crate::schema::Transaction> = tx_store.transactions.iter().collect();
+    sorted.sort_by_key(|tx| tx.time);
+
+    for tx in sorted {
+        if let Some(at) = at {
+            if tx.time > at {
+                break;
+            }
+        }
+
+        let symbol = tx.asset.symbol.clone();
+        let s = sign(tx.kind) as f64;
+        *holdings.entry(symbol).or_insert(0.0) += s * tx.quantity;
+    }
+
+    for qty in holdings.values_mut() {
+        if qty.abs() < 1e-12 {
+            *qty = 0.0;
+        }
+    }
+
+    holdings
+}
+
+/// Comme `holdings_at`, mais filtre les actifs à quantité nulle -- pratique
+/// pour n'afficher que ce qui est réellement détenu.
+pub fn non_zero_holdings_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> HashMap<String, f64> {
+    holdings_at(tx_store, at)
+        .into_iter()
+        .filter(|(_, qty)| *qty != 0.0)
+        .collect()
+}
+
+
+################################################################################
+# Dossier : src
+# Fichier : lib.rs
+# Chemin relatif : lib.rs
+################################################################################
+
+pub mod schema;
+pub mod store;
+pub mod ledger;
+pub mod market;
+pub mod parse;
+
+
+################################################################################
+# Dossier : src
+# Fichier : main.rs
+# Chemin relatif : main.rs
+################################################################################
+
+//! Portage de src/cli.py -- construit (ou met à jour) serialized_tx.json
+//! à partir des exports bruts dans ./data/raw/.
+//!
+//! Ré-exécutable sans risque : le dédoublonnage par external_id garantit
+//! qu'un même fichier réimporté ne crée pas de doublons.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+
+use portfolio_rs::ledger::cost_basis::compute_fifo;
+use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
+use portfolio_rs::market::tickers::resolve_ticker;
+use portfolio_rs::parse::{binance, manual, xtb};
+use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
+use portfolio_rs::store::serialize::{load_tx_store, save_wallet};
+
+fn data_dir() -> PathBuf {
+    PathBuf::from("./data/raw")
+}
+
+fn accounts_path() -> PathBuf {
+    data_dir().join("accounts")
+}
+
+fn parse_binance_sources(known_tx: &HashMap<String, Transaction>) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    let trades_path = accounts_path().join("trades.csv");
+    let converts_path = accounts_path().join("convert.csv");
+
+    if trades_path.exists() {
+        println!("Lecture Binance Trades : {trades_path:?}");
+        match binance::parse_trades(&trades_path, known_tx) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
+        }
+    } else {
+        println!("[Omis] Fichier introuvable : {trades_path:?}");
+    }
+
+    if converts_path.exists() {
+        println!("Lecture Binance Converts : {converts_path:?}");
+        match binance::parse_converts(&converts_path, known_tx) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
+        }
+    } else {
+        println!("[Omis] Fichier introuvable : {converts_path:?}");
+    }
+
+    out
+}
+
+fn parse_xtb_file(path: &Path, known_tx: &HashMap<String, Transaction>) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    if !path.exists() {
+        println!("[Omis] Fichier introuvable : {path:?}");
+        return out;
+    }
+
+    println!("Lecture XTB : {path:?}");
+
+    match xtb::find_sheet_by_prefix(path, "Closed Position") {
+        Ok(sheet) => match xtb::parse_closed_positions(path, &sheet) {
+            Ok(positions) => {
+                for pos in positions {
+                    out.extend(pos.to_transactions());
+                }
+            }
+            Err(e) => println!("  [Erreur XTB Closed] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Closed] {e}"),
+    }
+
+    match xtb::find_sheet_by_prefix(path, "Open Position") {
+        Ok(sheet) => match xtb::parse_open_positions(path, &sheet, known_tx) {
+            Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
+            Err(e) => println!("  [Erreur XTB Open] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Open] {e}"),
+    }
+
+    match xtb::find_sheet_by_prefix(path, "Cash") {
+        Ok(sheet) => match xtb::parse_cash_operations(path, &sheet) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => println!("  [Erreur XTB Cash] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Cash] {e}"),
+    }
+
+    out
+}
+
+fn main() -> Result<()> {
+    println!("=== CONSTRUCTION DU WALLET ===");
+
+    let tx_store_path = PathBuf::from("./data/tx_store.json");
+    let mut tx_store = load_tx_store(&tx_store_path)?;
+    println!("Wallet chargé : {} transaction(s) existante(s)", tx_store.transactions.len());
+
+    // --- NOUVEAU : Création du cache des transactions existantes ---
+    // Permet d'éviter de refetcher les prix API pour les TX déjà connues
+    let known_tx: HashMap<String, Transaction> = tx_store
+        .transactions
+        .iter()
+        .filter_map(|tx| tx.external_id.clone().map(|id| (id, tx.clone())))
+        .collect();
+
+    let new_transactions = parse_binance_sources(&known_tx);
+    let mut xtb_tx = Vec::new();
+    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account.xlsx"), &known_tx));
+    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account_pea.xlsx"), &known_tx));
+
+    tx_store.add_transactions(new_transactions);
+    tx_store.add_transactions(xtb_tx.clone());
+
+    println!("\n=== DIAGNOSTIC : BUY/DEPOSIT à quantité négative ===");
+    for tx in &tx_store.transactions {
+        if matches!(tx.kind, TransactionKind::Buy | TransactionKind::Deposit) && tx.quantity <= 0.0 {
+            println!(
+                "  platform={:?} asset={} qty={} value_eur={} time={} source={} external_id={:?} remark={:?}",
+                tx.platform, tx.asset.symbol, tx.quantity, tx.value_eur, tx.time, tx.source_file, tx.external_id, tx.remark
+            );
+        }
+    }
+
+    let replaced = tx_store.replace_platform(Platform::Xtb, xtb_tx);
+    println!("XTB : {replaced} transaction(s) (remplacement complet)");
+
+    let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
+    tx_store.replace_platform(Platform::Manual, manual_tx);
+
+    // --- RÉSOLUTION DES TICKERS MANQUANTS ---
+    println!("\n=== RÉSOLUTION DES TICKERS ===");
+    let mut resolved = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+
+    let symbols: Vec<String> = tx_store.assets.keys().cloned().collect();
+    for symbol in symbols {
+        let (kind, has_ticker) = {
+            let asset = tx_store.assets.get(&symbol).unwrap();
+            (asset.kind, asset.identifiers.ticker.is_some())
+        };
+
+        if kind == AssetKind::Cash || has_ticker {
+            skipped += 1;
+            continue;
+        }
+
+        match resolve_ticker(&symbol, kind) {
+            Some(ticker) => {
+                println!("  ✓ {symbol:<12} -> {ticker}");
+                tx_store.assets.get_mut(&symbol).unwrap().identifiers.ticker = Some(ticker);
+                resolved += 1;
+            }
+            None => {
+                println!("  ✗ {symbol:<12} : ticker introuvable");
+                failed += 1;
+            }
+        }
+    }
+    println!("({resolved} résolus, {skipped} ignorés, {failed} échoués)");
+
+    save_wallet(&tx_store, &tx_store_path)?;
+
+    println!("\n=== VALORISATION ACTUELLE ===");
+    let snapshot = portfolio_snapshot_at(&tx_store, None);
+    let cost_basis = compute_fifo(&tx_store, None)?;
+
+    println!("Date: {}", snapshot.date);
+    println!("Valeur totale: {:.2} EUR", snapshot.total_value_eur);
+    println!("Détail par actif:");
+    println!(
+        "  {:<10} {:>10} {:>10} {:>12} {:>12} {:>12} {:>8}",
+        "Symbole", "Qty", "Prix", "Valeur", "Cost basis", "P&L", "P&L %"
+    );
+
+    let mut total_pnl = 0.0;
+    for asset in &snapshot.assets {
+        if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") {
+            continue; // on cache les poussières
+        }
+
+        let avg_cost = cost_basis.average_cost(&asset.symbol);
+        let cb_total = cost_basis.open_cost_basis(&asset.symbol);
+
+        let (cb_str, pnl_eur_str, pnl_pct_str) = match avg_cost {
+            Some(_) => {
+                let pnl_eur = asset.value_eur - cb_total;
+                let pnl_pct = if cb_total > 0.0 { pnl_eur / cb_total * 100.0 } else { 0.0 };
+                total_pnl += pnl_eur;
+                (format!("{cb_total:>11.2}"), format!("{pnl_eur:>+11.2}"), format!("{pnl_pct:>+7.2}%"))
+            }
+            None => (format!("{:>11}", "—"), format!("{:>11}", "—"), format!("{:>8}", "—")),
+        };
+
+        println!(
+            "  {:<10} {:>10.4} {:>10.2} {:>12.2} {} {} {}",
+            asset.symbol, asset.quantity, asset.price_eur, asset.value_eur, cb_str, pnl_eur_str, pnl_pct_str
+        );
+    }
+
+    println!("\nP&L latent total : {total_pnl:>+.2} EUR");
+
+  
+    // --- NOUVEAU : EXPORT POUR LE DASHBOARD STREAMLIT ---
+    println!("\n=== EXPORT DASHBOARD ===");
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct DashboardAsset {
+        symbol: String,
+        quantity: f64,
+        price_eur: f64,
+        value_eur: f64,
+        cost_basis_eur: f64,
+        pnl_eur: f64,
+        pnl_pct: f64,
+        kind: AssetKind,
+    }
+
+    #[derive(Serialize)]
+    struct DashboardData {
+        date: String,
+        total_value_eur: f64,
+        total_cost_basis_eur: f64,
+        total_pnl_eur: f64,
+        assets: Vec<DashboardAsset>,
+    }
+
+    let mut dashboard_assets = Vec::new();
+    let mut total_cb = 0.0;
+    let mut total_pnl_calc = 0.0;
+
+    for asset in &snapshot.assets {
+        if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") {
+            continue; // on cache les poussières
+        }
+
+        let cb_total = cost_basis.open_cost_basis(&asset.symbol);
+        let pnl_eur = asset.value_eur - cb_total;
+        let pnl_pct = if cb_total > 0.0 { pnl_eur / cb_total * 100.0 } else { 0.0 };
+
+        total_cb += cb_total;
+        total_pnl_calc += pnl_eur;
+
+        dashboard_assets.push(DashboardAsset {
+            symbol: asset.symbol.clone(),
+            quantity: asset.quantity,
+            price_eur: asset.price_eur,
+            value_eur: asset.value_eur,
+            cost_basis_eur: cb_total,
+            pnl_eur,
+            pnl_pct,
+            kind: asset.kind,
+        });
+    }
+
+    let dashboard_data = DashboardData {
+        date: snapshot.date.clone(),
+        total_value_eur: snapshot.total_value_eur,
+        total_cost_basis_eur: total_cb,
+        total_pnl_eur: total_pnl_calc,
+        assets: dashboard_assets,
+    };
+
+    let dashboard_path = PathBuf::from("./data/dashboard.json");
+    let dashboard_json = serde_json::to_string_pretty(&dashboard_data)?;
+    std::fs::write(&dashboard_path, dashboard_json)?;
+    println!("Données du dashboard sauvegardées dans : {dashboard_path:?}");
+
+    Ok(())
+}
+
+################################################################################
+# Dossier : src/market
+# Fichier : mod.rs
+# Chemin relatif : market/mod.rs
+################################################################################
+
+pub mod prices;
+pub mod tickers;
+
+
+################################################################################
+# Dossier : src/market
+# Fichier : prices.rs
+# Chemin relatif : market/prices.rs
+################################################################################
+
+//! Portage de src/market/prices.py. Utilise l'API publique de Binance
+//! pour la crypto, et Yahoo Finance pour les actions.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
+
+use chrono::{DateTime, TimeZone, Utc, Timelike};
+use once_cell::sync::Lazy;
+use serde_json::Value;
+use thiserror::Error;
+
+use crate::schema::AssetKind;
+
+const BINANCE_API: &str = "https://data-api.binance.vision/api/v3/klines";
+const YAHOO_CHART_API: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
+
+#[derive(Debug, Error)]
+pub enum PriceError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+}
+
+fn client() -> &'static reqwest::blocking::Client {
+    static CLIENT: Lazy<reqwest::blocking::Client> = Lazy::new(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent("Mozilla/5.0")
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client HTTP")
+    });
+    &CLIENT
+}
+
+// --- caches best-effort ---
+static BINANCE_KLINES_CACHE: Lazy<Mutex<HashMap<(String, String), Vec<Value>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static YAHOO_PRICE_CACHE: Lazy<Mutex<HashMap<(String, String), (f64, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static BINANCE_KLINES_H4_CACHE: Lazy<Mutex<HashMap<(String, String), Vec<Value>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static YAHOO_H4_CACHE: Lazy<Mutex<HashMap<(String, String), (f64, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn binance_klines(symbol_pair: &str, day_str: &str) -> Result<Vec<Value>, PriceError> {
+    let key = (symbol_pair.to_string(), day_str.to_string());
+    if let Some(cached) = BINANCE_KLINES_CACHE.lock().unwrap().get(&key) {
+        return Ok(cached.clone());
+    }
+
+    thread::sleep(Duration::from_millis(100));
+
+    let dt = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d")
+        .map_err(|e| PriceError::Message(e.to_string()))?
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let start_ms = Utc.from_utc_datetime(&dt).timestamp_millis();
+
+    let resp = client()
+        .get(BINANCE_API)
+        .query(&[
+            ("symbol", symbol_pair),
+            ("interval", "1d"),
+            ("startTime", &start_ms.to_string()),
+            ("limit", "1"),
+        ])
+        .send()?
+        .error_for_status()?;
+
+    let data: Vec<Value> = resp.json()?;
+    BINANCE_KLINES_CACHE.lock().unwrap().insert(key, data.clone());
+    Ok(data)
+}
+
+fn binance_klines_h4(symbol_pair: &str, hour_bucket_str: &str) -> Result<Vec<Value>, PriceError> {
+    let key = (symbol_pair.to_string(), hour_bucket_str.to_string());
+    if let Some(cached) = BINANCE_KLINES_H4_CACHE.lock().unwrap().get(&key) {
+        return Ok(cached.clone());
+    }
+
+    thread::sleep(Duration::from_millis(100));
+
+    let dt = chrono::NaiveDateTime::parse_from_str(hour_bucket_str, "%Y-%m-%d %H:%M:%S")
+        .map_err(|e| PriceError::Message(e.to_string()))?;
+    let start_ms = Utc.from_utc_datetime(&dt).timestamp_millis();
+
+    let resp = client()
+        .get(BINANCE_API)
+        .query(&[
+            ("symbol", symbol_pair),
+            ("interval", "4h"),
+            ("startTime", &start_ms.to_string()),
+            ("limit", "1"),
+        ])
+        .send()?
+        .error_for_status()?;
+
+    let data: Vec<Value> = resp.json()?;
+    BINANCE_KLINES_H4_CACHE.lock().unwrap().insert(key, data.clone());
+    Ok(data)
+}
+
+pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, String), PriceError> {
+    let key = (ticker.to_string(), day_str.to_string());
+    if let Some(cached) = YAHOO_PRICE_CACHE.lock().unwrap().get(&key) {
+        return Ok(cached.clone());
+    }
+
+    let target_date = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d").map_err(|e| PriceError::Message(e.to_string()))?;
+    let target = Utc.from_utc_datetime(&target_date.and_hms_opt(0, 0, 0).unwrap());
+
+    let period1 = (target - chrono::Duration::days(7)).timestamp();
+    let period2 = (target + chrono::Duration::days(1)).timestamp();
+
+    let url = format!("{YAHOO_CHART_API}/{ticker}");
+    let resp = client()
+        .get(&url)
+        .query(&[
+            ("period1", period1.to_string()),
+            ("period2", period2.to_string()),
+            ("interval", "1d".to_string()),
+            ("events", "history".to_string()),
+        ])
+        .send()?
+        .error_for_status()?;
+
+    let data: Value = resp.json()?;
+    let result = data
+        .get("chart")
+        .and_then(|c| c.get("result"))
+        .and_then(|r| r.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| PriceError::Message(format!("Yahoo n'a pas trouvé de résultat pour {ticker}")))?;
+
+    let meta = result.get("meta").cloned().unwrap_or(Value::Null);
+    let currency = meta.get("currency").and_then(|c| c.as_str()).unwrap_or("USD").to_string();
+
+    let timestamps: Vec<i64> = result
+        .get("timestamp")
+        .and_then(|t| t.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    let closes: Vec<Option<f64>> = result
+        .get("indicators")
+        .and_then(|i| i.get("quote"))
+        .and_then(|q| q.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|q0| q0.get("close"))
+        .and_then(|c| c.as_array())
+        .map(|arr| arr.iter().map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+
+    let mut candidates: Vec<(DateTime<Utc>, f64)> = Vec::new();
+    for (ts, close) in timestamps.iter().zip(closes.iter()) {
+        let Some(close) = close else { continue };
+        let dt = Utc.timestamp_opt(*ts, 0).single().ok_or_else(|| PriceError::Message("timestamp invalide".into()))?;
+        if dt <= target {
+            candidates.push((dt, *close));
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err(PriceError::Message(format!("Pas de clôture Yahoo disponible pour {ticker} au plus tard le {day_str}")));
+    }
+
+    let (_, price) = candidates.into_iter().max_by_key(|(dt, _)| *dt).unwrap();
+
+    YAHOO_PRICE_CACHE.lock().unwrap().insert(key, (price, currency.clone()));
+    Ok((price, currency))
+}
+
+pub fn yahoo_historical_price_h4(ticker: &str, hour_bucket_str: &str) -> Result<(f64, String), PriceError> {
+    let key = (ticker.to_string(), hour_bucket_str.to_string());
+    if let Some(cached) = YAHOO_H4_CACHE.lock().unwrap().get(&key) {
+        return Ok(cached.clone());
+    }
+
+    let target = chrono::NaiveDateTime::parse_from_str(hour_bucket_str, "%Y-%m-%d %H:%M:%S")
+        .map_err(|e| PriceError::Message(e.to_string()))?;
+    let target_dt = Utc.from_utc_datetime(&target);
+
+    // Fenêtre de 8h en arrière pour couvrir la borne H4 précédente même si weekend/férié
+    let period1 = (target_dt - chrono::Duration::hours(8)).timestamp();
+    let period2 = (target_dt + chrono::Duration::hours(4)).timestamp();
+
+    let url = format!("{YAHOO_CHART_API}/{ticker}");
+    let resp = client()
+        .get(&url)
+        .query(&[
+            ("period1", period1.to_string()),
+            ("period2", period2.to_string()),
+            ("interval", "1h".to_string()), // Yahoo ne supporte pas 4h nativement partout, on prend 1h
+            ("events", "history".to_string()),
+        ])
+        .send()?
+        .error_for_status()?;
+
+    let data: Value = resp.json()?;
+    let result = data
+        .get("chart")
+        .and_then(|c| c.get("result"))
+        .and_then(|r| r.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| PriceError::Message(format!("Yahoo H4 n'a pas trouvé de résultat pour {ticker}")))?;
+
+    let meta = result.get("meta").cloned().unwrap_or(Value::Null);
+    let currency = meta.get("currency").and_then(|c| c.as_str()).unwrap_or("USD").to_string();
+
+    let timestamps: Vec<i64> = result
+        .get("timestamp")
+        .and_then(|t| t.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    let closes: Vec<Option<f64>> = result
+        .get("indicators")
+        .and_then(|i| i.get("quote"))
+        .and_then(|q| q.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|q0| q0.get("close"))
+        .and_then(|c| c.as_array())
+        .map(|arr| arr.iter().map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+
+    let mut candidates: Vec<(DateTime<Utc>, f64)> = Vec::new();
+    for (ts, close) in timestamps.iter().zip(closes.iter()) {
+        let Some(close) = close else { continue };
+        let dt = Utc.timestamp_opt(*ts, 0).single().ok_or_else(|| PriceError::Message("timestamp invalide".into()))?;
+        if dt <= target_dt {
+            candidates.push((dt, *close));
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err(PriceError::Message(format!("Pas de clôture H4 Yahoo disponible pour {ticker} au {hour_bucket_str}")));
+    }
+
+    let (_, price) = candidates.into_iter().max_by_key(|(dt, _)| *dt).unwrap();
+
+    YAHOO_H4_CACHE.lock().unwrap().insert(key, (price, currency.clone()));
+    Ok((price, currency))
+}
+
+fn get_price_from_binance_daily(symbol: &str, time: DateTime<Utc>) -> Result<f64, PriceError> {
+    let day_str = time.format("%Y-%m-%d").to_string();
+
+    match binance_klines(&format!("{symbol}EUR"), &day_str) {
+        Ok(data) if !data.is_empty() => {
+            if let Some(close) = data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                return Ok(close);
+            }
+        }
+        Err(PriceError::Http(e)) if e.status().map(|s| s.as_u16()) != Some(400) => {
+            return Err(PriceError::Message(format!("API Binance KO pour {symbol}EUR")));
+        }
+        _ => {}
+    }
+
+    let usdt_data = binance_klines(&format!("{symbol}USDT"), &day_str);
+    let eurusdt_data = binance_klines("EURUSDT", &day_str);
+    if let (Ok(usdt_data), Ok(eurusdt_data)) = (usdt_data, eurusdt_data) {
+        if !usdt_data.is_empty() && !eurusdt_data.is_empty() {
+            let price_usdt: Option<f64> = usdt_data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+            let eurusdt_rate: Option<f64> = eurusdt_data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+            if let (Some(price_usdt), Some(eurusdt_rate)) = (price_usdt, eurusdt_rate) {
+                if eurusdt_rate > 0.0 {
+                    return Ok(price_usdt / eurusdt_rate);
+                }
+            }
+        }
+    }
+
+    Err(PriceError::Message(format!("Binance n'a pas trouvé le prix pour {symbol} au {day_str}")))
+}
+
+pub fn normalize_currency_for_fx(currency: &str) -> (String, f64) {
+    if currency == "GBp" || currency == "GBX" {
+        ("GBP".to_string(), 0.01)
+    } else {
+        (currency.to_string(), 1.0)
+    }
+}
+
+pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, ticker: Option<&str>) -> f64 {
+    let symbol = symbol.to_uppercase();
+
+    if kind == AssetKind::Cash {
+        match symbol.as_str() {
+            "EUR" | "EURI" => return 1.0,
+            "USD" | "USDT" | "USDC" | "BUSD" => return 0.92,
+            "GBP" => return 1.15,
+            _ => {}
+        }
+    }
+
+    let day_str = time.format("%Y-%m-%d").to_string();
+    
+    // Arrondi à la borne inférieure H4 (00, 04, 08, 12, 16, 20)
+    let h4_hour = (time.hour() / 4) * 4;
+    let h4_time = time.with_hour(h4_hour).unwrap().with_minute(0).unwrap().with_second(0).unwrap();
+    let h4_str = h4_time.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    match kind {
+        AssetKind::Stock => {
+            let Some(ticker) = ticker else {
+                eprintln!("  [WARN] Pas de ticker Yahoo pour l'action {symbol}. Prix mis à 0.");
+                return 0.0;
+            };
+            
+            // 1. Tentative H4
+            if let Ok((mut price, currency)) = yahoo_historical_price_h4(ticker, &h4_str) {
+                if currency != "EUR" {
+                    let (fx_currency, price_factor) = normalize_currency_for_fx(&currency);
+                    price *= price_factor;
+                    let fx_pair = format!("EUR{fx_currency}=X");
+                    if let Ok((fx_price, _)) = yahoo_historical_price_h4(&fx_pair, &h4_str) {
+                        return price / fx_price;
+                    }
+                } else {
+                    return price;
+                }
+            }
+
+            // 2. Fallback Daily (si > 2 ans ou erreur H4)
+            match yahoo_historical_price(ticker, &day_str) {
+                Ok((mut price, currency)) => {
+                    if currency != "EUR" {
+                        let (fx_currency, price_factor) = normalize_currency_for_fx(&currency);
+                        price *= price_factor;
+                        let fx_pair = format!("EUR{fx_currency}=X");
+                        match yahoo_historical_price(&fx_pair, &day_str) {
+                            Ok((fx_price, _)) => price / fx_price,
+                            Err(_) => {
+                                eprintln!("  [WARN] Prix Yahoo indisponible pour {ticker} au {day_str}.");
+                                0.0
+                            }
+                        }
+                    } else {
+                        price
+                    }
+                }
+                Err(_) => {
+                    eprintln!("  [WARN] Prix Yahoo indisponible pour {ticker} au {day_str}.");
+                    0.0
+                }
+            }
+        }
+        AssetKind::Crypto => {
+            // 1. Tentative H4 directe EUR
+            let h4_direct = (|| -> Result<f64, PriceError> {
+                let data = binance_klines_h4(&format!("{symbol}EUR"), &h4_str)?;
+                if !data.is_empty() {
+                    if let Some(close) = data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                        return Ok(close);
+                    }
+                }
+                Err(PriceError::Message("H4 direct EUR failed".to_string()))
+            })();
+            if let Ok(price) = h4_direct { return price; }
+
+            // 2. Tentative H4 fallback USDT
+            let h4_usdt = (|| -> Result<f64, PriceError> {
+                let usdt_data = binance_klines_h4(&format!("{symbol}USDT"), &h4_str)?;
+                let eurusdt_data = binance_klines_h4("EURUSDT", &h4_str)?;
+                if !usdt_data.is_empty() && !eurusdt_data.is_empty() {
+                    let price_usdt: Option<f64> = usdt_data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+                    let eurusdt_rate: Option<f64> = eurusdt_data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+                    if let (Some(price_usdt), Some(eurusdt_rate)) = (price_usdt, eurusdt_rate) {
+                        if eurusdt_rate > 0.0 {
+                            return Ok(price_usdt / eurusdt_rate);
+                        }
+                    }
+                }
+                Err(PriceError::Message("H4 USDT fallback failed".to_string()))
+            })();
+            if let Ok(price) = h4_usdt { return price; }
+
+            // 3. Fallback Daily
+            match get_price_from_binance_daily(&symbol, time) {
+                Ok(price) => price,
+                Err(_) => {
+                    eprintln!("  [WARN] Prix Binance indisponible pour {symbol} au {day_str}. Prix mis à 0.");
+                    0.0
+                }
+            }
+        }
+        AssetKind::Cash => 0.0,
+    }
+}
+
+################################################################################
+# Dossier : src/market
+# Fichier : tickers.rs
+# Chemin relatif : market/tickers.rs
+################################################################################
+
+//! Portage de src/market/tickers.py -- résolution du ticker externe
+//! (AssetIdentifiers.ticker) pour un Asset :
+//! - STOCK  -> recherche Yahoo Finance (endpoint non officiel).
+//! - CRYPTO -> API publique Binance (exchangeInfo), confirme que le
+//!   symbole est bien coté sur Binance et le renvoie tel quel.
+//!
+//! Best-effort : toute erreur réseau/format renvoie None plutôt que de
+//! propager -- un ticker manquant ne doit jamais bloquer le pipeline.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use once_cell::sync::Lazy;
+use serde_json::Value;
+
+use crate::schema::AssetKind;
+
+const YAHOO_SEARCH_API: &str = "https://query2.finance.yahoo.com/v1/finance/search";
+const BINANCE_EXCHANGE_INFO: &str = "https://data-api.binance.vision/api/v3/exchangeInfo";
+
+// Mapping des suffixes XTB -> Yahoo Finance.
+fn xtb_to_yahoo_suffix() -> &'static [(&'static str, &'static str)] {
+    &[
+        (".FR", ".PA"), // Euronext Paris
+        (".NL", ".AS"), // Euronext Amsterdam
+        (".UK", ".L"),  // London Stock Exchange
+        (".DE", ".DE"), // Xetra (identique)
+        (".US", ""),    // pas de suffixe pour les US (ex: MSTR.US -> MSTR)
+        (".PL", ".WA"), // Varsovie
+    ]
+}
+
+// Corrections manuelles pour les cas où la recherche Yahoo se trompe
+// systématiquement.
+fn manual_ticker_overrides() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("MSTR.US", "MSTR"),
+        ("XFVT.DE", "XFVT.DE"), // plusieurs classes de parts homonymes -> ambigu pour la recherche Yahoo
+    ]
+}
+
+const ACCEPTED_QUOTE_TYPES: &[&str] = &["EQUITY", "ETF"];
+
+static BINANCE_ASSETS_CACHE: Lazy<Mutex<Option<std::collections::HashSet<String>>>> = Lazy::new(|| Mutex::new(None));
+static STOCK_TICKER_CACHE: Lazy<Mutex<HashMap<String, Option<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("client HTTP")
+}
+
+fn binance_known_base_assets() -> std::collections::HashSet<String> {
+    let mut cache = BINANCE_ASSETS_CACHE.lock().unwrap();
+    if let Some(set) = cache.as_ref() {
+        return set.clone();
+    }
+
+    let set = (|| -> Option<std::collections::HashSet<String>> {
+        let resp = client().get(BINANCE_EXCHANGE_INFO).send().ok()?.error_for_status().ok()?;
+        let data: Value = resp.json().ok()?;
+        let symbols = data.get("symbols")?.as_array()?;
+        Some(
+            symbols
+                .iter()
+                .filter_map(|s| s.get("baseAsset").and_then(|b| b.as_str()).map(String::from))
+                .collect(),
+        )
+    })()
+    .unwrap_or_default();
+
+    *cache = Some(set.clone());
+    set
+}
+
+pub fn ticker_for_crypto(symbol: &str) -> Option<String> {
+    let known = binance_known_base_assets();
+    let symbol = symbol.to_uppercase();
+    if known.contains(&symbol) {
+        Some(symbol)
+    } else {
+        None
+    }
+}
+
+/// Choisit le meilleur candidat parmi les résultats Yahoo :
+/// 1. correspondance exacte du symbole complet (gère un même fonds coté
+///    sur plusieurs places, ex: XFVT.DE / XFVT.MI / XFVT.SW / XFVT.L) ;
+/// 2. à défaut, même radical (avant le point) et type EQUITY/ETF, pour
+///    éviter les produits dérivés au nom proche (ex: MSTU/MSTX pour MSTR).
+fn best_quote(quotes: &[Value], expected_symbol: &str) -> Option<String> {
+    let candidates: Vec<&Value> = quotes
+        .iter()
+        .filter(|q| q.get("quoteType").and_then(|t| t.as_str()).map_or(false, |t| ACCEPTED_QUOTE_TYPES.contains(&t)))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let expected_upper = expected_symbol.to_uppercase();
+    if let Some(exact) = candidates.iter().find(|q| {
+        q.get("symbol").and_then(|s| s.as_str()).map(|s| s.to_uppercase()) == Some(expected_upper.clone())
+    }) {
+        return exact.get("symbol").and_then(|s| s.as_str()).map(String::from);
+    }
+
+    let expected_root = expected_upper.split('.').next().unwrap_or("").to_string();
+    let same_root: Vec<&&Value> = candidates
+        .iter()
+        .filter(|q| {
+            q.get("symbol")
+                .and_then(|s| s.as_str())
+                .map(|s| s.split('.').next().unwrap_or("").to_uppercase())
+                == Some(expected_root.clone())
+        })
+        .collect();
+
+    if same_root.len() == 1 {
+        return same_root[0].get("symbol").and_then(|s| s.as_str()).map(String::from);
+    }
+
+    None // ambigu (plusieurs places de cotation) -> mieux vaut échouer que se tromper
+}
+
+pub fn ticker_for_stock(symbol: &str) -> Option<String> {
+    let symbol = symbol.to_uppercase();
+
+    if let Some(cached) = STOCK_TICKER_CACHE.lock().unwrap().get(&symbol) {
+        return cached.clone();
+    }
+
+    if let Some((_, over)) = manual_ticker_overrides().iter().find(|(k, _)| *k == symbol) {
+        let result = Some(over.to_string());
+        STOCK_TICKER_CACHE.lock().unwrap().insert(symbol, result.clone());
+        return result;
+    }
+
+    let mut yahoo_symbol_guess = symbol.clone();
+    for (xtb_suf, yahoo_suf) in xtb_to_yahoo_suffix() {
+        if symbol.ends_with(xtb_suf) {
+            yahoo_symbol_guess = format!("{}{}", &symbol[..symbol.len() - xtb_suf.len()], yahoo_suf);
+            break;
+        }
+    }
+
+    let queries: Vec<&str> = if yahoo_symbol_guess != symbol {
+        vec![yahoo_symbol_guess.as_str(), symbol.as_str()]
+    } else {
+        vec![yahoo_symbol_guess.as_str()]
+    };
+
+    let mut result: Option<String> = None;
+    for query in queries {
+        let attempt = (|| -> Option<String> {
+            let resp = client()
+                .get(YAHOO_SEARCH_API)
+                .query(&[("q", query), ("quotesCount", "5"), ("newsCount", "0")])
+                .send()
+                .ok()?
+                .error_for_status()
+                .ok()?;
+            let data: Value = resp.json().ok()?;
+            let quotes = data.get("quotes")?.as_array()?;
+            best_quote(quotes, &yahoo_symbol_guess)
+        })();
+        if attempt.is_some() {
+            result = attempt;
+            break;
+        }
+    }
+
+    STOCK_TICKER_CACHE.lock().unwrap().insert(symbol, result.clone());
+    result
+}
+
+pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
+    match kind {
+        AssetKind::Crypto => ticker_for_crypto(symbol),
+        AssetKind::Stock => ticker_for_stock(symbol),
+        AssetKind::Cash => None,
+    }
+}
+
+
+################################################################################
+# Dossier : src/parse
+# Fichier : binance.rs
+# Chemin relatif : parse/binance.rs
+################################################################################
+
+//! Portage de src/parse/binance.py.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
+use chrono::{NaiveDateTime, TimeZone, Utc};
+use regex::Regex;
+use sha2::{Digest, Sha256};
+
+use crate::market::prices::historical_price_eur;
+use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+
+pub fn synthetic_id(prefix: &str, parts: &[&str]) -> String {
+    let joined = parts.join("|");
+    let digest = Sha256::digest(joined.as_bytes());
+    format!("{prefix}-{}", hex::encode(&digest)[..16].to_string())
+}
+
+fn split_amount(raw: &str) -> Result<(f64, String)> {
+    let re = Regex::new(r"^([0-9.]+)([A-Za-z]+)$").unwrap();
+    let caps = re.captures(raw.trim()).ok_or_else(|| anyhow!("pas de suffixe trouvé dans '{raw}'"))?;
+    let qty: f64 = caps[1].parse()?;
+    Ok((qty, caps[2].to_string()))
+}
+
+fn split_space_amount(raw: &str) -> Result<(f64, String)> {
+    let mut parts = raw.trim().splitn(2, ' ');
+    let qty_str = parts.next().ok_or_else(|| anyhow!("pas de symbole dans '{raw}'"))?;
+    let symbol = parts.next().ok_or_else(|| anyhow!("pas de symbole dans '{raw}'"))?;
+    Ok((qty_str.parse()?, symbol.to_string()))
+}
+
+fn normalize_currency(coin: &str) -> Option<&'static str> {
+    match coin {
+        "EUR" | "EURI" => Some("EUR"),
+        "USDC" | "USDT" => Some("USD"),
+        _ => None,
+    }
+}
+
+fn asset_kind_for(symbol: &str) -> AssetKind {
+    if normalize_currency(symbol).is_some() {
+        AssetKind::Cash
+    } else {
+        AssetKind::Crypto
+    }
+}
+
+fn parse_time(raw: &str) -> Result<chrono::DateTime<Utc>> {
+    let naive = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")?;
+    Ok(Utc.from_utc_datetime(&naive))
+}
+
+pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Result<Vec<Transaction>> {
+    let source_file = path.display().to_string();
+    let mut out = Vec::new();
+
+    let mut reader = csv::Reader::from_path(path).with_context(|| format!("lecture de {path:?}"))?;
+    let headers = reader.headers()?.clone();
+
+    for record in reader.records() {
+        let record = record?;
+        let row: HashMap<&str, &str> = headers.iter().zip(record.iter()).collect();
+        let get = |k: &str| -> Result<&str> { row.get(k).copied().ok_or_else(|| anyhow!("colonne '{k}' manquante")) };
+
+        let time = parse_time(get("Time")?)?;
+        let (base_qty, base_symbol) = split_amount(get("Executed")?)?;
+        let (quote_amount, quote_symbol) = split_amount(get("Amount")?)?;
+        let (fee_amount, fee_symbol) = split_amount(get("Fee")?)?;
+
+        let side = get("Side")?.to_uppercase();
+        let kind = match side.as_str() {
+            "BUY" => TransactionKind::Buy,
+            "SELL" => TransactionKind::Sell,
+            other => return Err(anyhow!("side inconnu: {other}")),
+        };
+
+        let trade_id = synthetic_id(
+            "binance-trade",
+            &[get("Time")?, get("Pair")?, get("Side")?, get("Price")?, get("Executed")?, get("Amount")?],
+        );
+
+        // --- CACHE CHECK ---
+        if let Some(existing_tx) = known_tx.get(&trade_id) {
+            out.push(existing_tx.clone());
+            continue;
+        }
+
+        let base_ref_currency = normalize_currency(&base_symbol).unwrap_or("USD").to_string();
+        let base_asset = Asset {
+            symbol: base_symbol.clone(),
+            name: base_symbol.clone(),
+            kind: asset_kind_for(&base_symbol),
+            ref_currency: base_ref_currency,
+            identifiers: AssetIdentifiers::default(),
+        };
+
+        let quote_currency = normalize_currency(&quote_symbol).map(String::from).unwrap_or(quote_symbol.clone());
+        let eur_price = historical_price_eur(&base_symbol, time, asset_kind_for(&base_symbol), None);
+        let value_eur = base_qty * eur_price;
+
+        out.push(Transaction {
+            platform: Platform::Binance,
+            account_label: "Spot".to_string(),
+            kind,
+            asset: base_asset,
+            quantity: base_qty,
+            price: Some(eur_price),
+            amount: Some(quote_amount),
+            quote_currency: Some(quote_currency),
+            time,
+            value_eur,
+            external_id: Some(trade_id.clone()),
+            remark: None,
+            source_file: source_file.clone(),
+        });
+
+        if fee_amount > 0.0 {
+            let fee_id = synthetic_id("binance-fee", &[&trade_id, get("Fee")?]);
+            
+            // --- CACHE CHECK FEE ---
+            if let Some(existing_fee_tx) = known_tx.get(&fee_id) {
+                out.push(existing_fee_tx.clone());
+                continue;
+            }
+
+            let fee_ref_currency = normalize_currency(&fee_symbol).unwrap_or("USD").to_string();
+            let fee_asset = Asset {
+                symbol: fee_symbol.clone(),
+                name: fee_symbol.clone(),
+                kind: asset_kind_for(&fee_symbol),
+                ref_currency: fee_ref_currency,
+                identifiers: AssetIdentifiers::default(),
+            };
+            let fee_price_eur = historical_price_eur(&fee_symbol, time, asset_kind_for(&fee_symbol), None);
+            let fee_value_eur = fee_amount * fee_price_eur;
+
+            out.push(Transaction {
+                platform: Platform::Binance,
+                account_label: "Spot".to_string(),
+                kind: TransactionKind::Fee,
+                asset: fee_asset,
+                quantity: fee_amount,
+                price: Some(eur_price),
+                amount: None,
+                quote_currency: None,
+                time,
+                value_eur: fee_value_eur,
+                external_id: Some(fee_id),
+                remark: Some(format!("Fee on {side} {base_symbol}")),
+                source_file: source_file.clone(),
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+pub fn parse_converts(path: &Path, known_tx: &HashMap<String, Transaction>) -> Result<Vec<Transaction>> {
+    let source_file = path.display().to_string();
+    let mut out = Vec::new();
+
+    let mut reader = csv::Reader::from_path(path).with_context(|| format!("lecture de {path:?}"))?;
+    let headers = reader.headers()?.clone();
+
+    for record in reader.records() {
+        let record = record?;
+        let row: HashMap<&str, &str> = headers.iter().zip(record.iter()).collect();
+        let get = |k: &str| -> Result<&str> { row.get(k).copied().ok_or_else(|| anyhow!("colonne '{k}' manquante")) };
+
+        if get("Status")? != "Successful" {
+            continue;
+        }
+
+        let time = parse_time(get("Time")?)?;
+        let (sell_qty, sell_symbol) = split_space_amount(get("Sell")?)?;
+        let (buy_qty, buy_symbol) = split_space_amount(get("Buy")?)?;
+
+        let convert_id = synthetic_id(
+            "binance-convert",
+            &[get("Time")?, get("Wallet")?, get("Pair")?, get("Sell")?, get("Buy")?, get("Price")?],
+        );
+
+        let sell_id = format!("{convert_id}-sell");
+        let buy_id = format!("{convert_id}-buy");
+
+        // --- CACHE CHECK SELL ---
+        if let Some(existing_tx) = known_tx.get(&sell_id) {
+            out.push(existing_tx.clone());
+        } else {
+            let sell_asset = Asset {
+                symbol: sell_symbol.clone(),
+                name: sell_symbol.clone(),
+                kind: asset_kind_for(&sell_symbol),
+                ref_currency: normalize_currency(&sell_symbol).unwrap_or("USD").to_string(),
+                identifiers: AssetIdentifiers::default(),
+            };
+            let sell_price_eur = historical_price_eur(&sell_symbol, time, asset_kind_for(&sell_symbol), None);
+            let sell_value_eur = sell_qty * sell_price_eur;
+
+            out.push(Transaction {
+                platform: Platform::Binance,
+                account_label: get("Wallet")?.to_string(),
+                kind: TransactionKind::Sell,
+                asset: sell_asset,
+                quantity: sell_qty,
+                price: Some(sell_price_eur),
+                amount: Some(sell_value_eur),
+                value_eur: sell_value_eur,
+                quote_currency: Some("EUR".to_string()),
+                time,
+                external_id: Some(sell_id),
+                remark: Some("Convert".to_string()),
+                source_file: source_file.clone(),
+            });
+        }
+
+        // --- CACHE CHECK BUY ---
+        if let Some(existing_tx) = known_tx.get(&buy_id) {
+            out.push(existing_tx.clone());
+        } else {
+            let buy_asset = Asset {
+                symbol: buy_symbol.clone(),
+                name: buy_symbol.clone(),
+                kind: asset_kind_for(&buy_symbol),
+                ref_currency: normalize_currency(&buy_symbol).unwrap_or("USD").to_string(),
+                identifiers: AssetIdentifiers::default(),
+            };
+            let buy_price_eur = historical_price_eur(&buy_symbol, time, asset_kind_for(&buy_symbol), None);
+            let buy_value_eur = buy_qty * buy_price_eur;
+
+            out.push(Transaction {
+                platform: Platform::Binance,
+                account_label: get("Wallet")?.to_string(),
+                kind: TransactionKind::Buy,
+                asset: buy_asset,
+                quantity: buy_qty,
+                price: Some(buy_price_eur),
+                amount: Some(buy_value_eur),
+                value_eur: buy_value_eur,
+                quote_currency: Some("EUR".to_string()),
+                time,
+                external_id: Some(buy_id),
+                remark: Some("Convert".to_string()),
+                source_file: source_file.clone(),
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+################################################################################
+# Dossier : src/parse
+# Fichier : manual.rs
+# Chemin relatif : parse/manual.rs
+################################################################################
+
+//! Portage de src/parse/manual.py -- comble les trous non couverts par les
+//! exports automatisés (ex: on-chain non tracé). Remplacé en bloc à chaque
+//! run -- voir TxStore::replace_platform.
+
+use std::fs;
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+
+use crate::parse::binance::synthetic_id;
+use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+
+fn parse_time(raw: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(&raw.replace('Z', "+00:00"))?.with_timezone(&Utc))
+}
+
+fn kind_from_str(s: &str) -> Result<TransactionKind> {
+    Ok(match s {
+        "Buy" => TransactionKind::Buy,
+        "Sell" => TransactionKind::Sell,
+        "Fee" => TransactionKind::Fee,
+        "Deposit" => TransactionKind::Deposit,
+        "Withdraw" => TransactionKind::Withdraw,
+        other => return Err(anyhow!("TransactionKind inconnu: {other}")),
+    })
+}
+
+pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = fs::read_to_string(path).with_context(|| format!("lecture de {path:?}"))?;
+    let entries: Vec<Value> = serde_json::from_str(&raw)?;
+    let mut out = Vec::new();
+
+    for entry in entries {
+        let symbol = entry.get("asset").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("champ 'asset' manquant"))?.to_string();
+        let asset = Asset {
+            symbol: symbol.clone(),
+            name: symbol.clone(),
+            kind: AssetKind::Crypto,
+            ref_currency: "EUR".to_string(),
+            identifiers: AssetIdentifiers::default(),
+        };
+
+        let raw_id = entry
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| synthetic_id("manual-auto", &[&serde_json::to_string(&entry).unwrap_or_default()]));
+
+        let kind_str = entry.get("kind").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("champ 'kind' manquant"))?;
+
+        out.push(Transaction {
+            platform: Platform::Manual,
+            account_label: entry.get("account_label").and_then(|v| v.as_str()).unwrap_or("Manuel").to_string(),
+            kind: kind_from_str(kind_str)?,
+            asset,
+            quantity: entry.get("quantity").and_then(|v| v.as_f64()).ok_or_else(|| anyhow!("champ 'quantity' manquant"))?,
+            price: entry.get("price").and_then(|v| v.as_f64()),
+            value_eur: entry.get("value_eur").and_then(|v| v.as_f64()).ok_or_else(|| anyhow!("champ 'value_eur' manquant"))?,
+            amount: entry.get("amount").and_then(|v| v.as_f64()),
+            quote_currency: entry.get("quote_currency").and_then(|v| v.as_str()).map(String::from),
+            time: parse_time(entry.get("time").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("champ 'time' manquant"))?)?,
+            external_id: Some(format!("manual-{raw_id}")),
+            remark: entry.get("remark").and_then(|v| v.as_str()).map(String::from),
+            source_file: path.display().to_string(),
+        });
+    }
+
+    Ok(out)
+}
+
+
+################################################################################
+# Dossier : src/parse
+# Fichier : mod.rs
+# Chemin relatif : parse/mod.rs
+################################################################################
+
+pub mod binance;
+pub mod xtb;
+pub mod manual;
+
+
+################################################################################
+# Dossier : src/parse
+# Fichier : xtb.rs
+# Chemin relatif : parse/xtb.rs
+################################################################################
+
+//! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
+//! opérations de cash XTB, lues depuis les exports xlsx.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+
+use anyhow::{anyhow, Context, Result};
+use calamine::{open_workbook, Data, Reader, Xlsx};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use once_cell::sync::Lazy;
+
+use crate::market::prices::{normalize_currency_for_fx, yahoo_historical_price};
+use crate::market::tickers::resolve_ticker;
+use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+
+#[derive(Debug, Clone)]
+pub struct XtbClosedPosition {
+    pub position_id: String,
+    pub symbol: String,
+    pub volume: f64,
+    pub open_time: DateTime<Utc>,
+    pub open_price: f64,
+    pub close_time: DateTime<Utc>,
+    pub close_price: f64,
+    pub purchase_value: f64,
+    pub sale_value: f64,
+    pub source_file: String,
+}
+
+impl XtbClosedPosition {
+    pub fn to_transactions(&self) -> Vec<Transaction> {
+        let currency = infer_currency(&self.symbol);
+        let asset = Asset {
+            symbol: self.symbol.clone(),
+            name: self.symbol.clone(),
+            kind: AssetKind::Stock,
+            ref_currency: currency,
+            identifiers: AssetIdentifiers::default(),
+        };
+        vec![
+            Transaction {
+                platform: Platform::Xtb,
+                account_label: "XTB".to_string(),
+                kind: TransactionKind::Buy,
+                asset: asset.clone(),
+                quantity: self.volume,
+                price: Some(self.open_price),
+                amount: Some(self.purchase_value),
+                quote_currency: None,
+                time: self.open_time,
+                value_eur: self.purchase_value,
+                external_id: Some(format!("{}-buy", self.position_id)),
+                remark: None,
+                source_file: self.source_file.clone(),
+            },
+            Transaction {
+                platform: Platform::Xtb,
+                account_label: "XTB".to_string(),
+                kind: TransactionKind::Sell,
+                asset,
+                quantity: self.volume,
+                price: Some(self.close_price),
+                amount: Some(self.sale_value),
+                quote_currency: None,
+                time: self.close_time,
+                value_eur: self.sale_value,
+                external_id: Some(format!("{}-sell", self.position_id)),
+                remark: None,
+                source_file: self.source_file.clone(),
+            },
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct XtbOpenPosition {
+    pub position_id: String,
+    pub symbol: String,
+    pub volume: f64,
+    pub open_time: DateTime<Utc>,
+    pub open_price: f64,
+    pub purchase_value: f64,
+    pub comment: Option<String>,
+    pub source_file: String,
+}
+
+impl XtbOpenPosition {
+    pub fn to_transaction(&self) -> Transaction {
+        let currency = infer_currency(&self.symbol);
+        let asset = Asset {
+            symbol: self.symbol.clone(),
+            name: self.symbol.clone(),
+            kind: AssetKind::Stock,
+            ref_currency: currency,
+            identifiers: AssetIdentifiers::default(),
+        };
+        Transaction {
+            platform: Platform::Xtb,
+            account_label: "XTB".to_string(),
+            kind: TransactionKind::Buy,
+            asset,
+            quantity: self.volume,
+            price: Some(self.open_price),
+            amount: Some(self.purchase_value),
+            quote_currency: None,
+            time: self.open_time,
+            value_eur: self.purchase_value,
+            external_id: Some(self.position_id.clone()),
+            remark: self.comment.clone(),
+            source_file: self.source_file.clone(),
+        }
+    }
+}
+
+fn infer_currency(symbol: &str) -> String {
+    let suffix = symbol.rsplit('.').next().unwrap_or("");
+    match suffix {
+        "DE" | "NL" | "FR" | "ES" | "IT" => "EUR",
+        "UK" => "GBP",
+        "US" => "USD",
+        _ => "EUR",
+    }
+    .to_string()
+}
+
+static FX_RATE_CACHE: Lazy<Mutex<HashMap<(String, String), f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static TRADING_CURRENCY_CACHE: Lazy<Mutex<HashMap<(String, String), String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Facteur multiplicatif -> EUR à la date donnée, via Yahoo. Best-effort :
+/// en cas d'échec réseau/format, renvoie 1.0 (dégradé) plutôt que de
+/// lever une erreur qui casserait tout l'import.
+fn fx_rate_to_eur(currency: &str, day_str: &str) -> f64 {
+    if currency == "EUR" {
+        return 1.0;
+    }
+    let key = (currency.to_string(), day_str.to_string());
+    if let Some(cached) = FX_RATE_CACHE.lock().unwrap().get(&key) {
+        return *cached;
+    }
+    let (fx_currency, price_factor) = normalize_currency_for_fx(currency);
+    let rate = match yahoo_historical_price(&format!("EUR{fx_currency}=X"), day_str) {
+        Ok((fx_price, _)) if fx_price != 0.0 => price_factor / fx_price,
+        _ => 1.0,
+    };
+    FX_RATE_CACHE.lock().unwrap().insert(key, rate);
+    rate
+}
+
+/// Devise de cotation RÉELLE de `symbol`, lue chez Yahoo -- ne jamais la
+/// deviner depuis le suffixe XTB seul (repli sur l'heuristique si la
+/// résolution Yahoo échoue).
+fn real_trading_currency(symbol: &str, day_str: &str) -> String {
+    let key = (symbol.to_string(), day_str.to_string());
+    if let Some(cached) = TRADING_CURRENCY_CACHE.lock().unwrap().get(&key) {
+        return cached.clone();
+    }
+    let currency = resolve_ticker(symbol, AssetKind::Stock)
+        .and_then(|ticker| yahoo_historical_price(&ticker, day_str).ok())
+        .map(|(_, currency)| currency)
+        .unwrap_or_else(|| infer_currency(symbol));
+    TRADING_CURRENCY_CACHE.lock().unwrap().insert(key, currency.clone());
+    currency
+}
+
+/// Trouve dynamiquement le nom d'onglet commençant par un préfixe donné,
+/// utile pour 'OPEN POSITION <date>' dont le nom exact change à chaque export.
+pub fn find_sheet_by_prefix(path: &Path, prefix: &str) -> Result<String> {
+    let workbook: Xlsx<_> = open_workbook(path).with_context(|| format!("ouverture de {path:?}"))?;
+    workbook
+        .sheet_names()
+        .iter()
+        .find(|name| name.starts_with(prefix))
+        .cloned()
+        .ok_or_else(|| anyhow!("aucun onglet commençant par '{prefix}'"))
+}
+
+fn cell_str(value: &Data) -> String {
+    match value {
+        Data::Empty => String::new(),
+        Data::String(s) => s.trim().to_string(),
+        Data::Float(f) => f.to_string(),
+        Data::Int(i) => i.to_string(),
+        Data::Bool(b) => b.to_string(),
+        other => format!("{other:?}").trim().to_string(),
+    }
+}
+
+fn cell_f64(value: &Data) -> Option<f64> {
+    match value {
+        Data::Float(f) => Some(*f),
+        Data::Int(i) => Some(*i as f64),
+        Data::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// Excel/xlsx stocke les dates comme un nombre de jours depuis 1899-12-30 ;
+/// calamine expose déjà ce nombre via `as_f64` pour les cellules formatées
+/// date, donc on repasse par cette base -- équivalent du comportement
+/// openpyxl (qui renvoie directement un datetime Python).
+fn cell_datetime(value: &Data) -> Result<DateTime<Utc>> {
+    match value {
+        Data::DateTime(excel_dt) => {
+            let naive = excel_dt.as_datetime().ok_or_else(|| anyhow!("date Excel invalide: {excel_dt:?}"))?;
+            Ok(Utc.from_utc_datetime(&naive))
+        }
+        Data::String(s) => {
+            let naive = NaiveDateTime::parse_from_str(s.trim(), "%d/%m/%Y %H:%M:%S")
+                .with_context(|| format!("format de date inattendu: {s:?}"))?;
+            Ok(Utc.from_utc_datetime(&naive))
+        }
+        other => Err(anyhow!("format de date inattendu: {other:?}")),
+    }
+}
+
+/// Trouve l'index de la ligne d'en-tête -- celle qui contient
+/// `required_col`. Les exports XTB ont un nombre variable de lignes de
+/// titre/résumé de compte au-dessus du vrai tableau.
+fn find_header_row(rows: &[Vec<Data>], required_col: &str) -> Result<usize> {
+    let required_lower = required_col.trim().to_lowercase();
+    for (i, row) in rows.iter().enumerate() {
+        if row.iter().any(|cell| cell_str(cell).to_lowercase() == required_lower) {
+            return Ok(i);
+        }
+    }
+    Err(anyhow!("en-tête introuvable (colonne '{required_col}' non trouvée)"))
+}
+
+/// Nom de colonne (normalisé en minuscules) -> index. Insensible à la
+/// casse : les exports XTB ont déjà changé la casse de certains en-têtes
+/// d'une version à l'autre.
+fn column_map(header_row: &[Data]) -> HashMap<String, usize> {
+    header_row
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cell)| {
+            let s = cell_str(cell);
+            if s.is_empty() {
+                None
+            } else {
+                Some((s.to_lowercase(), i))
+            }
+        })
+        .collect()
+}
+
+fn col<'a>(row: &'a [Data], col_map: &HashMap<String, usize>, name: &str) -> Result<&'a Data> {
+    let idx = col_map
+        .get(&name.trim().to_lowercase())
+        .ok_or_else(|| anyhow!("colonne '{name}' introuvable. Colonnes disponibles: {:?}", {
+            let mut keys: Vec<&String> = col_map.keys().collect();
+            keys.sort();
+            keys
+        }))?;
+    row.get(*idx).ok_or_else(|| anyhow!("cellule manquante pour la colonne '{name}'"))
+}
+
+fn has_col(col_map: &HashMap<String, usize>, name: &str) -> bool {
+    col_map.contains_key(&name.trim().to_lowercase())
+}
+
+fn load_rows(path: &Path, sheet_name: &str) -> Result<Vec<Vec<Data>>> {
+    let mut workbook: Xlsx<_> = open_workbook(path).with_context(|| format!("ouverture de {path:?}"))?;
+    let range = workbook
+        .worksheet_range(sheet_name)
+        .with_context(|| format!("lecture de l'onglet '{sheet_name}'"))?;
+    Ok(range.rows().map(|r| r.to_vec()).collect())
+}
+
+/// Parse l'onglet 'Closed Positions' d'un export XTB xlsx.
+pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbClosedPosition>> {
+    let source_file = path.display().to_string();
+    let rows = load_rows(path, sheet_name)?;
+    let header_idx = find_header_row(&rows, "Position ID")?;
+    let col_map = column_map(&rows[header_idx]);
+    let mut out = Vec::new();
+
+    for row in &rows[header_idx + 1..] {
+        let position_id = match cell_f64(col(row, &col_map, "Position ID")?) {
+            Some(id) => id,
+            None => continue, // ligne "Total" ou vide
+        };
+
+        out.push(XtbClosedPosition {
+            position_id: (position_id as i64).to_string(),
+            symbol: cell_str(col(row, &col_map, "Ticker")?),
+            volume: cell_f64(col(row, &col_map, "Volume")?).unwrap_or(0.0),
+            open_time: cell_datetime(col(row, &col_map, "Open Time (UTC)")?)?,
+            open_price: cell_f64(col(row, &col_map, "Open Price")?).unwrap_or(0.0),
+            close_time: cell_datetime(col(row, &col_map, "Close Time (UTC)")?)?,
+            close_price: cell_f64(col(row, &col_map, "Close Price")?).unwrap_or(0.0),
+            purchase_value: cell_f64(col(row, &col_map, "Purchase Value")?).unwrap_or(0.0),
+            sale_value: cell_f64(col(row, &col_map, "Sale Value")?).unwrap_or(0.0),
+            source_file: source_file.clone(),
+        });
+    }
+
+    Ok(out)
+}
+
+/// Parse l'onglet 'Open Positions' d'un export XTB xlsx.
+///
+/// Le tableau contient deux types de lignes : des lignes "résumé" par
+/// instrument (colonne Type vide) et des lignes "détail" par position
+/// individuelle (Type='BUY'). Seules les secondes sont retenues.
+
+pub fn parse_open_positions(path: &Path, sheet_name: &str, known_tx: &HashMap<String, Transaction>) -> Result<Vec<XtbOpenPosition>> {
+    let source_file = path.display().to_string();
+    let rows = load_rows(path, sheet_name)?;
+    let header_idx = find_header_row(&rows, "Instrument/Position")?;
+    let col_map = column_map(&rows[header_idx]);
+    let mut out = Vec::new();
+
+    for row in &rows[header_idx + 1..] {
+        let side = cell_str(col(row, &col_map, "Type")?);
+        if side.is_empty() {
+            continue;
+        }
+        let position_id = cell_str(col(row, &col_map, "Instrument/Position")?);
+        if position_id.is_empty() {
+            continue;
+        }
+
+        // --- CACHE CHECK ---
+        // Si la transaction d'achat existe déjà dans le wallet, on la reconstruit
+        // à partir des données en cache pour éviter tout appel API Yahoo.
+        if let Some(existing_tx) = known_tx.get(&position_id) {
+            out.push(XtbOpenPosition {
+                position_id: existing_tx.external_id.clone().unwrap_or_default(),
+                symbol: existing_tx.asset.symbol.clone(),
+                volume: existing_tx.quantity,
+                open_time: existing_tx.time,
+                open_price: existing_tx.price.unwrap_or(0.0),
+                purchase_value: existing_tx.value_eur,
+                comment: existing_tx.remark.clone(),
+                source_file: existing_tx.source_file.clone(),
+            });
+            continue;
+        }
+
+        let symbol = cell_str(col(row, &col_map, "Ticker")?);
+        let open_time = cell_datetime(col(row, &col_map, "Open time (UTC)")?)?;
+        let open_price = cell_f64(col(row, &col_map, "Open price")?).unwrap_or(0.0);
+        let volume = cell_f64(col(row, &col_map, "Volume")?).unwrap_or(0.0);
+
+        let day_str = open_time.format("%Y-%m-%d").to_string();
+        let currency = real_trading_currency(&symbol, &day_str);
+        let fx_rate = fx_rate_to_eur(&currency, &day_str);
+        let acquisition_cost_eur = volume * open_price * fx_rate;
+
+        out.push(XtbOpenPosition {
+            position_id,
+            symbol,
+            volume,
+            open_time,
+            open_price,
+            purchase_value: acquisition_cost_eur,
+            comment: None,
+            source_file: source_file.clone(),
+        });
+    }
+
+    Ok(out)
+}
+
+// Mapping des types d'opération 'Cash Operations' -> TransactionKind. Si un
+// nouveau type apparaît dans un futur export, on renvoie une erreur
+// explicite plutôt que de l'ignorer silencieusement.
+fn cash_kind_for(op_type: &str) -> Option<TransactionKind> {
+    match op_type {
+        "Deposit" | "Free funds interest" => Some(TransactionKind::Deposit),
+        // jambe cash de l'achat/vente -- le titre est déjà géré par
+        // parse_open_positions/parse_closed_positions.
+        "Stock purchase" => Some(TransactionKind::Withdraw),
+        "Stock sell" => Some(TransactionKind::Deposit),
+        "Dividend" => Some(TransactionKind::Deposit),
+        "Withholding tax" => Some(TransactionKind::Fee), // retenue à la source sur dividende
+        "Tax IFTT" => Some(TransactionKind::Fee),         // taxe française sur transactions financières
+        "Fractional shares" => Some(TransactionKind::Deposit), // compensation cash pour rompus d'actions
+        _ => None,
+    }
+}
+
+// Ignoré : mouvement interne entre sous-comptes XTB, pas une entrée/sortie
+// réelle de patrimoine (vu sur le principal et sur le PEA).
+const SKIP_CASH_TYPES: &[&str] = &["PEA deposit"];
+
+/// Parse l'onglet 'Cash Operations' d'un export XTB xlsx en transactions de
+/// cash EUR (dépôts, dividendes, taxes, achats/ventes de titres...).
+pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transaction>> {
+    let source_file = path.display().to_string();
+    let rows = load_rows(path, sheet_name)?;
+    let header_idx = find_header_row(&rows, "ID")?;
+    let col_map = column_map(&rows[header_idx]);
+    let mut out = Vec::new();
+
+    let eur_asset = Asset {
+        symbol: "EUR".to_string(),
+        name: "EUR".to_string(),
+        kind: AssetKind::Cash,
+        ref_currency: "EUR".to_string(),
+        identifiers: AssetIdentifiers::default(),
+    };
+
+    for row in &rows[header_idx + 1..] {
+        let op_type = cell_str(col(row, &col_map, "Type")?);
+        if op_type.is_empty() || op_type == "Total" {
+            continue;
+        }
+        if SKIP_CASH_TYPES.contains(&op_type.as_str()) {
+            continue;
+        }
+
+        let kind = cash_kind_for(&op_type).ok_or_else(|| anyhow!("Type d'opération Cash non géré: {op_type:?}"))?;
+        let amount = cell_f64(col(row, &col_map, "Amount")?).unwrap_or(0.0);
+        let op_id = cell_str(col(row, &col_map, "ID")?);
+        let comment = if has_col(&col_map, "Comment") { cell_str(col(row, &col_map, "Comment")?) } else { String::new() };
+
+        out.push(Transaction {
+            platform: Platform::Xtb,
+            account_label: "XTB".to_string(),
+            kind,
+            asset: eur_asset.clone(),
+            quantity: amount.abs(),
+            price: Some(1.0),
+            value_eur: amount.abs(),
+            amount: Some(amount),
+            quote_currency: Some("EUR".to_string()),
+            time: cell_datetime(col(row, &col_map, "Time")?)?,
+            external_id: Some(format!("xtb-cash-{op_id}")),
+            remark: if comment.is_empty() { None } else { Some(comment) },
+            source_file: source_file.clone(),
+        });
+    }
+
+    Ok(out)
+}
+
+
+
+################################################################################
+# Dossier : src
+# Fichier : schema.rs
+# Chemin relatif : schema.rs
+################################################################################
+
+//! Types de base, portage direct de src/schema.py.
+//! Equivalent du crate pf-core évoqué dans le Python d'origine.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Platform {
+    Binance,
+    Xtb,
+    Manual,
+}
+
+impl Platform {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Platform::Binance => "Binance",
+            Platform::Xtb => "Xtb",
+            Platform::Manual => "Manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TransactionKind {
+    Buy,
+    Sell,
+    Fee,
+    Deposit,
+    Withdraw,
+}
+
+impl TransactionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransactionKind::Buy => "Buy",
+            TransactionKind::Sell => "Sell",
+            TransactionKind::Fee => "Fee",
+            TransactionKind::Deposit => "Deposit",
+            TransactionKind::Withdraw => "Withdraw",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AssetKind {
+    Cash,
+    Crypto,
+    Stock,
+}
+
+impl AssetKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AssetKind::Cash => "Cash",
+            AssetKind::Crypto => "Crypto",
+            AssetKind::Stock => "Stock",
+        }
+    }
+}
+
+/// Identifiants externes optionnels d'un actif (ISIN, ticker...).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetIdentifiers {
+    pub isin: Option<String>,
+    pub ticker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Asset {
+    pub symbol: String,
+    pub name: String,
+    pub kind: AssetKind,
+    pub ref_currency: String,
+    pub identifiers: AssetIdentifiers,
+}
+
+/// Transaction porte directement un `Asset` cloné (pas d'`asset_id`) --
+/// la dédup canonique des Asset vit dans TxStore::find_or_create_asset,
+/// comme dans le Python d'origine (suppression d'AssetRegistry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transaction {
+    pub platform: Platform,
+    pub account_label: String,
+    pub kind: TransactionKind,
+    pub asset: Asset,
+    pub quantity: f64,
+    pub price: Option<f64>,
+    /// EUR, immutable : la valeur qui fait autorité (voir cost_basis.rs).
+    pub value_eur: f64,
+    pub amount: Option<f64>,
+    pub quote_currency: Option<String>,
+    pub time: DateTime<Utc>,
+    pub external_id: Option<String>,
+    pub remark: Option<String>,
+    pub source_file: String,
+}
+
+
+################################################################################
+# Dossier : src/store
+# Fichier : mod.rs
+# Chemin relatif : store/mod.rs
+################################################################################
+
+pub mod serialize;
+
+
+################################################################################
+# Dossier : src/store
+# Fichier : serialize.rs
+# Chemin relatif : store/serialize.rs
+################################################################################
+
+//! Portage de src/store/serialize.py : TxStore (conteneur en mémoire) +
+//! chargement/sauvegarde JSON. Format compatible avec l'ancien
+//! serialized_tx.json Python (assets en dict par symbole, transactions
+//! en liste plate avec champ "asset" = symbole).
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+
+const TX_STORE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AssetMeta {
+    name: String,
+    kind: AssetKind,
+    ref_currency: String,
+    identifiers: AssetIdentifiers,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransactionDto {
+    platform: Platform,
+    account_label: String,
+    kind: TransactionKind,
+    asset: String,
+    quantity: f64,
+    price: Option<f64>,
+    value_eur: f64,
+    amount: Option<f64>,
+    quote_currency: Option<String>,
+    time: String,
+    external_id: Option<String>,
+    remark: Option<String>,
+    source_file: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WalletPayload {
+    version: u32,
+    updated_at: String,
+    assets: HashMap<String, AssetMeta>,
+    transactions: Vec<TransactionDto>,
+}
+
+/// Conteneur en mémoire pour l'ensemble des transactions et actifs connus.
+/// Equivalent de la classe TxStore côté Python (anciennement Wallet).
+#[derive(Debug, Default)]
+pub struct TxStore {
+    pub assets: HashMap<String, Asset>,
+    pub transactions: Vec<Transaction>,
+    known_external_ids: HashSet<String>,
+}
+
+impl TxStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Retourne l'Asset canonique pour ce symbole, le créant si besoin.
+    /// Si un Asset existe déjà, ses métadonnées font foi (dédup, remplace
+    /// l'ancien AssetRegistry.find_or_create).
+    pub fn find_or_create_asset(
+        &mut self,
+        symbol: &str,
+        name: &str,
+        kind: AssetKind,
+        ref_currency: &str,
+        identifiers: AssetIdentifiers,
+    ) -> Asset {
+        if let Some(existing) = self.assets.get(symbol) {
+            return existing.clone();
+        }
+        let asset = Asset {
+            symbol: symbol.to_string(),
+            name: name.to_string(),
+            kind,
+            ref_currency: ref_currency.to_string(),
+            identifiers,
+        };
+        self.assets.insert(symbol.to_string(), asset.clone());
+        asset
+    }
+
+    /// Fusionne des transactions fraîchement parsées dans le wallet.
+    /// Chaque `tx.asset` (venant d'un parseur, instance locale au run)
+    /// est retraduit vers l'Asset canonique via son symbole. Retourne le
+    /// nombre de transactions effectivement ajoutées (hors doublons).
+    pub fn add_transactions(&mut self, new_transactions: Vec<Transaction>) -> usize {
+        let mut added = 0;
+        for tx in new_transactions {
+            if let Some(ext_id) = &tx.external_id {
+                if self.known_external_ids.contains(ext_id) {
+                    continue;
+                }
+            }
+
+            let local_asset = self.find_or_create_asset(
+                &tx.asset.symbol,
+                &tx.asset.name,
+                tx.asset.kind,
+                &tx.asset.ref_currency,
+                tx.asset.identifiers.clone(),
+            );
+
+            let ext_id = tx.external_id.clone();
+            let mut stored_tx = tx;
+            stored_tx.asset = local_asset;
+            self.transactions.push(stored_tx);
+
+            if let Some(ext_id) = ext_id {
+                self.known_external_ids.insert(ext_id);
+            }
+            added += 1;
+        }
+        added
+    }
+
+    /// Retire toutes les transactions d'une plateforme et les remplace par
+    /// `new_transactions` -- remplacement complet, pas de merge partiel.
+    pub fn replace_platform(&mut self, platform: Platform, new_transactions: Vec<Transaction>) -> usize {
+        self.transactions.retain(|tx| tx.platform != platform);
+        self.known_external_ids = self
+            .transactions
+            .iter()
+            .filter_map(|tx| tx.external_id.clone())
+            .collect();
+        self.add_transactions(new_transactions)
+    }
+}
+
+fn transaction_to_dto(tx: &Transaction) -> TransactionDto {
+    TransactionDto {
+        platform: tx.platform,
+        account_label: tx.account_label.clone(),
+        kind: tx.kind,
+        asset: tx.asset.symbol.clone(),
+        quantity: tx.quantity,
+        price: tx.price,
+        value_eur: tx.value_eur,
+        amount: tx.amount,
+        quote_currency: tx.quote_currency.clone(),
+        time: tx.time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        external_id: tx.external_id.clone(),
+        remark: tx.remark.clone(),
+        source_file: tx.source_file.clone(),
+    }
+}
+
+fn dto_to_transaction(dto: TransactionDto, tx_store: &mut TxStore, assets_meta: &HashMap<String, AssetMeta>) -> Result<Transaction> {
+    let meta = assets_meta
+        .get(&dto.asset)
+        .with_context(|| format!("métadonnées manquantes pour l'actif '{}'", dto.asset))?;
+    let asset = tx_store.find_or_create_asset(
+        &dto.asset,
+        &meta.name,
+        meta.kind,
+        &meta.ref_currency,
+        meta.identifiers.clone(),
+    );
+    let time: DateTime<Utc> = DateTime::parse_from_rfc3339(&dto.time)
+        .with_context(|| format!("horodatage invalide: {}", dto.time))?
+        .with_timezone(&Utc);
+
+    Ok(Transaction {
+        platform: dto.platform,
+        account_label: dto.account_label,
+        kind: dto.kind,
+        asset,
+        quantity: dto.quantity,
+        price: dto.price,
+        value_eur: dto.value_eur,
+        amount: dto.amount,
+        quote_currency: dto.quote_currency,
+        time,
+        external_id: dto.external_id,
+        remark: dto.remark,
+        source_file: dto.source_file,
+    })
+}
+
+/// Charge un serialized_tx.json existant. Retourne un TxStore vide si le
+/// fichier n'existe pas encore (premier import).
+pub fn load_tx_store(path: &Path) -> Result<TxStore> {
+    let mut tx_store = TxStore::new();
+
+    if !path.exists() {
+        return Ok(tx_store);
+    }
+
+    let raw = fs::read_to_string(path).with_context(|| format!("lecture de {:?}", path))?;
+    let payload: WalletPayload = serde_json::from_str(&raw).with_context(|| format!("parse JSON de {:?}", path))?;
+
+    for dto in payload.transactions {
+        let tx = dto_to_transaction(dto, &mut tx_store, &payload.assets)?;
+        if let Some(ext_id) = tx.external_id.clone() {
+            tx_store.known_external_ids.insert(ext_id);
+        }
+        tx_store.transactions.push(tx);
+    }
+
+    Ok(tx_store)
+}
+
+/// Réécrit le serialized_tx.json en entier (pas d'append) -- garantit un
+/// fichier toujours cohérent avec l'état en mémoire.
+pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
+    let assets_out: HashMap<String, AssetMeta> = tx_store
+        .assets
+        .iter()
+        .map(|(symbol, asset)| {
+            (
+                symbol.clone(),
+                AssetMeta {
+                    name: asset.name.clone(),
+                    kind: asset.kind,
+                    ref_currency: asset.ref_currency.clone(),
+                    identifiers: asset.identifiers.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let mut transactions_out: Vec<TransactionDto> = tx_store.transactions.iter().map(transaction_to_dto).collect();
+    // Ordre chronologique stable -> diffs git lisibles.
+    transactions_out.sort_by(|a, b| a.time.cmp(&b.time));
+
+    let payload = WalletPayload {
+        version: TX_STORE_VERSION,
+        updated_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        assets: assets_out,
+        transactions: transactions_out,
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&payload)?;
+    fs::write(path, json).with_context(|| format!("écriture de {:?}", path))?;
+    Ok(())
+}
+
