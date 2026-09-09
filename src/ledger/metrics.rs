@@ -55,8 +55,9 @@ pub fn compute_correlation_matrix(tx_store: &TxStore, days: i64) -> HashMap<Stri
 
     // 2. On fetch les historiques de prix et on calcule les rendements
     let mut returns_map: HashMap<String, Vec<f64>> = HashMap::new();
-
+    
     for symbol in &symbols {
+        
         let asset = tx_store.assets.get(symbol).unwrap();
         let ticker = asset.identifiers.ticker.as_deref();
         
@@ -71,7 +72,7 @@ pub fn compute_correlation_matrix(tx_store: &TxStore, days: i64) -> HashMap<Stri
             returns_map.insert(symbol.clone(), daily_returns(&prices));
         }
     }
-    
+
     // 3. On calcule la matrice NxN
     let mut matrix: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let valid_symbols: Vec<String> = returns_map.keys().cloned().collect();
