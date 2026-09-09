@@ -304,8 +304,7 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbCl
 /// Le tableau contient deux types de lignes : des lignes "résumé" par
 /// instrument (colonne Type vide) et des lignes "détail" par position
 /// individuelle (Type='BUY'). Seules les secondes sont retenues.
-
-pub fn parse_open_positions(path: &Path, sheet_name: &str, known_tx: &HashMap<String, Transaction>) -> Result<Vec<XtbOpenPosition>> {
+pub fn parse_open_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbOpenPosition>> {
     let source_file = path.display().to_string();
     let rows = load_rows(path, sheet_name)?;
     let header_idx = find_header_row(&rows, "Instrument/Position")?;
@@ -322,28 +321,17 @@ pub fn parse_open_positions(path: &Path, sheet_name: &str, known_tx: &HashMap<St
             continue;
         }
 
-        // --- CACHE CHECK ---
-        // Si la transaction d'achat existe déjà dans le wallet, on la reconstruit
-        // à partir des données en cache pour éviter tout appel API Yahoo.
-        if let Some(existing_tx) = known_tx.get(&position_id) {
-            out.push(XtbOpenPosition {
-                position_id: existing_tx.external_id.clone().unwrap_or_default(),
-                symbol: existing_tx.asset.symbol.clone(),
-                volume: existing_tx.quantity,
-                open_time: existing_tx.time,
-                open_price: existing_tx.price.unwrap_or(0.0),
-                purchase_value: existing_tx.value_eur,
-                comment: existing_tx.remark.clone(),
-                source_file: existing_tx.source_file.clone(),
-            });
-            continue;
-        }
-
         let symbol = cell_str(col(row, &col_map, "Ticker")?);
         let open_time = cell_datetime(col(row, &col_map, "Open time (UTC)")?)?;
         let open_price = cell_f64(col(row, &col_map, "Open price")?).unwrap_or(0.0);
         let volume = cell_f64(col(row, &col_map, "Volume")?).unwrap_or(0.0);
 
+        // Coût réel d'acquisition (Volume x Open price), converti en EUR à
+        // la date d'ouverture -- PAS la colonne "Value" (valeur de marché
+        // au moment de l'export) : utiliser celle-ci comme purchase_value
+        // faussait silencieusement tout le cost basis FIFO à chaque
+        // réimport (le "coût d'achat" devenait la valeur de marché du jour
+        // d'export).
         let day_str = open_time.format("%Y-%m-%d").to_string();
         let currency = real_trading_currency(&symbol, &day_str);
         let fx_rate = fx_rate_to_eur(&currency, &day_str);
@@ -356,7 +344,7 @@ pub fn parse_open_positions(path: &Path, sheet_name: &str, known_tx: &HashMap<St
             open_time,
             open_price,
             purchase_value: acquisition_cost_eur,
-            comment: None,
+            comment: None, // colonne "Comment" absente du nouvel export
             source_file: source_file.clone(),
         });
     }

@@ -11,12 +11,16 @@ use sha2::{Digest, Sha256};
 use crate::market::prices::historical_price_eur;
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
 
+/// ID stable et déterministe pour le dédoublonnage, calculé sur les champs
+/// bruts du CSV -- recalculer le même hash sur les mêmes données d'export
+/// donne toujours le même external_id.
 pub fn synthetic_id(prefix: &str, parts: &[&str]) -> String {
     let joined = parts.join("|");
     let digest = Sha256::digest(joined.as_bytes());
     format!("{prefix}-{}", hex::encode(&digest)[..16].to_string())
 }
 
+/// Sépare une cellule collée '<nombre><symbole>' (format Trade History).
 fn split_amount(raw: &str) -> Result<(f64, String)> {
     let re = Regex::new(r"^([0-9.]+)([A-Za-z]+)$").unwrap();
     let caps = re.captures(raw.trim()).ok_or_else(|| anyhow!("pas de suffixe trouvé dans '{raw}'"))?;
@@ -24,6 +28,8 @@ fn split_amount(raw: &str) -> Result<(f64, String)> {
     Ok((qty, caps[2].to_string()))
 }
 
+/// Sépare une cellule '<nombre> <symbole>' (format Convert), à ne pas
+/// confondre avec `split_amount` (collé, format Trade History).
 fn split_space_amount(raw: &str) -> Result<(f64, String)> {
     let mut parts = raw.trim().splitn(2, ' ');
     let qty_str = parts.next().ok_or_else(|| anyhow!("pas de symbole dans '{raw}'"))?;
@@ -52,7 +58,12 @@ fn parse_time(raw: &str) -> Result<chrono::DateTime<Utc>> {
     Ok(Utc.from_utc_datetime(&naive))
 }
 
-pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Result<Vec<Transaction>> {
+/// Parse un export Binance 'Trade History' en transactions Buy/Sell + Fee.
+///
+/// Seule source Binance retenue -- le format 'Account Statement' est
+/// abandonné (pas de prix d'exécution fiable, appariement heuristique trop
+/// fragile).
+pub fn parse_trades(path: &Path) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
     let mut out = Vec::new();
 
@@ -76,17 +87,6 @@ pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Res
             other => return Err(anyhow!("side inconnu: {other}")),
         };
 
-        let trade_id = synthetic_id(
-            "binance-trade",
-            &[get("Time")?, get("Pair")?, get("Side")?, get("Price")?, get("Executed")?, get("Amount")?],
-        );
-
-        // --- CACHE CHECK ---
-        if let Some(existing_tx) = known_tx.get(&trade_id) {
-            out.push(existing_tx.clone());
-            continue;
-        }
-
         let base_ref_currency = normalize_currency(&base_symbol).unwrap_or("USD").to_string();
         let base_asset = Asset {
             symbol: base_symbol.clone(),
@@ -99,6 +99,10 @@ pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Res
         let quote_currency = normalize_currency(&quote_symbol).map(String::from).unwrap_or(quote_symbol.clone());
         let eur_price = historical_price_eur(&base_symbol, time, asset_kind_for(&base_symbol), None);
         let value_eur = base_qty * eur_price;
+        let trade_id = synthetic_id(
+            "binance-trade",
+            &[get("Time")?, get("Pair")?, get("Side")?, get("Price")?, get("Executed")?, get("Amount")?],
+        );
 
         out.push(Transaction {
             platform: Platform::Binance,
@@ -111,20 +115,12 @@ pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Res
             quote_currency: Some(quote_currency),
             time,
             value_eur,
-            external_id: Some(trade_id.clone()),
+            external_id: Some(trade_id),
             remark: None,
             source_file: source_file.clone(),
         });
 
         if fee_amount > 0.0 {
-            let fee_id = synthetic_id("binance-fee", &[&trade_id, get("Fee")?]);
-            
-            // --- CACHE CHECK FEE ---
-            if let Some(existing_fee_tx) = known_tx.get(&fee_id) {
-                out.push(existing_fee_tx.clone());
-                continue;
-            }
-
             let fee_ref_currency = normalize_currency(&fee_symbol).unwrap_or("USD").to_string();
             let fee_asset = Asset {
                 symbol: fee_symbol.clone(),
@@ -133,6 +129,8 @@ pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Res
                 ref_currency: fee_ref_currency,
                 identifiers: AssetIdentifiers::default(),
             };
+            // Le prix et la valeur du fee doivent être basés sur l'actif du
+            // fee (ex: BNB), pas sur le base (ex: BTC).
             let fee_price_eur = historical_price_eur(&fee_symbol, time, asset_kind_for(&fee_symbol), None);
             let fee_value_eur = fee_amount * fee_price_eur;
 
@@ -147,7 +145,7 @@ pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Res
                 quote_currency: None,
                 time,
                 value_eur: fee_value_eur,
-                external_id: Some(fee_id),
+                external_id: None,
                 remark: Some(format!("Fee on {side} {base_symbol}")),
                 source_file: source_file.clone(),
             });
@@ -157,7 +155,10 @@ pub fn parse_trades(path: &Path, known_tx: &HashMap<String, Transaction>) -> Res
     Ok(out)
 }
 
-pub fn parse_converts(path: &Path, known_tx: &HashMap<String, Transaction>) -> Result<Vec<Transaction>> {
+/// Parse un export Binance 'Convert History'. Chaque ligne réussie devient
+/// deux transactions (Sell de l'actif cédé, Buy de l'actif reçu) -- les
+/// conversions échouées/annulées (Status != 'Successful') sont ignorées.
+pub fn parse_converts(path: &Path) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
     let mut out = Vec::new();
 
@@ -177,75 +178,61 @@ pub fn parse_converts(path: &Path, known_tx: &HashMap<String, Transaction>) -> R
         let (sell_qty, sell_symbol) = split_space_amount(get("Sell")?)?;
         let (buy_qty, buy_symbol) = split_space_amount(get("Buy")?)?;
 
+        let sell_asset = Asset {
+            symbol: sell_symbol.clone(),
+            name: sell_symbol.clone(),
+            kind: asset_kind_for(&sell_symbol),
+            ref_currency: normalize_currency(&sell_symbol).unwrap_or("USD").to_string(),
+            identifiers: AssetIdentifiers::default(),
+        };
+        let buy_asset = Asset {
+            symbol: buy_symbol.clone(),
+            name: buy_symbol.clone(),
+            kind: asset_kind_for(&buy_symbol),
+            ref_currency: normalize_currency(&buy_symbol).unwrap_or("USD").to_string(),
+            identifiers: AssetIdentifiers::default(),
+        };
+
+        let sell_price_eur = historical_price_eur(&sell_symbol, time, asset_kind_for(&sell_symbol), None);
+        let buy_price_eur = historical_price_eur(&buy_symbol, time, asset_kind_for(&buy_symbol), None);
+        let buy_value_eur = buy_qty * buy_price_eur;
+        let sell_value_eur = sell_qty * sell_price_eur;
+
         let convert_id = synthetic_id(
             "binance-convert",
             &[get("Time")?, get("Wallet")?, get("Pair")?, get("Sell")?, get("Buy")?, get("Price")?],
         );
 
-        let sell_id = format!("{convert_id}-sell");
-        let buy_id = format!("{convert_id}-buy");
-
-        // --- CACHE CHECK SELL ---
-        if let Some(existing_tx) = known_tx.get(&sell_id) {
-            out.push(existing_tx.clone());
-        } else {
-            let sell_asset = Asset {
-                symbol: sell_symbol.clone(),
-                name: sell_symbol.clone(),
-                kind: asset_kind_for(&sell_symbol),
-                ref_currency: normalize_currency(&sell_symbol).unwrap_or("USD").to_string(),
-                identifiers: AssetIdentifiers::default(),
-            };
-            let sell_price_eur = historical_price_eur(&sell_symbol, time, asset_kind_for(&sell_symbol), None);
-            let sell_value_eur = sell_qty * sell_price_eur;
-
-            out.push(Transaction {
-                platform: Platform::Binance,
-                account_label: get("Wallet")?.to_string(),
-                kind: TransactionKind::Sell,
-                asset: sell_asset,
-                quantity: sell_qty,
-                price: Some(sell_price_eur),
-                amount: Some(sell_value_eur),
-                value_eur: sell_value_eur,
-                quote_currency: Some("EUR".to_string()),
-                time,
-                external_id: Some(sell_id),
-                remark: Some("Convert".to_string()),
-                source_file: source_file.clone(),
-            });
-        }
-
-        // --- CACHE CHECK BUY ---
-        if let Some(existing_tx) = known_tx.get(&buy_id) {
-            out.push(existing_tx.clone());
-        } else {
-            let buy_asset = Asset {
-                symbol: buy_symbol.clone(),
-                name: buy_symbol.clone(),
-                kind: asset_kind_for(&buy_symbol),
-                ref_currency: normalize_currency(&buy_symbol).unwrap_or("USD").to_string(),
-                identifiers: AssetIdentifiers::default(),
-            };
-            let buy_price_eur = historical_price_eur(&buy_symbol, time, asset_kind_for(&buy_symbol), None);
-            let buy_value_eur = buy_qty * buy_price_eur;
-
-            out.push(Transaction {
-                platform: Platform::Binance,
-                account_label: get("Wallet")?.to_string(),
-                kind: TransactionKind::Buy,
-                asset: buy_asset,
-                quantity: buy_qty,
-                price: Some(buy_price_eur),
-                amount: Some(buy_value_eur),
-                value_eur: buy_value_eur,
-                quote_currency: Some("EUR".to_string()),
-                time,
-                external_id: Some(buy_id),
-                remark: Some("Convert".to_string()),
-                source_file: source_file.clone(),
-            });
-        }
+        out.push(Transaction {
+            platform: Platform::Binance,
+            account_label: get("Wallet")?.to_string(),
+            kind: TransactionKind::Sell,
+            asset: sell_asset,
+            quantity: sell_qty,
+            price: Some(sell_price_eur),
+            amount: Some(sell_value_eur),
+            value_eur: sell_value_eur,
+            quote_currency: Some("EUR".to_string()),
+            time,
+            external_id: Some(format!("{convert_id}-sell")),
+            remark: Some("Convert".to_string()),
+            source_file: source_file.clone(),
+        });
+        out.push(Transaction {
+            platform: Platform::Binance,
+            account_label: get("Wallet")?.to_string(),
+            kind: TransactionKind::Buy,
+            asset: buy_asset,
+            quantity: buy_qty,
+            price: Some(buy_price_eur),
+            amount: Some(buy_value_eur),
+            value_eur: buy_value_eur,
+            quote_currency: Some("EUR".to_string()),
+            time,
+            external_id: Some(format!("{convert_id}-buy")),
+            remark: Some("Convert".to_string()),
+            source_file: source_file.clone(),
+        });
     }
 
     Ok(out)

@@ -15,9 +15,8 @@ use std::collections::{HashMap, VecDeque};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
-use crate::schema::{TransactionKind};
+use crate::schema::TransactionKind;
 use crate::store::serialize::TxStore;
-
 
 const EPSILON: f64 = 1e-12;
 

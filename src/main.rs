@@ -4,17 +4,46 @@
 //! Ré-exécutable sans risque : le dédoublonnage par external_id garantit
 //! qu'un même fichier réimporté ne crée pas de doublons.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
 use portfolio_rs::ledger::cost_basis::compute_fifo;
 use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
+use portfolio_rs::ledger::positions::non_zero_holdings_at;
+use portfolio_rs::market::correlation::compute_correlation_matrix;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
 use portfolio_rs::store::serialize::{load_tx_store, save_wallet};
+
+/// Seuil en-dessous duquel un actif est considéré comme une poussière et
+/// exclu de la matrice de corrélation. Les benchmarks (indices,
+/// matières premières) y échappent -- ils n'ont pas de "valeur détenue".
+const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
+const CORRELATION_LOOKBACK_DAYS: i64 = 90;
+
+#[derive(serde::Serialize)]
+struct DashboardAsset {
+    symbol: String,
+    kind: String,
+    ticker: Option<String>,
+    quantity: f64,
+    price_eur: f64,
+    value_eur: f64,
+    cost_basis_eur: f64,
+    pnl_eur: f64,
+    pnl_pct: f64,
+}
+
+#[derive(serde::Serialize)]
+struct DashboardData {
+    total_value_eur: f64,
+    total_cost_basis_eur: f64,
+    total_pnl_eur: f64,
+    assets: Vec<DashboardAsset>,
+    correlation_matrix: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+}
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -24,14 +53,14 @@ fn accounts_path() -> PathBuf {
     data_dir().join("accounts")
 }
 
-fn parse_binance_sources(known_tx: &HashMap<String, Transaction>) -> Vec<Transaction> {
+fn parse_binance_sources() -> Vec<Transaction> {
     let mut out = Vec::new();
     let trades_path = accounts_path().join("trades.csv");
     let converts_path = accounts_path().join("convert.csv");
 
     if trades_path.exists() {
         println!("Lecture Binance Trades : {trades_path:?}");
-        match binance::parse_trades(&trades_path, known_tx) {
+        match binance::parse_trades(&trades_path) {
             Ok(mut tx) => out.append(&mut tx),
             Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
         }
@@ -41,7 +70,7 @@ fn parse_binance_sources(known_tx: &HashMap<String, Transaction>) -> Vec<Transac
 
     if converts_path.exists() {
         println!("Lecture Binance Converts : {converts_path:?}");
-        match binance::parse_converts(&converts_path, known_tx) {
+        match binance::parse_converts(&converts_path) {
             Ok(mut tx) => out.append(&mut tx),
             Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
         }
@@ -52,7 +81,7 @@ fn parse_binance_sources(known_tx: &HashMap<String, Transaction>) -> Vec<Transac
     out
 }
 
-fn parse_xtb_file(path: &Path, known_tx: &HashMap<String, Transaction>) -> Vec<Transaction> {
+fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
     let mut out = Vec::new();
     if !path.exists() {
         println!("[Omis] Fichier introuvable : {path:?}");
@@ -74,7 +103,7 @@ fn parse_xtb_file(path: &Path, known_tx: &HashMap<String, Transaction>) -> Vec<T
     }
 
     match xtb::find_sheet_by_prefix(path, "Open Position") {
-        Ok(sheet) => match xtb::parse_open_positions(path, &sheet, known_tx) {
+        Ok(sheet) => match xtb::parse_open_positions(path, &sheet) {
             Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
             Err(e) => println!("  [Erreur XTB Open] {e}"),
         },
@@ -99,18 +128,10 @@ fn main() -> Result<()> {
     let mut tx_store = load_tx_store(&tx_store_path)?;
     println!("Wallet chargé : {} transaction(s) existante(s)", tx_store.transactions.len());
 
-    // --- NOUVEAU : Création du cache des transactions existantes ---
-    // Permet d'éviter de refetcher les prix API pour les TX déjà connues
-    let known_tx: HashMap<String, Transaction> = tx_store
-        .transactions
-        .iter()
-        .filter_map(|tx| tx.external_id.clone().map(|id| (id, tx.clone())))
-        .collect();
-
-    let new_transactions = parse_binance_sources(&known_tx);
+    let new_transactions = parse_binance_sources();
     let mut xtb_tx = Vec::new();
-    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account.xlsx"), &known_tx));
-    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account_pea.xlsx"), &known_tx));
+    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account.xlsx")));
+    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
 
     tx_store.add_transactions(new_transactions);
     tx_store.add_transactions(xtb_tx.clone());
@@ -204,78 +225,46 @@ fn main() -> Result<()> {
 
     println!("\nP&L latent total : {total_pnl:>+.2} EUR");
 
-  
-       // --- EXPORT POUR LE DASHBOARD STREAMLIT ---
-    println!("\n=== EXPORT DASHBOARD ===");
-    use serde::Serialize;
+    // --- EXPORT dashboard.json (consommé par dashboard.py) ---
+    println!("\n=== CALCUL DE LA CORRÉLATION ({CORRELATION_LOOKBACK_DAYS}j, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
+    let holdings = non_zero_holdings_at(&tx_store, None);
+    let prices_eur: std::collections::HashMap<String, f64> =
+        snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
+    let correlation_matrix = compute_correlation_matrix(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR, CORRELATION_LOOKBACK_DAYS);
 
-    #[derive(Serialize)]
-    struct DashboardAsset {
-        symbol: String,
-        quantity: f64,
-        price_eur: f64,
-        value_eur: f64,
-        cost_basis_eur: f64,
-        pnl_eur: f64,
-        pnl_pct: f64,
-        kind: AssetKind,
-    }
+    let dashboard_assets: Vec<DashboardAsset> = snapshot
+        .assets
+        .iter()
+        .map(|a| {
+            let cost_basis_eur = cost_basis.open_cost_basis(&a.symbol);
+            let pnl_eur = a.value_eur - cost_basis_eur;
+            let pnl_pct = if cost_basis_eur > 0.0 { pnl_eur / cost_basis_eur * 100.0 } else { 0.0 };
+            DashboardAsset {
+                symbol: a.symbol.clone(),
+                kind: a.kind.as_str().to_string(),
+                ticker: a.ticker.clone(),
+                quantity: a.quantity,
+                price_eur: a.price_eur,
+                value_eur: a.value_eur,
+                cost_basis_eur,
+                pnl_eur,
+                pnl_pct,
+            }
+        })
+        .collect();
 
-    #[derive(Serialize)]
-    struct DashboardData {
-        date: String,
-        total_value_eur: f64,
-        total_cost_basis_eur: f64,
-        total_pnl_eur: f64,
-        assets: Vec<DashboardAsset>,
-        correlation_matrix: HashMap<String, HashMap<String, f64>>,
-    }
-
-    let mut dashboard_assets = Vec::new();
-    let mut total_cb = 0.0;
-    let mut total_pnl_calc = 0.0;
-
-    for asset in &snapshot.assets {
-        if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") {
-            continue; // on cache les poussières
-        }
-
-        let cb_total = cost_basis.open_cost_basis(&asset.symbol);
-        let pnl_eur = asset.value_eur - cb_total;
-        let pnl_pct = if cb_total > 0.0 { pnl_eur / cb_total * 100.0 } else { 0.0 };
-
-        total_cb += cb_total;
-        total_pnl_calc += pnl_eur;
-
-        dashboard_assets.push(DashboardAsset {
-            symbol: asset.symbol.clone(),
-            quantity: asset.quantity,
-            price_eur: asset.price_eur,
-            value_eur: asset.value_eur,
-            cost_basis_eur: cb_total,
-            pnl_eur,
-            pnl_pct,
-            kind: asset.kind,
-        });
-    }
-    // --- NOUVEAU : CALCUL DE LA MATRICE ---
-    println!("\n=== CALCUL DE LA MATRICE DE CORRÉLATION ===");
-    let correlation_matrix = portfolio_rs::ledger::metrics::compute_correlation_matrix(&tx_store, 90);
-
+    let total_cost_basis_eur: f64 = dashboard_assets.iter().map(|a| a.cost_basis_eur).sum();
     let dashboard_data = DashboardData {
-        date: snapshot.date.clone(),
         total_value_eur: snapshot.total_value_eur,
-        total_cost_basis_eur: total_cb,
-        total_pnl_eur: total_pnl_calc,
+        total_cost_basis_eur,
+        total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
         assets: dashboard_assets,
-        correlation_matrix: correlation_matrix,
+        correlation_matrix,
     };
 
     let dashboard_path = PathBuf::from("./data/dashboard.json");
-    let dashboard_json = serde_json::to_string_pretty(&dashboard_data)?;
-    std::fs::write(&dashboard_path, dashboard_json)?;
-    println!("Données du dashboard sauvegardées dans : {dashboard_path:?}");
+    std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
+    println!("Dashboard écrit : {dashboard_path:?}");
 
     Ok(())
 }
-
