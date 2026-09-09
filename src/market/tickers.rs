@@ -32,10 +32,12 @@ fn xtb_to_yahoo_suffix() -> &'static [(&'static str, &'static str)] {
 
 // Corrections manuelles pour les cas où la recherche Yahoo se trompe
 // systématiquement.
-fn manual_ticker_overrides() -> &'static [(&'static str, &'static str)] {
+
+pub fn manual_ticker_overrides() -> &'static [(&'static str, &'static str)] {
     &[
         ("MSTR.US", "MSTR"),
-        ("XFVT.DE", "XFVT.DE"), // plusieurs classes de parts homonymes -> ambigu pour la recherche Yahoo
+        ("XFVT.DE", "XFVT.DE"), 
+        ("CNYA.DE", "CNYA.DE"), // <--- AJOUTE CELLE-CI ICI
     ]
 }
 
@@ -182,3 +184,4 @@ pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
         AssetKind::Cash => None,
     }
 }
+

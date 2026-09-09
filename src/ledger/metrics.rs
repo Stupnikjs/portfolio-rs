@@ -60,12 +60,18 @@ pub fn compute_correlation_matrix(tx_store: &TxStore, days: i64) -> HashMap<Stri
         let asset = tx_store.assets.get(symbol).unwrap();
         let ticker = asset.identifiers.ticker.as_deref();
         
+        // --- NOUVEAU : On saute les actions si on n'a pas réussi à résoudre le ticker ---
+        if asset.kind == AssetKind::Stock && ticker.is_none() {
+            println!("  [SKIP METRICS] {symbol} ignoré dans la corrélation (ticker manquant)");
+            continue;
+        }
+
         let prices = fetch_daily_closes(symbol, asset.kind, ticker, days);
         if prices.len() > 5 {
             returns_map.insert(symbol.clone(), daily_returns(&prices));
         }
     }
-
+    
     // 3. On calcule la matrice NxN
     let mut matrix: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let valid_symbols: Vec<String> = returns_map.keys().cloned().collect();
