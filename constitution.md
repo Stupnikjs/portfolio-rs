@@ -74,6 +74,21 @@ Pour chaque poche, on définit une cible avec une bande de tolérance.
 4.  **Le prix est-il suffisamment intéressant ?** *(Une baisse de 5, 10 ou 20 % n'est pas en soi une justification).*
 5.  **La thèse fondamentale est-elle intacte ?** *(Si elle a changé → ne pas renforcer mécaniquement).*
 
+🔴 Règle de Vente
+
+Une vente peut survenir lorsque la concentration d'un actif dans sa sous-catégorie, dans sa poche ou dans le portefeuille devient trop importante.
+
+La vente n'est pas nécessairement liée à une dégradation de la thèse fondamentale. Elle peut simplement avoir pour objectif de préserver la diversification et la structure cible du portefeuille.
+
+Une forte appréciation d'une position peut donc justifier une réduction partielle lorsque son poids devient disproportionné.
+
+Une vente peut ainsi être déclenchée principalement pour deux raisons :
+
+- Thèse fondamentale invalidée.
+- Concentration excessive de l'actif dans sa sous-catégorie, sa poche ou le portefeuille global.
+
+Principe : une entreprise peut rester une excellente entreprise tout en devenant une position trop importante dans le portefeuille. Dans ce cas, une réduction partielle est possible sans remettre en cause la conviction fondamentale.
+
 ### 🛑 Règle Anti-Dispersion
 Aucune nouvelle ligne sans raison stratégique forte. Avant un achat, vérifier :
 *   Une ligne existante peut-elle remplir le même rôle ?
