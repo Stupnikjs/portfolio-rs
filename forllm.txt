@@ -393,7 +393,7 @@ use anyhow::Result;
 use portfolio_rs::ledger::cost_basis::compute_fifo;
 use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
-use portfolio_rs::market::correlation::compute_correlation_matrix;
+use portfolio_rs::market::correlation::compute_correlation_matrices;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
@@ -403,7 +403,7 @@ use portfolio_rs::store::serialize::{load_tx_store, save_wallet};
 /// exclu de la matrice de corrélation. Les benchmarks (indices,
 /// matières premières) y échappent -- ils n'ont pas de "valeur détenue".
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
-const CORRELATION_LOOKBACK_DAYS: i64 = 90;
+// const CORRELATION_LOOKBACK_DAYS: i64 = 90;
 
 #[derive(serde::Serialize)]
 struct DashboardAsset {
@@ -424,8 +424,8 @@ struct DashboardData {
     total_cost_basis_eur: f64,
     total_pnl_eur: f64,
     assets: Vec<DashboardAsset>,
-    correlation_matrix: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
-}
+    correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, f64>>>,
+    }
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -607,13 +607,11 @@ fn main() -> Result<()> {
 
     println!("\nP&L latent total : {total_pnl:>+.2} EUR");
 
-    // --- EXPORT dashboard.json (consommé par dashboard.py) ---
-    println!("\n=== CALCUL DE LA CORRÉLATION ({CORRELATION_LOOKBACK_DAYS}j, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
+    println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
     let holdings = non_zero_holdings_at(&tx_store, None);
     let prices_eur: std::collections::HashMap<String, f64> =
         snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
-    let correlation_matrix = compute_correlation_matrix(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR, CORRELATION_LOOKBACK_DAYS);
-
+    let correlation_matrices = compute_correlation_matrices(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR);
     let dashboard_assets: Vec<DashboardAsset> = snapshot
         .assets
         .iter()
@@ -641,7 +639,7 @@ fn main() -> Result<()> {
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
         assets: dashboard_assets,
-        correlation_matrix,
+        correlation_matrices,
     };
 
     let dashboard_path = PathBuf::from("./data/dashboard.json");
@@ -690,11 +688,27 @@ pub const BENCHMARKS: &[(&str, &str)] = &[
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::NaiveDate;
+use chrono::{Duration, Utc};
 
 use crate::market::benchmarks::BENCHMARKS;
 use crate::market::prices::{binance_daily_closes, yahoo_daily_closes};
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
+
+/// Fenêtres calculées à chaque run. Le label est celui utilisé comme clé
+/// dans le JSON de sortie (consommé tel quel par dashboard.py).
+pub const CORRELATION_WINDOWS: &[(&str, i64)] = &[
+    ("90d", 90),
+    ("6m", 182),
+    ("1y", 365),
+];
+
+
+/// Restreint une série de rendements aux dates >= aujourd'hui - window_days.
+fn windowed(returns: &BTreeMap<NaiveDate, f64>, window_days: i64) -> BTreeMap<NaiveDate, f64> {
+    let cutoff = Utc::now().date_naive() - Duration::days(window_days);
+    returns.range(cutoff..).map(|(d, v)| (*d, *v)).collect()
+}
 
 /// Récupère la série de clôtures pour un actif de portefeuille selon son
 /// type. Best-effort : renvoie None si la source ne répond pas plutôt que
@@ -770,13 +784,19 @@ fn pearson(a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option
 /// Résultat au format dict-de-dicts (label -> label -> coefficient),
 /// directement sérialisable pour dashboard.json et consommable tel quel
 /// par `pd.DataFrame(...)` côté Streamlit.
-pub fn compute_correlation_matrix(
+/// Calcule les matrices de corrélation pour toutes les fenêtres de
+/// `CORRELATION_WINDOWS`, en une seule passe de fetch de prix (sur la
+/// fenêtre la plus large) pour éviter de solliciter Yahoo/Binance une
+/// fois par fenêtre. Résultat : label de fenêtre -> matrice (label ->
+/// label -> coefficient), directement sérialisable pour dashboard.json.
+pub fn compute_correlation_matrices(
     tx_store: &TxStore,
     holdings: &HashMap<String, f64>,
     prices_eur: &HashMap<String, f64>,
     min_value_eur: f64,
-    lookback_days: i64,
-) -> HashMap<String, HashMap<String, f64>> {
+) -> HashMap<String, HashMap<String, HashMap<String, f64>>> {
+    let max_lookback = CORRELATION_WINDOWS.iter().map(|(_, d)| *d).max().unwrap_or(365);
+
     let mut series: Vec<(String, BTreeMap<NaiveDate, f64>)> = Vec::new();
 
     for (symbol, quantity) in holdings {
@@ -791,7 +811,7 @@ pub fn compute_correlation_matrix(
         if value_eur < min_value_eur {
             continue;
         }
-        if let Some(prices) = closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), lookback_days) {
+        if let Some(prices) = closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), max_lookback) {
             series.push((symbol.clone(), prices));
         } else {
             eprintln!("  [WARN corrélation] historique indisponible pour {symbol}, exclu de la matrice.");
@@ -799,25 +819,38 @@ pub fn compute_correlation_matrix(
     }
 
     for (label, ticker) in BENCHMARKS {
-        if let Some(prices) = closes_for_benchmark(ticker, lookback_days) {
+        if let Some(prices) = closes_for_benchmark(ticker, max_lookback) {
             series.push((label.to_string(), prices));
         } else {
             eprintln!("  [WARN corrélation] historique indisponible pour le benchmark {label} ({ticker}), exclu.");
         }
     }
 
-    let returns: Vec<(String, BTreeMap<NaiveDate, f64>)> = series.into_iter().map(|(label, prices)| (label, to_returns(&prices))).collect();
+    // Rendements calculés une seule fois sur l'historique complet.
+    let full_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> =
+        series.into_iter().map(|(label, prices)| (label, to_returns(&prices))).collect();
 
-    let mut matrix: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    for (label_a, returns_a) in &returns {
-        let mut row = HashMap::new();
-        for (label_b, returns_b) in &returns {
-            let coeff = if label_a == label_b { 1.0 } else { pearson(returns_a, returns_b).unwrap_or(0.0) };
-            row.insert(label_b.clone(), coeff);
+    let mut result: HashMap<String, HashMap<String, HashMap<String, f64>>> = HashMap::new();
+
+    for (window_label, window_days) in CORRELATION_WINDOWS {
+        let windowed_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> = full_returns
+            .iter()
+            .map(|(label, r)| (label.clone(), windowed(r, *window_days)))
+            .collect();
+
+        let mut matrix: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for (label_a, returns_a) in &windowed_returns {
+            let mut row = HashMap::new();
+            for (label_b, returns_b) in &windowed_returns {
+                let coeff = if label_a == label_b { 1.0 } else { pearson(returns_a, returns_b).unwrap_or(0.0) };
+                row.insert(label_b.clone(), coeff);
+            }
+            matrix.insert(label_a.clone(), row);
         }
-        matrix.insert(label_a.clone(), row);
+        result.insert(window_label.to_string(), matrix);
     }
-    matrix
+
+    result
 }
 
 
@@ -916,6 +949,7 @@ fn binance_klines(symbol_pair: &str, day_str: &str) -> Result<Vec<Value>, PriceE
 /// demande une fenêtre de plusieurs jours et on prend la dernière bougie
 /// disponible avant ou à la date cible.
 pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, String), PriceError> {
+   
     let key = (ticker.to_string(), day_str.to_string());
     if let Some(cached) = YAHOO_PRICE_CACHE.lock().unwrap().get(&key) {
         return Ok(cached.clone());
@@ -926,7 +960,6 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
 
     let period1 = (target - chrono::Duration::days(7)).timestamp();
     let period2 = (target + chrono::Duration::days(1)).timestamp();
-
     let url = format!("{YAHOO_CHART_API}/{ticker}");
     let resp = client()
         .get(&url)
@@ -966,12 +999,14 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
         .map(|arr| arr.iter().map(|v| v.as_f64()).collect())
         .unwrap_or_default();
 
-    let mut candidates: Vec<(DateTime<Utc>, f64)> = Vec::new();
+    
+    let mut candidates: Vec<(chrono::NaiveDate, f64)> = Vec::new();
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         let Some(close) = close else { continue };
         let dt = Utc.timestamp_opt(*ts, 0).single().ok_or_else(|| PriceError::Message("timestamp invalide".into()))?;
-        if dt <= target {
-            candidates.push((dt, *close));
+        let date = dt.date_naive();
+        if date <= target_date {
+            candidates.push((date, close.clone()));
         }
     }
 
@@ -979,7 +1014,7 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
         return Err(PriceError::Message(format!("Pas de clôture Yahoo disponible pour {ticker} au plus tard le {day_str}")));
     }
 
-    let (_, price) = candidates.into_iter().max_by_key(|(dt, _)| *dt).unwrap();
+    let (_, price) = candidates.into_iter().max_by_key(|(date, _)| *date).unwrap();
 
     YAHOO_PRICE_CACHE.lock().unwrap().insert(key, (price, currency.clone()));
     Ok((price, currency))

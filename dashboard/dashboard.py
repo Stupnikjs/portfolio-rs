@@ -53,11 +53,31 @@ st.divider()
 col_left, col_right = st.columns(2)
 
 with col_left:
-    st.subheader("🥧 Allocation du Portefeuille")
+    st.subheader("🥧 Allocation par Groupe")
+
+    # 1. Exclure le Cash (EUR)
+    df_no_cash = df[~df['symbol'].str.upper().eq('EUR')].copy()
+
+    # 2. Mapping de tes symboles vers les groupes demandés
+    groupe_mapping = {
+        'SANTE': ['SAN.FR', 'MDT.US', 'BIM.FR', 'NOV.DE', 'SHL.DE', 'BSX.US'],
+        'INDUS': ['SGO.FR', 'AI.FR',  'BAS.DE', ],
+        'MAT PREM' : ['4BRZ.DE','EGLN.UK' ],
+        'CRYPTO': ['ETH', 'BTC', 'LINK', 'MSTR.US', 'IB1T.DE'],
+        'ASIE': ['CEBL.DE', 'NDIA.UK', 'PASI.FR', 'XFVT.DE']
+    }
+
+    # Création d'un dictionnaire inversé pour associer chaque symbole à son groupe
+    symbol_to_groupe = {symbole: groupe for groupe, symboles in groupe_mapping.items() for symbole in symboles}
+
+    # Application du mapping sur le DataFrame (les actifs non trouvés iraient dans 'Autres')
+    df_no_cash['groupe'] = df_no_cash['symbol'].map(symbol_to_groupe).fillna('Autres')
+
+    # 3. Graphique en anneau (Donut) respectant ta charte Pastel
     fig_pie = px.pie(
-        df, 
+        df_no_cash, 
         values='value_eur', 
-        names='symbol',
+        names='groupe',
         hole=0.4, # Donut chart
         color_discrete_sequence=px.colors.qualitative.Pastel
     )
@@ -111,11 +131,28 @@ st.dataframe(
 
 st.divider()
 # --- MATRICE DE CORRÉLATION ---
-st.subheader("🔥 Matrice de corrélation (90 jours)")
+st.subheader("🔥 Matrice de corrélation")
+
+# Le Rust écrit "correlation_matrices" (pluriel) : dict window -> matrice.
+correlation_matrices = data.get("correlation_matrices", {})
+
+# Mapping label de fenêtre (côté Rust) -> période acceptée par yfinance
+WINDOW_TO_YF_PERIOD = {"90d": "3mo", "6m": "6mo", "1y": "1y"}
+
+if correlation_matrices:
+    # Ordre canonique si toutes les fenêtres sont présentes
+    default_order = ["90d", "6m", "1y"]
+    available_windows = [w for w in default_order if w in correlation_matrices] \
+                      + [w for w in correlation_matrices if w not in default_order]
+    selected_window = st.selectbox("Fenêtre temporelle", options=available_windows, index=0)
+else:
+    selected_window = "90d"
+
+yf_period = WINDOW_TO_YF_PERIOD.get(selected_window, "3mo")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_returns(tickers: tuple[str, ...], period: str = "90d") -> pd.DataFrame:
+def fetch_returns(tickers: tuple[str, ...], period: str = "3mo") -> pd.DataFrame:
     """Télécharge les clôtures quotidiennes Yahoo Finance pour `tickers` et
     renvoie les rendements journaliers (une colonne par ticker). Les
     tickers introuvables sont simplement absents du résultat plutôt que
@@ -128,19 +165,14 @@ def fetch_returns(tickers: tuple[str, ...], period: str = "90d") -> pd.DataFrame
                 prices[ticker] = hist["Close"]
         except Exception:
             continue
-
     if not prices:
         return pd.DataFrame()
-
     price_df = pd.concat(prices, axis=1)
     price_df.index = price_df.index.tz_localize(None)
     return price_df.pct_change().dropna(how="all")
 
 
 def yfinance_ticker_for(row: pd.Series) -> str:
-    """Meilleure estimation du ticker Yahoo Finance pour un actif du
-    portefeuille. Utilise le ticker déjà résolu côté Rust s'il est présent
-    dans le JSON, sinon une heuristique par type d'actif."""
     ticker = row.get("ticker")
     if isinstance(ticker, str) and ticker:
         return ticker
@@ -149,10 +181,14 @@ def yfinance_ticker_for(row: pd.Series) -> str:
     return row["symbol"]
 
 
-# Labels des benchmarks fixes ajoutés côté Rust (market/benchmarks.rs) --
-# à garder synchronisé si la liste change là-bas. Ils échappent au filtre
-# de valeur ci-dessous : un indice n'a pas de "valeur détenue".
 BENCHMARK_LABELS = {"MSCI China", "CAC 40", "S&P 500", "Or", "Argent"}
+BENCHMARK_TICKERS = {
+    "MSCI China": "MCHI",
+    "CAC 40": "^FCHI",
+    "S&P 500": "^GSPC",
+    "Or": "GC=F",
+    "Argent": "SI=F",
+}
 
 min_value_eur = st.number_input(
     "Valeur minimale par actif du portefeuille pour la corrélation (EUR)",
@@ -168,22 +204,8 @@ extra_tickers = [t.strip().upper() for t in extra_tickers_input.split(",") if t.
 
 eligible_symbols = set(df.loc[df["value_eur"] >= min_value_eur, "symbol"]) | BENCHMARK_LABELS
 
-# Correspondance label -> ticker Yahoo pour les benchmarks, utilisée dans
-# le mode "recalcul en direct" ci-dessous -- doit rester synchronisée avec
-# market/benchmarks.rs côté Rust.
-BENCHMARK_TICKERS = {
-    "MSCI China": "MCHI",
-    "CAC 40": "^FCHI",
-    "S&P 500": "^GSPC",
-    "Or": "GC=F",
-    "Argent": "SI=F",
-}
-
 if extra_tickers:
-    # Dès qu'un ticker externe est demandé, on recalcule tout en direct via
-    # Yahoo Finance : impossible de mélanger une corrélation déjà calculée
-    # côté Rust avec un actif qu'elle ne connaît pas. On réinclut les
-    # benchmarks ici pour ne pas les perdre dans ce mode.
+    # Mode "recalcul en direct" : on appelle Yahoo Finance sur la fenêtre choisie.
     eligible_rows = df[df["symbol"].isin(eligible_symbols)]
     portfolio_tickers = {row["symbol"]: yfinance_ticker_for(row) for _, row in eligible_rows.iterrows()}
     label_by_ticker = {
@@ -193,7 +215,7 @@ if extra_tickers:
     }
 
     with st.spinner("Récupération des historiques de prix (Yahoo Finance)..."):
-        returns = fetch_returns(tuple(sorted(set(label_by_ticker.keys()))))
+        returns = fetch_returns(tuple(sorted(set(label_by_ticker.keys()))), period=yf_period)
 
     missing = set(label_by_ticker.keys()) - set(returns.columns)
     if missing:
@@ -201,15 +223,14 @@ if extra_tickers:
 
     returns = returns.rename(columns=label_by_ticker)
     corr_matrix = returns.corr() if returns.shape[1] >= 2 else pd.DataFrame()
-    source_note = "Corrélation recalculée en direct (Yahoo Finance)"
-elif "correlation_matrix" in data and data["correlation_matrix"]:
-    # Cas par défaut : pas de ticker externe demandé -> on réutilise la
-    # matrice déjà calculée côté Rust (pas d'appel réseau), en ne gardant
-    # que les actifs au-dessus du seuil de valeur.
-    full_corr = pd.DataFrame(data["correlation_matrix"])
+    source_note = f"Corrélation recalculée en direct (Yahoo Finance, fenêtre={selected_window})"
+elif correlation_matrices and selected_window in correlation_matrices:
+    # ✅ Cas nominal : on réutilise la matrice pré-calculée par le Rust pour
+    # la fenêtre sélectionnée, en filtrant selon le seuil de valeur.
+    full_corr = pd.DataFrame(correlation_matrices[selected_window])
     kept = [s for s in full_corr.columns if s in eligible_symbols]
     corr_matrix = full_corr.loc[kept, kept] if len(kept) >= 2 else pd.DataFrame()
-    source_note = "Corrélation pré-calculée (pipeline Rust)"
+    source_note = f"Corrélation pré-calculée (pipeline Rust, fenêtre={selected_window})"
 else:
     corr_matrix = pd.DataFrame()
     source_note = None
@@ -220,25 +241,72 @@ if not corr_matrix.empty and corr_matrix.shape[1] >= 2:
     fig_corr = px.imshow(
         corr_matrix,
         text_auto=".2f",
-        color_continuous_scale='RdBu_r',  # Rouge = positif, Bleu = négatif
+        color_continuous_scale='RdBu_r',
         zmin=-1, zmax=1,
-        title="Corrélation des rendements journaliers (90 jours)"
+        title=f"Corrélation des rendements journaliers ({selected_window})",
     )
-
     fig_corr.update_layout(
         height=600,
         margin=dict(t=50, b=0, l=0, r=0),
         xaxis_title="Actifs",
-        yaxis_title="Actifs"
+        yaxis_title="Actifs",
     )
-
     st.plotly_chart(fig_corr, use_container_width=True)
 
     st.markdown("""
     **Comment lire cette matrice ?**
-    - 🔴 **Rouge (proche de 1)** : Les actifs bougent ensemble. (Mauvaise diversification).
-    - ⚪ **Blanc (proche de 0)** : Aucune corrélation. (Idéal pour stabiliser).
-    - 🔵 **Bleu (proche de -1)** : Corrélation négative. (Vrais couvre-risques).
+    - 🔴 **Rouge (proche de 1)** : Les actifs bougent ensemble (mauvaise diversification).
+    - ⚪ **Blanc (proche de 0)** : Aucune corrélation (idéal pour stabiliser).
+    - 🔵 **Bleu (proche de -1)** : Corrélation négative (vrais couvre-risques).
     """)
 else:
     st.info("Données insuffisantes pour calculer la corrélation (moins de 2 actifs après filtrage).")
+
+
+st.divider()
+st.subheader(f"🔗 Corrélations par actif ({selected_window})")
+
+if correlation_matrices and selected_window in correlation_matrices:
+    full_corr = pd.DataFrame(correlation_matrices[selected_window])
+    # Même filtre que pour la matrice complète : cohérence visuelle.
+    kept = [s for s in full_corr.columns if s in eligible_symbols]
+    corr_matrix_asset = full_corr.loc[kept, kept] if len(kept) >= 2 else pd.DataFrame()
+
+    if not corr_matrix_asset.empty:
+        selected_asset = st.selectbox("Choisir un actif", options=corr_matrix_asset.columns.tolist())
+
+        corr_series = corr_matrix_asset[selected_asset].drop(selected_asset).sort_values(ascending=True)
+
+        fig_corr_asset = go.Figure(go.Bar(
+            x=corr_series.values,
+            y=corr_series.index,
+            orientation='h',
+            marker=dict(
+                color=corr_series.values,
+                colorscale='RdBu_r',
+                cmin=-1, cmax=1,
+                colorbar=dict(title="Corrélation"),
+            ),
+            text=[f"{v:+.2f}" for v in corr_series.values],
+            textposition='outside',
+        ))
+
+        fig_corr_asset.update_layout(
+            title=f"Corrélation de {selected_asset} avec les autres actifs",
+            xaxis_title="Coefficient de corrélation",
+            xaxis=dict(range=[-1.15, 1.15]),
+            height=max(300, 40 * len(corr_series)),
+            margin=dict(t=50, b=0, l=10, r=50),
+        )
+
+        st.plotly_chart(fig_corr_asset, use_container_width=True)
+
+        st.caption(
+            "🔴 Rouge = corrélation positive (bougent ensemble) · "
+            "🔵 Bleu = corrélation négative (couvre-risque) · "
+            "Proche de 0 = décorrélé"
+        )
+    else:
+        st.info("Données insuffisantes après filtrage.")
+else:
+    st.info("Données insuffisantes pour calculer la corrélation.")

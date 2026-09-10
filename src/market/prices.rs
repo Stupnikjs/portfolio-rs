@@ -75,6 +75,7 @@ fn binance_klines(symbol_pair: &str, day_str: &str) -> Result<Vec<Value>, PriceE
 /// demande une fenêtre de plusieurs jours et on prend la dernière bougie
 /// disponible avant ou à la date cible.
 pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, String), PriceError> {
+   
     let key = (ticker.to_string(), day_str.to_string());
     if let Some(cached) = YAHOO_PRICE_CACHE.lock().unwrap().get(&key) {
         return Ok(cached.clone());
@@ -85,7 +86,6 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
 
     let period1 = (target - chrono::Duration::days(7)).timestamp();
     let period2 = (target + chrono::Duration::days(1)).timestamp();
-
     let url = format!("{YAHOO_CHART_API}/{ticker}");
     let resp = client()
         .get(&url)
@@ -125,12 +125,14 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
         .map(|arr| arr.iter().map(|v| v.as_f64()).collect())
         .unwrap_or_default();
 
-    let mut candidates: Vec<(DateTime<Utc>, f64)> = Vec::new();
+    
+    let mut candidates: Vec<(chrono::NaiveDate, f64)> = Vec::new();
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         let Some(close) = close else { continue };
         let dt = Utc.timestamp_opt(*ts, 0).single().ok_or_else(|| PriceError::Message("timestamp invalide".into()))?;
-        if dt <= target {
-            candidates.push((dt, *close));
+        let date = dt.date_naive();
+        if date <= target_date {
+            candidates.push((date, close.clone()));
         }
     }
 
@@ -138,7 +140,7 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
         return Err(PriceError::Message(format!("Pas de clôture Yahoo disponible pour {ticker} au plus tard le {day_str}")));
     }
 
-    let (_, price) = candidates.into_iter().max_by_key(|(dt, _)| *dt).unwrap();
+    let (_, price) = candidates.into_iter().max_by_key(|(date, _)| *date).unwrap();
 
     YAHOO_PRICE_CACHE.lock().unwrap().insert(key, (price, currency.clone()));
     Ok((price, currency))

@@ -11,7 +11,7 @@ use anyhow::Result;
 use portfolio_rs::ledger::cost_basis::compute_fifo;
 use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
-use portfolio_rs::market::correlation::compute_correlation_matrix;
+use portfolio_rs::market::correlation::compute_correlation_matrices;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
@@ -21,7 +21,7 @@ use portfolio_rs::store::serialize::{load_tx_store, save_wallet};
 /// exclu de la matrice de corrélation. Les benchmarks (indices,
 /// matières premières) y échappent -- ils n'ont pas de "valeur détenue".
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
-const CORRELATION_LOOKBACK_DAYS: i64 = 90;
+// const CORRELATION_LOOKBACK_DAYS: i64 = 90;
 
 #[derive(serde::Serialize)]
 struct DashboardAsset {
@@ -42,8 +42,8 @@ struct DashboardData {
     total_cost_basis_eur: f64,
     total_pnl_eur: f64,
     assets: Vec<DashboardAsset>,
-    correlation_matrix: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
-}
+    correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, f64>>>,
+    }
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -225,13 +225,11 @@ fn main() -> Result<()> {
 
     println!("\nP&L latent total : {total_pnl:>+.2} EUR");
 
-    // --- EXPORT dashboard.json (consommé par dashboard.py) ---
-    println!("\n=== CALCUL DE LA CORRÉLATION ({CORRELATION_LOOKBACK_DAYS}j, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
+    println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
     let holdings = non_zero_holdings_at(&tx_store, None);
     let prices_eur: std::collections::HashMap<String, f64> =
         snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
-    let correlation_matrix = compute_correlation_matrix(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR, CORRELATION_LOOKBACK_DAYS);
-
+    let correlation_matrices = compute_correlation_matrices(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR);
     let dashboard_assets: Vec<DashboardAsset> = snapshot
         .assets
         .iter()
@@ -259,7 +257,7 @@ fn main() -> Result<()> {
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
         assets: dashboard_assets,
-        correlation_matrix,
+        correlation_matrices,
     };
 
     let dashboard_path = PathBuf::from("./data/dashboard.json");

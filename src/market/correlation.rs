@@ -6,11 +6,27 @@
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::NaiveDate;
+use chrono::{Duration, Utc};
 
 use crate::market::benchmarks::BENCHMARKS;
 use crate::market::prices::{binance_daily_closes, yahoo_daily_closes};
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
+
+/// Fenêtres calculées à chaque run. Le label est celui utilisé comme clé
+/// dans le JSON de sortie (consommé tel quel par dashboard.py).
+pub const CORRELATION_WINDOWS: &[(&str, i64)] = &[
+    ("90d", 90),
+    ("6m", 182),
+    ("1y", 365),
+];
+
+
+/// Restreint une série de rendements aux dates >= aujourd'hui - window_days.
+fn windowed(returns: &BTreeMap<NaiveDate, f64>, window_days: i64) -> BTreeMap<NaiveDate, f64> {
+    let cutoff = Utc::now().date_naive() - Duration::days(window_days);
+    returns.range(cutoff..).map(|(d, v)| (*d, *v)).collect()
+}
 
 /// Récupère la série de clôtures pour un actif de portefeuille selon son
 /// type. Best-effort : renvoie None si la source ne répond pas plutôt que
@@ -86,13 +102,19 @@ fn pearson(a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option
 /// Résultat au format dict-de-dicts (label -> label -> coefficient),
 /// directement sérialisable pour dashboard.json et consommable tel quel
 /// par `pd.DataFrame(...)` côté Streamlit.
-pub fn compute_correlation_matrix(
+/// Calcule les matrices de corrélation pour toutes les fenêtres de
+/// `CORRELATION_WINDOWS`, en une seule passe de fetch de prix (sur la
+/// fenêtre la plus large) pour éviter de solliciter Yahoo/Binance une
+/// fois par fenêtre. Résultat : label de fenêtre -> matrice (label ->
+/// label -> coefficient), directement sérialisable pour dashboard.json.
+pub fn compute_correlation_matrices(
     tx_store: &TxStore,
     holdings: &HashMap<String, f64>,
     prices_eur: &HashMap<String, f64>,
     min_value_eur: f64,
-    lookback_days: i64,
-) -> HashMap<String, HashMap<String, f64>> {
+) -> HashMap<String, HashMap<String, HashMap<String, f64>>> {
+    let max_lookback = CORRELATION_WINDOWS.iter().map(|(_, d)| *d).max().unwrap_or(365);
+
     let mut series: Vec<(String, BTreeMap<NaiveDate, f64>)> = Vec::new();
 
     for (symbol, quantity) in holdings {
@@ -107,7 +129,7 @@ pub fn compute_correlation_matrix(
         if value_eur < min_value_eur {
             continue;
         }
-        if let Some(prices) = closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), lookback_days) {
+        if let Some(prices) = closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), max_lookback) {
             series.push((symbol.clone(), prices));
         } else {
             eprintln!("  [WARN corrélation] historique indisponible pour {symbol}, exclu de la matrice.");
@@ -115,23 +137,36 @@ pub fn compute_correlation_matrix(
     }
 
     for (label, ticker) in BENCHMARKS {
-        if let Some(prices) = closes_for_benchmark(ticker, lookback_days) {
+        if let Some(prices) = closes_for_benchmark(ticker, max_lookback) {
             series.push((label.to_string(), prices));
         } else {
             eprintln!("  [WARN corrélation] historique indisponible pour le benchmark {label} ({ticker}), exclu.");
         }
     }
 
-    let returns: Vec<(String, BTreeMap<NaiveDate, f64>)> = series.into_iter().map(|(label, prices)| (label, to_returns(&prices))).collect();
+    // Rendements calculés une seule fois sur l'historique complet.
+    let full_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> =
+        series.into_iter().map(|(label, prices)| (label, to_returns(&prices))).collect();
 
-    let mut matrix: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    for (label_a, returns_a) in &returns {
-        let mut row = HashMap::new();
-        for (label_b, returns_b) in &returns {
-            let coeff = if label_a == label_b { 1.0 } else { pearson(returns_a, returns_b).unwrap_or(0.0) };
-            row.insert(label_b.clone(), coeff);
+    let mut result: HashMap<String, HashMap<String, HashMap<String, f64>>> = HashMap::new();
+
+    for (window_label, window_days) in CORRELATION_WINDOWS {
+        let windowed_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> = full_returns
+            .iter()
+            .map(|(label, r)| (label.clone(), windowed(r, *window_days)))
+            .collect();
+
+        let mut matrix: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for (label_a, returns_a) in &windowed_returns {
+            let mut row = HashMap::new();
+            for (label_b, returns_b) in &windowed_returns {
+                let coeff = if label_a == label_b { 1.0 } else { pearson(returns_a, returns_b).unwrap_or(0.0) };
+                row.insert(label_b.clone(), coeff);
+            }
+            matrix.insert(label_a.clone(), row);
         }
-        matrix.insert(label_a.clone(), row);
+        result.insert(window_label.to_string(), matrix);
     }
-    matrix
+
+    result
 }
