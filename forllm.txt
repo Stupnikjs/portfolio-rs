@@ -122,9 +122,9 @@ pub fn record_weekly_history(tx_store: &TxStore, path: &Path) -> Result<()> {
 }
 
 ################################################################################
-# Dossier : src\ledger
+# Dossier : src/ledger
 # Fichier : cost_basis.rs
-# Chemin relatif : ledger\cost_basis.rs
+# Chemin relatif : ledger/cost_basis.rs
 ################################################################################
 
 //! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
@@ -337,9 +337,9 @@ pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<Cos
 
 
 ################################################################################
-# Dossier : src\ledger
+# Dossier : src/ledger
 # Fichier : mod.rs
-# Chemin relatif : ledger\mod.rs
+# Chemin relatif : ledger/mod.rs
 ################################################################################
 
 pub mod positions;
@@ -348,9 +348,9 @@ pub mod portfolio;
 
 
 ################################################################################
-# Dossier : src\ledger
+# Dossier : src/ledger
 # Fichier : portfolio.rs
-# Chemin relatif : ledger\portfolio.rs
+# Chemin relatif : ledger/portfolio.rs
 ################################################################################
 
 //! Portage de src/ledger/portfolio.py -- valorisation du portefeuille à
@@ -412,9 +412,9 @@ pub fn portfolio_snapshot_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> P
 
 
 ################################################################################
-# Dossier : src\ledger
+# Dossier : src/ledger
 # Fichier : positions.rs
-# Chemin relatif : ledger\positions.rs
+# Chemin relatif : ledger/positions.rs
 ################################################################################
 
 //! Portage de src/ledger/positions.py -- reconstruction des positions
@@ -774,9 +774,9 @@ fn main() -> Result<()> {
 
 
 ################################################################################
-# Dossier : src\market
+# Dossier : src/market
 # Fichier : benchmarks.rs
-# Chemin relatif : market\benchmarks.rs
+# Chemin relatif : market/benchmarks.rs
 ################################################################################
 
 //! Indices régionaux et matières premières suivis par défaut dans la
@@ -798,9 +798,9 @@ pub const BENCHMARKS: &[(&str, &str)] = &[
 
 
 ################################################################################
-# Dossier : src\market
+# Dossier : src/market
 # Fichier : correlation.rs
-# Chemin relatif : market\correlation.rs
+# Chemin relatif : market/correlation.rs
 ################################################################################
 
 //! Construit la matrice de corrélation des rendements journaliers,
@@ -978,9 +978,9 @@ pub fn compute_correlation_matrices(
 
 
 ################################################################################
-# Dossier : src\market
+# Dossier : src/market
 # Fichier : mod.rs
-# Chemin relatif : market\mod.rs
+# Chemin relatif : market/mod.rs
 ################################################################################
 
 pub mod prices;
@@ -990,9 +990,9 @@ pub mod correlation;
 
 
 ################################################################################
-# Dossier : src\market
+# Dossier : src/market
 # Fichier : prices.rs
-# Chemin relatif : market\prices.rs
+# Chemin relatif : market/prices.rs
 ################################################################################
 
 //! Portage de src/market/prices.py. Utilise l'API publique de Binance
@@ -1399,9 +1399,9 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
 
 
 ################################################################################
-# Dossier : src\market
+# Dossier : src/market
 # Fichier : tickers.rs
-# Chemin relatif : market\tickers.rs
+# Chemin relatif : market/tickers.rs
 ################################################################################
 
 //! Portage de src/market/tickers.py -- résolution du ticker externe
@@ -1591,9 +1591,9 @@ pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
 
 
 ################################################################################
-# Dossier : src\parse
+# Dossier : src/parse
 # Fichier : binance.rs
-# Chemin relatif : parse\binance.rs
+# Chemin relatif : parse/binance.rs
 ################################################################################
 
 //! Portage de src/parse/binance.py.
@@ -1838,9 +1838,9 @@ pub fn parse_converts(path: &Path) -> Result<Vec<Transaction>> {
 
 
 ################################################################################
-# Dossier : src\parse
+# Dossier : src/parse
 # Fichier : manual.rs
-# Chemin relatif : parse\manual.rs
+# Chemin relatif : parse/manual.rs
 ################################################################################
 
 //! Portage de src/parse/manual.py -- comble les trous non couverts par les
@@ -1921,9 +1921,9 @@ pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
 
 
 ################################################################################
-# Dossier : src\parse
+# Dossier : src/parse
 # Fichier : mod.rs
-# Chemin relatif : parse\mod.rs
+# Chemin relatif : parse/mod.rs
 ################################################################################
 
 pub mod binance;
@@ -1932,9 +1932,9 @@ pub mod manual;
 
 
 ################################################################################
-# Dossier : src\parse
+# Dossier : src/parse
 # Fichier : xtb.rs
-# Chemin relatif : parse\xtb.rs
+# Chemin relatif : parse/xtb.rs
 ################################################################################
 
 //! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
@@ -2472,18 +2472,18 @@ pub struct Transaction {
 
 
 ################################################################################
-# Dossier : src\store
+# Dossier : src/store
 # Fichier : mod.rs
-# Chemin relatif : store\mod.rs
+# Chemin relatif : store/mod.rs
 ################################################################################
 
 pub mod serialize;
 
 
 ################################################################################
-# Dossier : src\store
+# Dossier : src/store
 # Fichier : serialize.rs
-# Chemin relatif : store\serialize.rs
+# Chemin relatif : store/serialize.rs
 ################################################################################
 
 //! Portage de src/store/serialize.py : TxStore (conteneur en mémoire) +
