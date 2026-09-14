@@ -12,6 +12,7 @@ use portfolio_rs::ledger::cost_basis::compute_fifo;
 use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::market::correlation::compute_correlation_matrices;
+use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
@@ -185,7 +186,7 @@ fn main() -> Result<()> {
     println!("({resolved} résolus, {skipped} ignorés, {failed} échoués)");
 
     save_wallet(&tx_store, &tx_store_path)?;
-
+    record_weekly_history(&tx_store, &PathBuf::from("./data/history.json"))?;
     println!("\n=== VALORISATION ACTUELLE ===");
     let snapshot = portfolio_snapshot_at(&tx_store, None);
     let cost_basis = compute_fifo(&tx_store, None)?;

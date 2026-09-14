@@ -1,8 +1,130 @@
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src
+# Fichier : history.rs
+# Chemin relatif : history.rs
+################################################################################
+
+//! Historique hebdomadaire de valorisation du portefeuille.
+//!
+//! Principe : les semaines passées sont immuables (le passé ne change
+//! pas), donc on ne (re)calcule jamais une semaine déjà présente dans
+//! history.json. Chaque `cargo run` ne backfille que les semaines
+//! manquantes entre la dernière semaine connue et la dernière semaine
+//! *complète* (la semaine en cours n'est pas backfillée : le
+//! dashboard.json du jour sert déjà de point "live" pour elle).
+//!
+//! Gestion jours de fermeture / crypto vs stock : entièrement déléguée à
+//! `historical_price_eur` (déjà utilisée par `portfolio_snapshot_at`) --
+//! pour une action, Yahoo renvoie la dernière clôture connue avant la
+//! date cible (gère week-ends/jours fériés) ; pour une crypto, Binance
+//! est interrogé directement sur cette date (marché ouvert 7j/7).
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use anyhow::Result;
+use chrono::{Datelike, Duration, NaiveDate, TimeZone, Utc, Weekday};
+use serde::{Deserialize, Serialize};
+
+use crate::ledger::cost_basis::compute_fifo;
+use crate::ledger::portfolio::portfolio_snapshot_at;
+use crate::store::serialize::TxStore;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeeklyHistoryEntry {
+    /// Dimanche de fin de semaine ISO, format "YYYY-MM-DD".
+    pub week_end: String,
+    pub total_value_eur: f64,
+    pub total_cost_basis_eur: f64,
+    pub total_pnl_eur: f64,
+}
+
+/// Dimanche de la semaine ISO contenant `date` (lundi = début de semaine).
+fn week_end(date: NaiveDate) -> NaiveDate {
+    let offset = (Weekday::Sun.num_days_from_monday() as i64
+        - date.weekday().num_days_from_monday() as i64
+        + 7)
+        % 7;
+    date + Duration::days(offset)
+}
+
+fn earliest_tx_date(tx_store: &TxStore) -> Option<NaiveDate> {
+    tx_store.transactions.iter().map(|tx| tx.time.date_naive()).min()
+}
+
+/// Backfille (de façon incrémentale) l'historique hebdomadaire dans
+/// `path`, à partir de la première transaction connue jusqu'à la
+/// dernière semaine *complète*. Réexécutable sans risque : les semaines
+/// déjà présentes ne sont jamais retouchées.
+pub fn record_weekly_history(tx_store: &TxStore, path: &Path) -> Result<()> {
+    let mut history: Vec<WeeklyHistoryEntry> = if path.exists() {
+        let raw = std::fs::read_to_string(path)?;
+        serde_json::from_str(&raw).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let already_done: HashSet<String> = history.iter().map(|e| e.week_end.clone()).collect();
+
+    let Some(start_date) = earliest_tx_date(tx_store) else {
+        return Ok(()); // aucune transaction, rien à backfiller
+    };
+
+    let today = Utc::now().date_naive();
+    // La semaine en cours n'a pas de "clôture" définitive -- on s'arrête
+    // à la dernière semaine complète.
+    let last_complete_week_end = week_end(today) - Duration::weeks(1);
+
+    if week_end(start_date) > last_complete_week_end {
+        return Ok(()); // pas encore une semaine complète d'historique
+    }
+
+    let mut cursor = week_end(start_date);
+    let mut computed = 0;
+
+    while cursor <= last_complete_week_end {
+        let key = cursor.format("%Y-%m-%d").to_string();
+
+        if !already_done.contains(&key) {
+            // 23:59:59 UTC le dimanche, pour inclure toutes les tx du jour.
+            let at = Utc.from_utc_datetime(&cursor.and_hms_opt(23, 59, 59).unwrap());
+
+            let snapshot = portfolio_snapshot_at(tx_store, Some(at));
+            let cost_basis = compute_fifo(tx_store, Some(at))?;
+            let total_cost_basis_eur: f64 =
+                snapshot.assets.iter().map(|a| cost_basis.open_cost_basis(&a.symbol)).sum();
+
+            if computed == 0 {
+                println!("=== BACKFILL HISTORIQUE HEBDOMADAIRE ===");
+            }
+            println!("  {key} : {:.2} EUR", snapshot.total_value_eur);
+
+            history.push(WeeklyHistoryEntry {
+                week_end: key,
+                total_value_eur: snapshot.total_value_eur,
+                total_cost_basis_eur,
+                total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
+            });
+            computed += 1;
+        }
+
+        cursor += Duration::weeks(1);
+    }
+
+    if computed > 0 {
+        history.sort_by(|a, b| a.week_end.cmp(&b.week_end));
+        std::fs::write(path, serde_json::to_string_pretty(&history)?)?;
+        println!("({computed} semaine(s) ajoutée(s) à l'historique)");
+    }
+
+    Ok(())
+}
+
+################################################################################
+# Dossier : src\ledger
 # Fichier : cost_basis.rs
-# Chemin relatif : ledger/cost_basis.rs
+# Chemin relatif : ledger\cost_basis.rs
 ################################################################################
 
 //! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
@@ -215,9 +337,9 @@ pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<Cos
 
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src\ledger
 # Fichier : mod.rs
-# Chemin relatif : ledger/mod.rs
+# Chemin relatif : ledger\mod.rs
 ################################################################################
 
 pub mod positions;
@@ -226,9 +348,9 @@ pub mod portfolio;
 
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src\ledger
 # Fichier : portfolio.rs
-# Chemin relatif : ledger/portfolio.rs
+# Chemin relatif : ledger\portfolio.rs
 ################################################################################
 
 //! Portage de src/ledger/portfolio.py -- valorisation du portefeuille à
@@ -290,9 +412,9 @@ pub fn portfolio_snapshot_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> P
 
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src\ledger
 # Fichier : positions.rs
-# Chemin relatif : ledger/positions.rs
+# Chemin relatif : ledger\positions.rs
 ################################################################################
 
 //! Portage de src/ledger/positions.py -- reconstruction des positions
@@ -372,7 +494,7 @@ pub mod store;
 pub mod ledger;
 pub mod market;
 pub mod parse;
-
+pub mod history;
 
 ################################################################################
 # Dossier : src
@@ -394,6 +516,7 @@ use portfolio_rs::ledger::cost_basis::compute_fifo;
 use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::market::correlation::compute_correlation_matrices;
+use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
@@ -567,7 +690,7 @@ fn main() -> Result<()> {
     println!("({resolved} résolus, {skipped} ignorés, {failed} échoués)");
 
     save_wallet(&tx_store, &tx_store_path)?;
-
+    record_weekly_history(&tx_store, &PathBuf::from("./data/history.json"))?;
     println!("\n=== VALORISATION ACTUELLE ===");
     let snapshot = portfolio_snapshot_at(&tx_store, None);
     let cost_basis = compute_fifo(&tx_store, None)?;
@@ -651,9 +774,9 @@ fn main() -> Result<()> {
 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : benchmarks.rs
-# Chemin relatif : market/benchmarks.rs
+# Chemin relatif : market\benchmarks.rs
 ################################################################################
 
 //! Indices régionaux et matières premières suivis par défaut dans la
@@ -675,9 +798,9 @@ pub const BENCHMARKS: &[(&str, &str)] = &[
 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : correlation.rs
-# Chemin relatif : market/correlation.rs
+# Chemin relatif : market\correlation.rs
 ################################################################################
 
 //! Construit la matrice de corrélation des rendements journaliers,
@@ -855,9 +978,9 @@ pub fn compute_correlation_matrices(
 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : mod.rs
-# Chemin relatif : market/mod.rs
+# Chemin relatif : market\mod.rs
 ################################################################################
 
 pub mod prices;
@@ -867,9 +990,9 @@ pub mod correlation;
 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : prices.rs
-# Chemin relatif : market/prices.rs
+# Chemin relatif : market\prices.rs
 ################################################################################
 
 //! Portage de src/market/prices.py. Utilise l'API publique de Binance
@@ -1276,9 +1399,9 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : tickers.rs
-# Chemin relatif : market/tickers.rs
+# Chemin relatif : market\tickers.rs
 ################################################################################
 
 //! Portage de src/market/tickers.py -- résolution du ticker externe
@@ -1468,9 +1591,9 @@ pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : binance.rs
-# Chemin relatif : parse/binance.rs
+# Chemin relatif : parse\binance.rs
 ################################################################################
 
 //! Portage de src/parse/binance.py.
@@ -1715,9 +1838,9 @@ pub fn parse_converts(path: &Path) -> Result<Vec<Transaction>> {
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : manual.rs
-# Chemin relatif : parse/manual.rs
+# Chemin relatif : parse\manual.rs
 ################################################################################
 
 //! Portage de src/parse/manual.py -- comble les trous non couverts par les
@@ -1798,9 +1921,9 @@ pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : mod.rs
-# Chemin relatif : parse/mod.rs
+# Chemin relatif : parse\mod.rs
 ################################################################################
 
 pub mod binance;
@@ -1809,9 +1932,9 @@ pub mod manual;
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : xtb.rs
-# Chemin relatif : parse/xtb.rs
+# Chemin relatif : parse\xtb.rs
 ################################################################################
 
 //! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
@@ -2349,18 +2472,18 @@ pub struct Transaction {
 
 
 ################################################################################
-# Dossier : src/store
+# Dossier : src\store
 # Fichier : mod.rs
-# Chemin relatif : store/mod.rs
+# Chemin relatif : store\mod.rs
 ################################################################################
 
 pub mod serialize;
 
 
 ################################################################################
-# Dossier : src/store
+# Dossier : src\store
 # Fichier : serialize.rs
-# Chemin relatif : store/serialize.rs
+# Chemin relatif : store\serialize.rs
 ################################################################################
 
 //! Portage de src/store/serialize.py : TxStore (conteneur en mémoire) +
