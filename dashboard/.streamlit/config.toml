@@ -1,0 +1,10 @@
+[theme]
+base = "dark"
+primaryColor = "#26C281"          # accent (vert gains, cohérent avec les graphes)
+backgroundColor = "#0E1117"       # fond principal
+secondaryBackgroundColor = "#161B22"  # fond des cartes / widgets / sidebar
+textColor = "#E6E6E6"
+font = "sans serif"
+
+[server]
+runOnSave = true
