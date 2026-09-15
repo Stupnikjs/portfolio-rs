@@ -85,6 +85,56 @@ fn client() -> &'static reqwest::blocking::Client {
 static BINANCE_KLINES_CACHE: Lazy<Mutex<HashMap<(String, String), Vec<Value>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static YAHOO_PRICE_CACHE: Lazy<Mutex<HashMap<(String, String), (f64, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+const FX_TICKERS: &[(&str, &str)] = &[
+    ("USD", "EURUSD=X"),
+    ("GBP", "EURGBP=X"),
+];
+
+/// Taux de change EUR -> `currency` (ex: EURUSD -> combien de USD pour 1 EUR),
+/// aligné à l'heure comme les autres prix, avec le même cache persistant.
+fn eur_fx_rate_1h(currency: &str, aligned_ts: i64) -> f64 {
+    if currency == "EUR" {
+        return 1.0;
+    }
+
+    // 1. Cache
+    {
+        let cache = PRICE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rate) = cache.get_closest(currency, aligned_ts) {
+            return rate;
+        }
+    }
+
+    // 2. Fetch Yahoo
+    let Some((_, ticker)) = FX_TICKERS.iter().find(|(c, _)| *c == currency) else {
+        eprintln!("  [WARN fx] devise non gérée: {currency}");
+        return fallback_fx_rate(currency);
+    };
+
+    match fetch_yahoo_fx_1h(ticker, aligned_ts) {
+        Ok(rate) if rate > 0.0 => {
+            PRICE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(currency, aligned_ts, rate);
+            rate
+        }
+        Ok(_) | Err(_) => {
+            eprintln!("  [WARN fx] échec récupération {currency} au ts={aligned_ts}, fallback statique utilisé");
+            fallback_fx_rate(currency)
+        }
+    }
+}
+
+/// Dernier filet de sécurité si Yahoo est injoignable -- vaut mieux une
+/// valeur approximative loggée qu'un échec total du run.
+fn fallback_fx_rate(currency: &str) -> f64 {
+    match currency {
+        "USD" => 1.08, // ~1 EUR en USD
+        "GBP" => 0.87, // ~1 EUR en GBP
+        _ => 1.0,
+    }
+}
+
+
+
 fn binance_klines(symbol_pair: &str, day_str: &str) -> Result<Vec<Value>, PriceError> {
     let key = (symbol_pair.to_string(), day_str.to_string());
     if let Some(cached) = BINANCE_KLINES_CACHE.lock().unwrap().get(&key) {
@@ -458,12 +508,16 @@ fn fetch_binance_1h(symbol: &str, aligned_ts: i64) -> Result<f64, PriceError> {
     Err(PriceError::Message("Prix Binance 1h introuvable".into()))
 }
 
-fn fetch_yahoo_1h(ticker: &str, aligned_ts: i64) -> Result<f64, PriceError> {
+
+/// Récupère la bougie 1h exacte (ou la dernière disponible avant) pour une
+/// paire FX Yahoo (ex: "EURUSD=X"). Contrairement à fetch_yahoo_1h, pas de
+/// normalisation de devise supplémentaire : la paire EST déjà le taux.
+fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<f64, PriceError> {
     let target = Utc.timestamp_opt(aligned_ts, 0).unwrap();
     let period1 = (target - chrono::Duration::days(2)).timestamp();
     let period2 = (target + chrono::Duration::days(1)).timestamp();
-    
-    let url = format!("{YAHOO_CHART_API}/{ticker}");
+
+    let url = format!("{YAHOO_CHART_API}/{pair_ticker}");
     let resp = client()
         .get(&url)
         .query(&[
@@ -476,42 +530,32 @@ fn fetch_yahoo_1h(ticker: &str, aligned_ts: i64) -> Result<f64, PriceError> {
         .error_for_status()?;
 
     let data: Value = resp.json()?;
-    let result = data.get("chart").and_then(|c| c.get("result")).and_then(|r| r.as_array()).and_then(|arr| arr.first())
-        .ok_or_else(|| PriceError::Message("Yahoo KO".into()))?;
+    let result = data
+        .get("chart").and_then(|c| c.get("result")).and_then(|r| r.as_array()).and_then(|arr| arr.first())
+        .ok_or_else(|| PriceError::Message(format!("Yahoo KO pour {pair_ticker}")))?;
 
-    let currency = result.get("meta").and_then(|m| m.get("currency")).and_then(|c| c.as_str()).unwrap_or("USD");
-    let (fx_currency, price_factor) = normalize_currency_for_fx(currency);
-    let fx_rate = if fx_currency != "EUR" {
-        yahoo_historical_price(&format!("EUR{fx_currency}=X"), &target.format("%Y-%m-%d").to_string()).ok().map(|(p, _)| p).unwrap_or(1.0)
-    } else { 1.0 };
+    let timestamps: Vec<i64> = result.get("timestamp").and_then(|t| t.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
+    let closes: Vec<Option<f64>> = result.get("indicators").and_then(|i| i.get("quote"))
+        .and_then(|q| q.as_array()).and_then(|arr| arr.first()).and_then(|q0| q0.get("close"))
+        .and_then(|c| c.as_array()).map(|arr| arr.iter().map(|v| v.as_f64()).collect()).unwrap_or_default();
 
-    let timestamps: Vec<i64> = result.get("timestamp").and_then(|t| t.as_array()).map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
-    let closes: Vec<Option<f64>> = result.get("indicators").and_then(|i| i.get("quote")).and_then(|q| q.as_array()).and_then(|arr| arr.first()).and_then(|q0| q0.get("close")).and_then(|c| c.as_array()).map(|arr| arr.iter().map(|v| v.as_f64()).collect()).unwrap_or_default();
-
-    // Cherche la bougie 1h exacte
+    // Bougie exacte
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         if *ts == aligned_ts {
-            if let Some(c) = *close {
-                return Ok((c * price_factor) / fx_rate);
-            }
+            if let Some(c) = *close { return Ok(c); }
         }
     }
-
-    // Si marché fermé, prend la dernière bougie disponible avant aligned_ts
-    let mut best_price = None;
-    let mut best_ts = 0;
+    // Sinon, dernière bougie connue avant aligned_ts (marché FX fermé le week-end)
+    let mut best: Option<(i64, f64)> = None;
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
-        if *ts <= aligned_ts && *ts > best_ts {
+        if *ts <= aligned_ts {
             if let Some(c) = *close {
-                best_price = Some(c);
-                best_ts = *ts;
+                if best.map_or(true, |(bts, _)| *ts > bts) {
+                    best = Some((*ts, c));
+                }
             }
         }
     }
-
-    if let Some(c) = best_price {
-        return Ok((c * price_factor) / fx_rate);
-    }
-
-    Err(PriceError::Message("Prix Yahoo 1h introuvable".into()))
+    best.map(|(_, c)| c).ok_or_else(|| PriceError::Message(format!("Pas de taux FX pour {pair_ticker}")))
 }
