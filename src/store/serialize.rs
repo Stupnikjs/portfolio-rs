@@ -1,17 +1,15 @@
 //! Portage de src/store/serialize.py : TxStore (conteneur en mémoire) +
-//! chargement/sauvegarde JSON. Format compatible avec l'ancien
-//! serialized_tx.json Python (assets en dict par symbole, transactions
-//! en liste plate avec champ "asset" = symbole).
+//! chargement/sauvegarde JSON. 
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::Path;
-use std::io::Write;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+// CORRECTION ICI : on importe bien seed_price_cache et on ajoute le point-virgule
+use crate::market::prices::seed_price_cache;
 
 const TX_STORE_VERSION: u32 = 1;
 
@@ -48,40 +46,11 @@ struct WalletPayload {
     transactions: Vec<TransactionDto>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum TxEvent {
-    /// tx complète auto-portée (Asset inclus, pas juste le symbole) :
-    /// chaque ligne du log doit pouvoir se relire seule.
-    Add { tx: Transaction },
-    /// Ne supprime jamais une ligne : marque juste une tx antérieure
-    /// comme périmée (correction XTB, édition manuelle...).
-    Tombstone { external_id: String, reason: Option<String> },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TxLogRecord {
-    recorded_at: String,   // horodatage d'écriture (audit), != tx.time
-    batch_id: String,      // uuid généré une fois par run de main.rs
-    event: TxEvent,
-}
-
-fn append_events(path: &Path, records: &[TxLogRecord]) -> Result<()> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    for r in records {
-        writeln!(file, "{}", serde_json::to_string(r)?)?;
-    }
-    Ok(())
-}
-
-/// Conteneur en mémoire pour l'ensemble des transactions et actifs connus.
-/// Equivalent de la classe TxStore côté Python (anciennement Wallet).
 #[derive(Debug, Default)]
 pub struct TxStore {
     pub assets: HashMap<String, Asset>,
     pub transactions: Vec<Transaction>,
-    known_external_ids: HashSet<String>,
+    pub known_external_ids: HashSet<String>,
 }
 
 impl TxStore {
@@ -89,9 +58,6 @@ impl TxStore {
         Self::default()
     }
 
-    /// Retourne l'Asset canonique pour ce symbole, le créant si besoin.
-    /// Si un Asset existe déjà, ses métadonnées font foi (dédup, remplace
-    /// l'ancien AssetRegistry.find_or_create).
     pub fn find_or_create_asset(
         &mut self,
         symbol: &str,
@@ -114,10 +80,6 @@ impl TxStore {
         asset
     }
 
-    /// Fusionne des transactions fraîchement parsées dans le wallet.
-    /// Chaque `tx.asset` (venant d'un parseur, instance locale au run)
-    /// est retraduit vers l'Asset canonique via son symbole. Retourne le
-    /// nombre de transactions effectivement ajoutées (hors doublons).
     pub fn add_transactions(&mut self, new_transactions: Vec<Transaction>) -> usize {
         let mut added = 0;
         for tx in new_transactions {
@@ -127,6 +89,7 @@ impl TxStore {
                 }
             }
 
+          
             let local_asset = self.find_or_create_asset(
                 &tx.asset.symbol,
                 &tx.asset.name,
@@ -146,23 +109,6 @@ impl TxStore {
             added += 1;
         }
         added
-    }
-
-   pub fn diff_platform(tx_store: &TxStore, platform: Platform, fresh: &[Transaction]) -> (Vec<String>, Vec<Transaction>) {
-    let fresh_ids: HashSet<&str> = fresh.iter().filter_map(|t| t.external_id.as_deref()).collect();
-
-    let to_tombstone = tx_store.transactions.iter()
-        .filter(|t| t.platform == platform)
-        .filter_map(|t| t.external_id.clone())
-        .filter(|id| !fresh_ids.contains(id.as_str()))
-        .collect();
-
-    let to_add = fresh.iter()
-        .filter(|t| t.external_id.as_deref().map_or(true, |id| !tx_store.known_external_ids.contains(id)))
-        .cloned()
-        .collect();
-
-    (to_tombstone, to_add)
     }
 }
 
@@ -184,61 +130,6 @@ fn transaction_to_dto(tx: &Transaction) -> TransactionDto {
     }
 }
 
- fn dto_to_transaction(dto: TransactionDto, tx_store: &mut TxStore, assets_meta: &HashMap<String, AssetMeta>) -> Result<Transaction> {
-    let meta = assets_meta
-        .get(&dto.asset)
-        .with_context(|| format!("métadonnées manquantes pour l'actif '{}'", dto.asset))?;
-    let asset = tx_store.find_or_create_asset(
-        &dto.asset,
-        &meta.name,
-        meta.kind,
-        &meta.ref_currency,
-        meta.identifiers.clone(),
-    );
-    let time: DateTime<Utc> = DateTime::parse_from_rfc3339(&dto.time)
-        .with_context(|| format!("horodatage invalide: {}", dto.time))?
-        .with_timezone(&Utc);
-
-    Ok(Transaction {
-        platform: dto.platform,
-        account_label: dto.account_label,
-        kind: dto.kind,
-        asset,
-        quantity: dto.quantity,
-        price: dto.price,
-        value_eur: dto.value_eur,
-        amount: dto.amount,
-        quote_currency: dto.quote_currency,
-        time,
-        external_id: dto.external_id,
-        remark: dto.remark,
-        source_file: dto.source_file,
-    })
-}
-
-   pub fn load_tx_store(path: &Path) -> Result<TxStore> {
-    let mut tx_store = TxStore::new();
-    if !path.exists() { return Ok(tx_store); }
-
-    for (i, line) in fs::read_to_string(path)?.lines().enumerate() {
-    if line.trim().is_empty() { continue; }
-    let record: TxLogRecord = serde_json::from_str(line)
-        .with_context(|| format!("ligne {} invalide", i + 1))?;
-    match record.event {
-        TxEvent::Add { tx } => {
-            tx_store.add_transactions(vec![tx]);
-        }
-        TxEvent::Tombstone { external_id, .. } => {
-            tx_store.transactions.retain(|t| t.external_id.as_deref() != Some(external_id.as_str()));
-            tx_store.known_external_ids.remove(&external_id);
-        }
-    }
-    }
-    Ok(tx_store)
-    }
-
-/// Réécrit le serialized_tx.json en entier (pas d'append) -- garantit un
-/// fichier toujours cohérent avec l'état en mémoire.
 pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
     let assets_out: HashMap<String, AssetMeta> = tx_store
         .assets
@@ -257,7 +148,6 @@ pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
         .collect();
 
     let mut transactions_out: Vec<TransactionDto> = tx_store.transactions.iter().map(transaction_to_dto).collect();
-    // Ordre chronologique stable -> diffs git lisibles.
     transactions_out.sort_by(|a, b| a.time.cmp(&b.time));
 
     let payload = WalletPayload {

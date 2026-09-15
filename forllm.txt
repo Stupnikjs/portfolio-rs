@@ -505,9 +505,10 @@ pub mod history;
 //! Portage de src/cli.py -- construit (ou met à jour) serialized_tx.json
 //! à partir des exports bruts dans ./data/raw/.
 //!
-//! Ré-exécutable sans risque : le dédoublonnage par external_id garantit
-//! qu'un même fichier réimporté ne crée pas de doublons.
+//! Ré-exécutable sans risque : le tx_store est recréé from scratch à chaque run.
+//! Le cache des prix (price_cache.bin) persiste et bloque les appels API inutiles.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -520,13 +521,10 @@ use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
-use portfolio_rs::store::serialize::{load_tx_store, save_wallet};
+use portfolio_rs::store::serialize::{TxStore, save_wallet};
+use portfolio_rs::market::prices::{init_price_cache, save_price_cache};
 
-/// Seuil en-dessous duquel un actif est considéré comme une poussière et
-/// exclu de la matrice de corrélation. Les benchmarks (indices,
-/// matières premières) y échappent -- ils n'ont pas de "valeur détenue".
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
-// const CORRELATION_LOOKBACK_DAYS: i64 = 90;
 
 #[derive(serde::Serialize)]
 struct DashboardAsset {
@@ -548,7 +546,7 @@ struct DashboardData {
     total_pnl_eur: f64,
     assets: Vec<DashboardAsset>,
     correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, f64>>>,
-    }
+}
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -565,7 +563,8 @@ fn parse_binance_sources() -> Vec<Transaction> {
 
     if trades_path.exists() {
         println!("Lecture Binance Trades : {trades_path:?}");
-        match binance::parse_trades(&trades_path) {
+        let empty_ids = HashSet::new();
+        match binance::parse_trades(&trades_path, &empty_ids) {
             Ok(mut tx) => out.append(&mut tx),
             Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
         }
@@ -575,7 +574,8 @@ fn parse_binance_sources() -> Vec<Transaction> {
 
     if converts_path.exists() {
         println!("Lecture Binance Converts : {converts_path:?}");
-        match binance::parse_converts(&converts_path) {
+        let empty_ids = HashSet::new();
+        match binance::parse_converts(&converts_path, &empty_ids) {
             Ok(mut tx) => out.append(&mut tx),
             Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
         }
@@ -594,9 +594,10 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
     }
 
     println!("Lecture XTB : {path:?}");
+    let empty_ids = HashSet::new();
 
     match xtb::find_sheet_by_prefix(path, "Closed Position") {
-        Ok(sheet) => match xtb::parse_closed_positions(path, &sheet) {
+        Ok(sheet) => match xtb::parse_closed_positions(path, &sheet, &empty_ids) {
             Ok(positions) => {
                 for pos in positions {
                     out.extend(pos.to_transactions());
@@ -608,7 +609,7 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
     }
 
     match xtb::find_sheet_by_prefix(path, "Open Position") {
-        Ok(sheet) => match xtb::parse_open_positions(path, &sheet) {
+        Ok(sheet) => match xtb::parse_open_positions(path, &sheet, &empty_ids) {
             Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
             Err(e) => println!("  [Erreur XTB Open] {e}"),
         },
@@ -628,18 +629,24 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
 
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
+    let cache_path = PathBuf::from("./data/price_cache.bin");
+    init_price_cache(&cache_path);
 
-    let tx_store_path = PathBuf::from("./data/tx_store.json");
-    let mut tx_store = load_tx_store(&tx_store_path)?;
-    println!("Wallet chargé : {} transaction(s) existante(s)", tx_store.transactions.len());
+    // Le wallet repart de zéro à chaque exécution
+    let mut tx_store = TxStore::new();
 
     let new_transactions = parse_binance_sources();
     let mut xtb_tx = Vec::new();
     xtb_tx.extend(parse_xtb_file(&accounts_path().join("account.xlsx")));
     xtb_tx.extend(parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
 
+    // L'ajout des transactions va automatiquement "nourrir" le cache des prix
+    // au cas où le cache binaire aurait une trouée.
     tx_store.add_transactions(new_transactions);
-    tx_store.add_transactions(xtb_tx.clone());
+    tx_store.add_transactions(xtb_tx);
+
+    let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
+    tx_store.add_transactions(manual_tx);
 
     println!("\n=== DIAGNOSTIC : BUY/DEPOSIT à quantité négative ===");
     for tx in &tx_store.transactions {
@@ -650,12 +657,6 @@ fn main() -> Result<()> {
             );
         }
     }
-
-    let replaced = tx_store.replace_platform(Platform::Xtb, xtb_tx);
-    println!("XTB : {replaced} transaction(s) (remplacement complet)");
-
-    let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
-    tx_store.replace_platform(Platform::Manual, manual_tx);
 
     // --- RÉSOLUTION DES TICKERS MANQUANTS ---
     println!("\n=== RÉSOLUTION DES TICKERS ===");
@@ -689,8 +690,13 @@ fn main() -> Result<()> {
     }
     println!("({resolved} résolus, {skipped} ignorés, {failed} échoués)");
 
+    // On écrase systématiquement tx_store.json (fichier jetable)
+    let tx_store_path = PathBuf::from("./data/tx_store.json");
     save_wallet(&tx_store, &tx_store_path)?;
+    println!("tx_store.json regénéré.");
+
     record_weekly_history(&tx_store, &PathBuf::from("./data/history.json"))?;
+    
     println!("\n=== VALORISATION ACTUELLE ===");
     let snapshot = portfolio_snapshot_at(&tx_store, None);
     let cost_basis = compute_fifo(&tx_store, None)?;
@@ -706,7 +712,7 @@ fn main() -> Result<()> {
     let mut total_pnl = 0.0;
     for asset in &snapshot.assets {
         if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") {
-            continue; // on cache les poussières
+            continue; 
         }
 
         let avg_cost = cost_basis.average_cost(&asset.symbol);
@@ -735,6 +741,7 @@ fn main() -> Result<()> {
     let prices_eur: std::collections::HashMap<String, f64> =
         snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
     let correlation_matrices = compute_correlation_matrices(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR);
+    
     let dashboard_assets: Vec<DashboardAsset> = snapshot
         .assets
         .iter()
@@ -769,9 +776,12 @@ fn main() -> Result<()> {
     std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
     println!("Dashboard écrit : {dashboard_path:?}");
 
+    // Sauvegarde atomique et définitive du cache de prix
+    save_price_cache(&cache_path);
+    println!("Cache des prix 1h sauvegardé : {cache_path:?}");
+
     Ok(())
 }
-
 
 ################################################################################
 # Dossier : src/market
@@ -998,14 +1008,16 @@ pub mod correlation;
 //! Portage de src/market/prices.py. Utilise l'API publique de Binance
 //! pour la crypto, et Yahoo Finance pour les actions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
 use once_cell::sync::Lazy;
 use serde_json::Value;
+use serde::{Serialize, Deserialize};
 use thiserror::Error;
 
 use crate::schema::AssetKind;
@@ -1021,6 +1033,57 @@ pub enum PriceError {
     Http(#[from] reqwest::Error),
 }
 
+// --- CACHE PERSISTANT 1H (BINAIRE) ---
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PriceCache {
+    pub data: HashMap<String, BTreeMap<i64, f64>>,
+}
+
+impl PriceCache {
+    pub fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| bincode::deserialize(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
+        let bytes = bincode::serialize(self).expect("bincode serialize");
+        std::fs::write(path, bytes)
+    }
+
+    pub fn get_closest(&self, symbol: &str, target_ts: i64) -> Option<f64> {
+        let map = self.data.get(&symbol.to_uppercase())?;
+        map.range(..=target_ts).next_back().map(|(_, &v)| v)
+    }
+
+    pub fn insert(&mut self, symbol: &str, ts: i64, price: f64) {
+        self.data.entry(symbol.to_uppercase()).or_default().insert(ts, price);
+    }
+}
+
+static PRICE_CACHE: Lazy<Mutex<PriceCache>> = Lazy::new(|| Mutex::new(PriceCache::default()));
+
+pub fn init_price_cache(path: &Path) {
+    let cache = PriceCache::load(path);
+    *PRICE_CACHE.lock().unwrap() = cache;
+}
+
+// NOUVELLE FONCTION : Permet de nourrir le cache depuis tx_store.json
+pub fn seed_price_cache(symbol: &str, ts: i64, price: f64) {
+    if price > 0.0 {
+        let aligned_ts = ts - (ts % 3600);
+        PRICE_CACHE.lock().unwrap().insert(symbol, aligned_ts, price);
+    }
+}
+
+pub fn save_price_cache(path: &Path) {
+    if let Err(e) = PRICE_CACHE.lock().unwrap().save(path) {
+        eprintln!("Erreur sauvegarde price_cache.bin: {e}");
+    }
+}
+
 fn client() -> &'static reqwest::blocking::Client {
     static CLIENT: Lazy<reqwest::blocking::Client> = Lazy::new(|| {
         reqwest::blocking::Client::builder()
@@ -1032,7 +1095,7 @@ fn client() -> &'static reqwest::blocking::Client {
     &CLIENT
 }
 
-// --- caches best-effort, équivalents des @lru_cache Python ---
+// --- caches best-effort en mémoire pour les tx ponctuelles (FX, etc) ---
 static BINANCE_KLINES_CACHE: Lazy<Mutex<HashMap<(String, String), Vec<Value>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static YAHOO_PRICE_CACHE: Lazy<Mutex<HashMap<(String, String), (f64, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -1067,12 +1130,7 @@ fn binance_klines(symbol_pair: &str, day_str: &str) -> Result<Vec<Value>, PriceE
 }
 
 /// Récupère la dernière clôture Yahoo disponible <= day_str.
-///
-/// Important : day_str peut tomber un week-end ou un jour férié. On
-/// demande une fenêtre de plusieurs jours et on prend la dernière bougie
-/// disponible avant ou à la date cible.
 pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, String), PriceError> {
-   
     let key = (ticker.to_string(), day_str.to_string());
     if let Some(cached) = YAHOO_PRICE_CACHE.lock().unwrap().get(&key) {
         return Ok(cached.clone());
@@ -1104,7 +1162,6 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
         .ok_or_else(|| PriceError::Message(format!("Yahoo n'a pas trouvé de résultat pour {ticker}")))?;
 
     let meta = result.get("meta").cloned().unwrap_or(Value::Null);
-    // Ne surtout pas faire .to_uppercase() : GBp != GBP.
     let currency = meta.get("currency").and_then(|c| c.as_str()).unwrap_or("USD").to_string();
 
     let timestamps: Vec<i64> = result
@@ -1122,7 +1179,6 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
         .map(|arr| arr.iter().map(|v| v.as_f64()).collect())
         .unwrap_or_default();
 
-    
     let mut candidates: Vec<(chrono::NaiveDate, f64)> = Vec::new();
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         let Some(close) = close else { continue };
@@ -1175,13 +1231,9 @@ fn get_price_from_binance(symbol: &str, time: DateTime<Utc>) -> Result<f64, Pric
     Err(PriceError::Message(format!("Binance n'a pas trouvé le prix pour {symbol} au {day_str}")))
 }
 
-/// Récupère la série de clôtures quotidiennes Yahoo sur les `days` derniers
-/// jours (bornes incluses). Contrairement à `yahoo_historical_price`, on
-/// veut ici tout l'historique pour calculer des rendements, pas une seule
-/// valeur -- une seule requête HTTP couvre toute la fenêtre.
 pub fn yahoo_daily_closes(ticker: &str, days: i64) -> Result<Vec<(chrono::NaiveDate, f64)>, PriceError> {
     let end = Utc::now();
-    let start = end - chrono::Duration::days(days + 5); // marge pour jours fériés/week-ends
+    let start = end - chrono::Duration::days(days + 5);
     let period1 = start.timestamp();
     let period2 = end.timestamp();
 
@@ -1236,7 +1288,7 @@ pub fn yahoo_daily_closes(ticker: &str, days: i64) -> Result<Vec<(chrono::NaiveD
 
         close *= price_factor;
         if fx_currency != "EUR" {
-            let Some(fx_rate) = fx_series.get(&day) else { continue }; // pas de FX ce jour-là -> on saute le point plutôt que fausser
+            let Some(fx_rate) = fx_series.get(&day) else { continue };
             close /= fx_rate;
         }
         out.push((day, close));
@@ -1245,8 +1297,6 @@ pub fn yahoo_daily_closes(ticker: &str, days: i64) -> Result<Vec<(chrono::NaiveD
     Ok(out)
 }
 
-/// Variante brute sans conversion EUR, utilisée en interne pour récupérer
-/// la série FX elle-même (éviter une récursion infinie).
 fn yahoo_daily_closes_raw(ticker: &str) -> Result<Vec<(chrono::NaiveDate, f64)>, PriceError> {
     let end = Utc::now();
     let start = end - chrono::Duration::days(95);
@@ -1291,12 +1341,6 @@ fn yahoo_daily_closes_raw(ticker: &str) -> Result<Vec<(chrono::NaiveDate, f64)>,
     Ok(out)
 }
 
-/// Série de clôtures quotidiennes EUR pour une crypto sur les `days`
-/// derniers jours. Seule la paire directe SYMBOLEUR est utilisée -- la
-/// reconstruction par cross-rate (SYMBOLUSDT / EURUSDT) jour par jour
-/// n'est pas gérée ici pour la corrélation (elle l'est déjà pour le prix
-/// ponctuel via `get_price_from_binance`) : si la paire EUR n'existe pas
-/// sur Binance, la crypto est simplement absente de la matrice.
 pub fn binance_daily_closes(symbol: &str, days: i64) -> Result<Vec<(chrono::NaiveDate, f64)>, PriceError> {
     let end_ms = Utc::now().timestamp_millis();
     let start_ms = (Utc::now() - chrono::Duration::days(days + 2)).timestamp_millis();
@@ -1324,10 +1368,6 @@ pub fn binance_daily_closes(symbol: &str, days: i64) -> Result<Vec<(chrono::Naiv
     Ok(out)
 }
 
-
-/// multiplicatif à appliquer au prix). Nécessaire car Yahoo exprime
-/// certains titres londoniens en pence ("GBp") plutôt qu'en livres
-/// ("GBP") -- il n'existe pas de paire "EURGBp=X".
 pub fn normalize_currency_for_fx(currency: &str) -> (String, f64) {
     if currency == "GBp" || currency == "GBX" {
         ("GBP".to_string(), 0.01)
@@ -1336,67 +1376,159 @@ pub fn normalize_currency_for_fx(currency: &str) -> (String, f64) {
     }
 }
 
-/// Retourne le prix en EUR de `symbol` à la date `time` en fonction de son
-/// `kind`. Best-effort : erreurs réseau/format renvoient 0.0 avec un
-/// warning plutôt que de propager -- un prix manquant ne doit jamais
-/// bloquer le pipeline.
+// --- NOUVELLE FONCTION HISTORICAL_PRICE_EUR AVEC CACHE 1H ---
 pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, ticker: Option<&str>) -> f64 {
     let symbol = symbol.to_uppercase();
 
     if kind == AssetKind::Cash {
         match symbol.as_str() {
             "EUR" | "EURI" => return 1.0,
-            "USD" | "USDT" | "USDC" | "BUSD" => return 0.92, // fixe, à remplacer par un vrai appel API si besoin
+            "USD" | "USDT" | "USDC" | "BUSD" => return 0.92,
             "GBP" => return 1.15,
             _ => {}
         }
     }
 
-    let day_str = time.format("%Y-%m-%d").to_string();
+    // Aligne sur l'heure pile (1h)
+    let aligned_ts = time.timestamp() - (time.timestamp() % 3600);
 
-    match kind {
-        AssetKind::Stock => {
-            let Some(ticker) = ticker else {
-                eprintln!("  [WARN] Pas de ticker Yahoo pour l'action {symbol}. Prix mis à 0.");
-                return 0.0;
-            };
-            match yahoo_historical_price(ticker, &day_str) {
-                Ok((mut price, currency)) => {
-                    if currency != "EUR" {
-                        let (fx_currency, price_factor) = normalize_currency_for_fx(&currency);
-                        price *= price_factor;
-                        let fx_pair = format!("EUR{fx_currency}=X");
-                        match yahoo_historical_price(&fx_pair, &day_str) {
-                            Ok((fx_price, _)) => price / fx_price,
-                            Err(_) => {
-                                eprintln!("  [WARN] Prix Yahoo indisponible pour {ticker} au {day_str}.");
-                                0.0
-                            }
-                        }
-                    } else {
-                        price
-                    }
-                }
-                Err(_) => {
-                    eprintln!("  [WARN] Prix Yahoo indisponible pour {ticker} au {day_str}.");
-                    0.0
-                }
-            }
-        }
-        AssetKind::Crypto => match get_price_from_binance(&symbol, time) {
-            Ok(price) => price,
-            Err(_) => {
-                eprintln!("  [WARN] Prix Binance indisponible pour {symbol} au {day_str}. Prix mis à 0.");
-                0.0
-            }
-        },
-        AssetKind::Cash => {
-            eprintln!("  [WARN] Type d'actif non géré pour {symbol}: {kind:?}");
-            0.0
+    // 1. Vérifier le cache
+    {
+        let cache = PRICE_CACHE.lock().unwrap();
+        if let Some(price) = cache.get_closest(&symbol, aligned_ts) {
+            return price;
         }
     }
+
+    // 2. Si absent, fetch et insertion
+    let price = match kind {
+        AssetKind::Stock => {
+            let Some(ticker) = ticker else { return 0.0; };
+            match fetch_yahoo_1h(ticker, aligned_ts) {
+                Ok(p) => p,
+                Err(_) => 0.0
+            }
+        }
+        AssetKind::Crypto => {
+            match fetch_binance_1h(&symbol, aligned_ts) {
+                Ok(p) => p,
+                Err(_) => 0.0
+            }
+        }
+        _ => 0.0
+    };
+
+    if price > 0.0 {
+        PRICE_CACHE.lock().unwrap().insert(&symbol, aligned_ts, price);
+    }
+
+    price
 }
 
+fn fetch_binance_1h(symbol: &str, aligned_ts: i64) -> Result<f64, PriceError> {
+    let start_ms = aligned_ts * 1000;
+    let resp = client()
+        .get(BINANCE_API)
+        .query(&[
+            ("symbol", format!("{symbol}EUR")),
+            ("interval", "1h".to_string()),
+            ("startTime", start_ms.to_string()),
+            ("limit", "1".to_string()),
+        ])
+        .send()?
+        .error_for_status()?;
+
+    let data: Vec<Value> = resp.json()?;
+    if let Some(kline) = data.first() {
+        if let Some(close) = kline.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            return Ok(close);
+        }
+    }
+    
+    // Fallback USDT
+    let resp_usdt = client()
+        .get(BINANCE_API)
+        .query(&[
+            ("symbol", format!("{symbol}USDT")),
+            ("interval", "1h".to_string()),
+            ("startTime", start_ms.to_string()),
+            ("limit", "1".to_string()),
+        ])
+        .send()?;
+
+    let data_usdt: Vec<Value> = resp_usdt.json()?;
+    if let Some(kline) = data_usdt.first() {
+        if let Some(close_usdt) = kline.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            let resp_eur = client().get(BINANCE_API)
+                .query(&[("symbol", "EURUSDT".to_string()), ("interval", "1h".to_string()), ("startTime", start_ms.to_string()), ("limit", "1".to_string())]).send()?;
+            let data_eur: Vec<Value> = resp_eur.json()?;
+            if let Some(kline_eur) = data_eur.first() {
+                if let Some(rate_eur) = kline_eur.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                    if rate_eur > 0.0 { return Ok(close_usdt / rate_eur); }
+                }
+            }
+        }
+    }
+    Err(PriceError::Message("Prix Binance 1h introuvable".into()))
+}
+
+fn fetch_yahoo_1h(ticker: &str, aligned_ts: i64) -> Result<f64, PriceError> {
+    let target = Utc.timestamp_opt(aligned_ts, 0).unwrap();
+    let period1 = (target - chrono::Duration::days(2)).timestamp();
+    let period2 = (target + chrono::Duration::days(1)).timestamp();
+    
+    let url = format!("{YAHOO_CHART_API}/{ticker}");
+    let resp = client()
+        .get(&url)
+        .query(&[
+            ("period1", period1.to_string()),
+            ("period2", period2.to_string()),
+            ("interval", "1h".to_string()),
+            ("events", "history".to_string()),
+        ])
+        .send()?
+        .error_for_status()?;
+
+    let data: Value = resp.json()?;
+    let result = data.get("chart").and_then(|c| c.get("result")).and_then(|r| r.as_array()).and_then(|arr| arr.first())
+        .ok_or_else(|| PriceError::Message("Yahoo KO".into()))?;
+
+    let currency = result.get("meta").and_then(|m| m.get("currency")).and_then(|c| c.as_str()).unwrap_or("USD");
+    let (fx_currency, price_factor) = normalize_currency_for_fx(currency);
+    let fx_rate = if fx_currency != "EUR" {
+        yahoo_historical_price(&format!("EUR{fx_currency}=X"), &target.format("%Y-%m-%d").to_string()).ok().map(|(p, _)| p).unwrap_or(1.0)
+    } else { 1.0 };
+
+    let timestamps: Vec<i64> = result.get("timestamp").and_then(|t| t.as_array()).map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
+    let closes: Vec<Option<f64>> = result.get("indicators").and_then(|i| i.get("quote")).and_then(|q| q.as_array()).and_then(|arr| arr.first()).and_then(|q0| q0.get("close")).and_then(|c| c.as_array()).map(|arr| arr.iter().map(|v| v.as_f64()).collect()).unwrap_or_default();
+
+    // Cherche la bougie 1h exacte
+    for (ts, close) in timestamps.iter().zip(closes.iter()) {
+        if *ts == aligned_ts {
+            if let Some(c) = *close {
+                return Ok((c * price_factor) / fx_rate);
+            }
+        }
+    }
+
+    // Si marché fermé, prend la dernière bougie disponible avant aligned_ts
+    let mut best_price = None;
+    let mut best_ts = 0;
+    for (ts, close) in timestamps.iter().zip(closes.iter()) {
+        if *ts <= aligned_ts && *ts > best_ts {
+            if let Some(c) = *close {
+                best_price = Some(c);
+                best_ts = *ts;
+            }
+        }
+    }
+
+    if let Some(c) = best_price {
+        return Ok((c * price_factor) / fx_rate);
+    }
+
+    Err(PriceError::Message("Prix Yahoo 1h introuvable".into()))
+}
 
 ################################################################################
 # Dossier : src/market
@@ -1598,7 +1730,7 @@ pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
 
 //! Portage de src/parse/binance.py.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -1661,7 +1793,7 @@ fn parse_time(raw: &str) -> Result<chrono::DateTime<Utc>> {
 /// Seule source Binance retenue -- le format 'Account Statement' est
 /// abandonné (pas de prix d'exécution fiable, appariement heuristique trop
 /// fragile).
-pub fn parse_trades(path: &Path) -> Result<Vec<Transaction>> {
+pub fn parse_trades(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
     let mut out = Vec::new();
 
@@ -1672,6 +1804,17 @@ pub fn parse_trades(path: &Path) -> Result<Vec<Transaction>> {
         let record = record?;
         let row: HashMap<&str, &str> = headers.iter().zip(record.iter()).collect();
         let get = |k: &str| -> Result<&str> { row.get(k).copied().ok_or_else(|| anyhow!("colonne '{k}' manquante")) };
+
+        // ON CALCULE L'ID TOUT DE SUITE
+        let trade_id = synthetic_id(
+            "binance-trade",
+            &[get("Time")?, get("Pair")?, get("Side")?, get("Price")?, get("Executed")?, get("Amount")?],
+        );
+
+        // SI L'ID EST DÉJÀ CONNU, ON SAUTE LA LIGNE SANS FETCH LE PRIX !
+        if known_ids.contains(&trade_id) {
+            continue;
+        }
 
         let time = parse_time(get("Time")?)?;
         let (base_qty, base_symbol) = split_amount(get("Executed")?)?;
@@ -1697,11 +1840,7 @@ pub fn parse_trades(path: &Path) -> Result<Vec<Transaction>> {
         let quote_currency = normalize_currency(&quote_symbol).map(String::from).unwrap_or(quote_symbol.clone());
         let eur_price = historical_price_eur(&base_symbol, time, asset_kind_for(&base_symbol), None);
         let value_eur = base_qty * eur_price;
-        let trade_id = synthetic_id(
-            "binance-trade",
-            &[get("Time")?, get("Pair")?, get("Side")?, get("Price")?, get("Executed")?, get("Amount")?],
-        );
-
+       
         out.push(Transaction {
             platform: Platform::Binance,
             account_label: "Spot".to_string(),
@@ -1756,7 +1895,7 @@ pub fn parse_trades(path: &Path) -> Result<Vec<Transaction>> {
 /// Parse un export Binance 'Convert History'. Chaque ligne réussie devient
 /// deux transactions (Sell de l'actif cédé, Buy de l'actif reçu) -- les
 /// conversions échouées/annulées (Status != 'Successful') sont ignorées.
-pub fn parse_converts(path: &Path) -> Result<Vec<Transaction>> {
+pub fn parse_converts(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
     let mut out = Vec::new();
 
@@ -1764,11 +1903,19 @@ pub fn parse_converts(path: &Path) -> Result<Vec<Transaction>> {
     let headers = reader.headers()?.clone();
 
     for record in reader.records() {
-        let record = record?;
+       let record = record?;
         let row: HashMap<&str, &str> = headers.iter().zip(record.iter()).collect();
         let get = |k: &str| -> Result<&str> { row.get(k).copied().ok_or_else(|| anyhow!("colonne '{k}' manquante")) };
 
-        if get("Status")? != "Successful" {
+        if get("Status")? != "Successful" { continue; }
+
+        let convert_id = synthetic_id(
+            "binance-convert",
+            &[get("Time")?, get("Wallet")?, get("Pair")?, get("Sell")?, get("Buy")?, get("Price")?],
+        );
+
+        // SAUTE SI DÉJÀ CONNU
+        if known_ids.contains(&format!("{convert_id}-sell")) && known_ids.contains(&format!("{convert_id}-buy")) {
             continue;
         }
 
@@ -1796,11 +1943,7 @@ pub fn parse_converts(path: &Path) -> Result<Vec<Transaction>> {
         let buy_value_eur = buy_qty * buy_price_eur;
         let sell_value_eur = sell_qty * sell_price_eur;
 
-        let convert_id = synthetic_id(
-            "binance-convert",
-            &[get("Time")?, get("Wallet")?, get("Pair")?, get("Sell")?, get("Buy")?, get("Price")?],
-        );
-
+       
         out.push(Transaction {
             platform: Platform::Binance,
             account_label: get("Wallet")?.to_string(),
@@ -1940,7 +2083,7 @@ pub mod manual;
 //! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
 //! opérations de cash XTB, lues depuis les exports xlsx.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -2207,8 +2350,7 @@ fn load_rows(path: &Path, sheet_name: &str) -> Result<Vec<Vec<Data>>> {
     Ok(range.rows().map(|r| r.to_vec()).collect())
 }
 
-/// Parse l'onglet 'Closed Positions' d'un export XTB xlsx.
-pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbClosedPosition>> {
+pub fn parse_closed_positions(path: &Path, sheet_name: &str, known_ids: &std::collections::HashSet<String>) -> Result<Vec<XtbClosedPosition>> {
     let source_file = path.display().to_string();
     let rows = load_rows(path, sheet_name)?;
     let header_idx = find_header_row(&rows, "Position ID")?;
@@ -2217,12 +2359,19 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbCl
 
     for row in &rows[header_idx + 1..] {
         let position_id = match cell_f64(col(row, &col_map, "Position ID")?) {
-            Some(id) => id,
-            None => continue, // ligne "Total" ou vide
+            Some(id) => (id as i64).to_string(),
+            None => continue,
         };
 
+        // SKIP EARLY
+        let buy_id = format!("{}-buy", position_id);
+        let sell_id = format!("{}-sell", position_id);
+        if known_ids.contains(&buy_id) && known_ids.contains(&sell_id) {
+            continue;
+        }
+
         out.push(XtbClosedPosition {
-            position_id: (position_id as i64).to_string(),
+            position_id,
             symbol: cell_str(col(row, &col_map, "Ticker")?),
             volume: cell_f64(col(row, &col_map, "Volume")?).unwrap_or(0.0),
             open_time: cell_datetime(col(row, &col_map, "Open Time (UTC)")?)?,
@@ -2234,16 +2383,14 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbCl
             source_file: source_file.clone(),
         });
     }
-
     Ok(out)
 }
-
 /// Parse l'onglet 'Open Positions' d'un export XTB xlsx.
 ///
 /// Le tableau contient deux types de lignes : des lignes "résumé" par
 /// instrument (colonne Type vide) et des lignes "détail" par position
 /// individuelle (Type='BUY'). Seules les secondes sont retenues.
-pub fn parse_open_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbOpenPosition>> {
+pub fn parse_open_positions(path: &Path, sheet_name: &str, known_ids: &HashSet<String>) -> Result<Vec<XtbOpenPosition>> {
     let source_file = path.display().to_string();
     let rows = load_rows(path, sheet_name)?;
     let header_idx = find_header_row(&rows, "Instrument/Position")?;
@@ -2252,11 +2399,11 @@ pub fn parse_open_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbOpen
 
     for row in &rows[header_idx + 1..] {
         let side = cell_str(col(row, &col_map, "Type")?);
-        if side.is_empty() {
-            continue;
-        }
+        if side.is_empty() { continue; }
         let position_id = cell_str(col(row, &col_map, "Instrument/Position")?);
-        if position_id.is_empty() {
+        if position_id.is_empty() { continue; }
+
+        if known_ids.contains(&position_id) {
             continue;
         }
 
@@ -2487,19 +2634,17 @@ pub mod serialize;
 ################################################################################
 
 //! Portage de src/store/serialize.py : TxStore (conteneur en mémoire) +
-//! chargement/sauvegarde JSON. Format compatible avec l'ancien
-//! serialized_tx.json Python (assets en dict par symbole, transactions
-//! en liste plate avec champ "asset" = symbole).
+//! chargement/sauvegarde JSON. 
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::Path;
-
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+// CORRECTION ICI : on importe bien seed_price_cache et on ajoute le point-virgule
+use crate::market::prices::seed_price_cache;
 
 const TX_STORE_VERSION: u32 = 1;
 
@@ -2536,40 +2681,11 @@ struct WalletPayload {
     transactions: Vec<TransactionDto>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum TxEvent {
-    /// tx complète auto-portée (Asset inclus, pas juste le symbole) :
-    /// chaque ligne du log doit pouvoir se relire seule.
-    Add { tx: Transaction },
-    /// Ne supprime jamais une ligne : marque juste une tx antérieure
-    /// comme périmée (correction XTB, édition manuelle...).
-    Tombstone { external_id: String, reason: Option<String> },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TxLogRecord {
-    recorded_at: String,   // horodatage d'écriture (audit), != tx.time
-    batch_id: String,      // uuid généré une fois par run de main.rs
-    event: TxEvent,
-}
-
-fn append_events(path: &Path, records: &[TxLogRecord]) -> Result<()> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    for r in records {
-        writeln!(file, "{}", serde_json::to_string(r)?)?;
-    }
-    Ok(())
-}
-
-/// Conteneur en mémoire pour l'ensemble des transactions et actifs connus.
-/// Equivalent de la classe TxStore côté Python (anciennement Wallet).
 #[derive(Debug, Default)]
 pub struct TxStore {
     pub assets: HashMap<String, Asset>,
     pub transactions: Vec<Transaction>,
-    known_external_ids: HashSet<String>,
+    pub known_external_ids: HashSet<String>,
 }
 
 impl TxStore {
@@ -2577,9 +2693,6 @@ impl TxStore {
         Self::default()
     }
 
-    /// Retourne l'Asset canonique pour ce symbole, le créant si besoin.
-    /// Si un Asset existe déjà, ses métadonnées font foi (dédup, remplace
-    /// l'ancien AssetRegistry.find_or_create).
     pub fn find_or_create_asset(
         &mut self,
         symbol: &str,
@@ -2602,10 +2715,6 @@ impl TxStore {
         asset
     }
 
-    /// Fusionne des transactions fraîchement parsées dans le wallet.
-    /// Chaque `tx.asset` (venant d'un parseur, instance locale au run)
-    /// est retraduit vers l'Asset canonique via son symbole. Retourne le
-    /// nombre de transactions effectivement ajoutées (hors doublons).
     pub fn add_transactions(&mut self, new_transactions: Vec<Transaction>) -> usize {
         let mut added = 0;
         for tx in new_transactions {
@@ -2613,6 +2722,15 @@ impl TxStore {
                 if self.known_external_ids.contains(ext_id) {
                     continue;
                 }
+            }
+
+            // AUTO-GUÉRISON DU CACHE :
+            // Si la transaction contient un prix valide, on l'insère dans le cache binaire
+            // au cas où le cache n'aurait pas encore cette heure précise.
+            if tx.quantity > 0.0 && tx.value_eur > 0.0 {
+                let price = tx.value_eur / tx.quantity;
+                // CORRECTION ICI : on utilise seed_price_cache
+                seed_price_cache(&tx.asset.symbol, tx.time.timestamp(), price);
             }
 
             let local_asset = self.find_or_create_asset(
@@ -2635,23 +2753,6 @@ impl TxStore {
         }
         added
     }
-
-    fn diff_platform(tx_store: &TxStore, platform: Platform, fresh: &[Transaction]) -> (Vec<String>, Vec<Transaction>) {
-    let fresh_ids: HashSet<&str> = fresh.iter().filter_map(|t| t.external_id.as_deref()).collect();
-
-    let to_tombstone = tx_store.transactions.iter()
-        .filter(|t| t.platform == platform)
-        .filter_map(|t| t.external_id.clone())
-        .filter(|id| !fresh_ids.contains(id.as_str()))
-        .collect();
-
-    let to_add = fresh.iter()
-        .filter(|t| t.external_id.as_deref().map_or(true, |id| !tx_store.known_external_ids.contains(id)))
-        .cloned()
-        .collect();
-
-    (to_tombstone, to_add)
-    }
 }
 
 fn transaction_to_dto(tx: &Transaction) -> TransactionDto {
@@ -2672,59 +2773,6 @@ fn transaction_to_dto(tx: &Transaction) -> TransactionDto {
     }
 }
 
-fn dto_to_transaction(dto: TransactionDto, tx_store: &mut TxStore, assets_meta: &HashMap<String, AssetMeta>) -> Result<Transaction> {
-    let meta = assets_meta
-        .get(&dto.asset)
-        .with_context(|| format!("métadonnées manquantes pour l'actif '{}'", dto.asset))?;
-    let asset = tx_store.find_or_create_asset(
-        &dto.asset,
-        &meta.name,
-        meta.kind,
-        &meta.ref_currency,
-        meta.identifiers.clone(),
-    );
-    let time: DateTime<Utc> = DateTime::parse_from_rfc3339(&dto.time)
-        .with_context(|| format!("horodatage invalide: {}", dto.time))?
-        .with_timezone(&Utc);
-
-    Ok(Transaction {
-        platform: dto.platform,
-        account_label: dto.account_label,
-        kind: dto.kind,
-        asset,
-        quantity: dto.quantity,
-        price: dto.price,
-        value_eur: dto.value_eur,
-        amount: dto.amount,
-        quote_currency: dto.quote_currency,
-        time,
-        external_id: dto.external_id,
-        remark: dto.remark,
-        source_file: dto.source_file,
-    })
-}
-
-fn load_tx_store(path: &Path) -> Result<TxStore> {
-    let mut tx_store = TxStore::new();
-    if !path.exists() { return Ok(tx_store); }
-
-    for (i, line) in fs::read_to_string(path)?.lines().enumerate() {
-        if line.trim().is_empty() { continue; }
-        let record: TxLogRecord = serde_json::from_str(line)
-            .with_context(|| format!("ligne {} invalide", i + 1))?;
-        match record.event {
-            TxEvent::Add { tx } => tx_store.add_transactions(vec![tx]), // dédup by external_id déjà en place
-            TxEvent::Tombstone { external_id, .. } => {
-                tx_store.transactions.retain(|t| t.external_id.as_deref() != Some(external_id.as_str()));
-                tx_store.known_external_ids.remove(&external_id);
-            }
-        };
-    }
-    Ok(tx_store)
-}
-
-/// Réécrit le serialized_tx.json en entier (pas d'append) -- garantit un
-/// fichier toujours cohérent avec l'état en mémoire.
 pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
     let assets_out: HashMap<String, AssetMeta> = tx_store
         .assets
@@ -2743,7 +2791,6 @@ pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
         .collect();
 
     let mut transactions_out: Vec<TransactionDto> = tx_store.transactions.iter().map(transaction_to_dto).collect();
-    // Ordre chronologique stable -> diffs git lisibles.
     transactions_out.sort_by(|a, b| a.time.cmp(&b.time));
 
     let payload = WalletPayload {
@@ -2760,4 +2807,3 @@ pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
     fs::write(path, json).with_context(|| format!("écriture de {:?}", path))?;
     Ok(())
 }
-

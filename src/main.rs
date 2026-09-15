@@ -1,9 +1,10 @@
 //! Portage de src/cli.py -- construit (ou met à jour) serialized_tx.json
 //! à partir des exports bruts dans ./data/raw/.
 //!
-//! Ré-exécutable sans risque : le dédoublonnage par external_id garantit
-//! qu'un même fichier réimporté ne crée pas de doublons.
+//! Ré-exécutable sans risque : le tx_store est recréé from scratch à chaque run.
+//! Le cache des prix (price_cache.bin) persiste et bloque les appels API inutiles.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -16,13 +17,10 @@ use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
-use portfolio_rs::store::serialize::{load_tx_store, save_wallet, diff_platform};
+use portfolio_rs::store::serialize::{TxStore, save_wallet};
+use portfolio_rs::market::prices::{init_price_cache, save_price_cache};
 
-/// Seuil en-dessous duquel un actif est considéré comme une poussière et
-/// exclu de la matrice de corrélation. Les benchmarks (indices,
-/// matières premières) y échappent -- ils n'ont pas de "valeur détenue".
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
-// const CORRELATION_LOOKBACK_DAYS: i64 = 90;
 
 #[derive(serde::Serialize)]
 struct DashboardAsset {
@@ -44,7 +42,7 @@ struct DashboardData {
     total_pnl_eur: f64,
     assets: Vec<DashboardAsset>,
     correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, f64>>>,
-    }
+}
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -61,7 +59,8 @@ fn parse_binance_sources() -> Vec<Transaction> {
 
     if trades_path.exists() {
         println!("Lecture Binance Trades : {trades_path:?}");
-        match binance::parse_trades(&trades_path) {
+        let empty_ids = HashSet::new();
+        match binance::parse_trades(&trades_path, &empty_ids) {
             Ok(mut tx) => out.append(&mut tx),
             Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
         }
@@ -71,7 +70,8 @@ fn parse_binance_sources() -> Vec<Transaction> {
 
     if converts_path.exists() {
         println!("Lecture Binance Converts : {converts_path:?}");
-        match binance::parse_converts(&converts_path) {
+        let empty_ids = HashSet::new();
+        match binance::parse_converts(&converts_path, &empty_ids) {
             Ok(mut tx) => out.append(&mut tx),
             Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
         }
@@ -90,9 +90,10 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
     }
 
     println!("Lecture XTB : {path:?}");
+    let empty_ids = HashSet::new();
 
     match xtb::find_sheet_by_prefix(path, "Closed Position") {
-        Ok(sheet) => match xtb::parse_closed_positions(path, &sheet) {
+        Ok(sheet) => match xtb::parse_closed_positions(path, &sheet, &empty_ids) {
             Ok(positions) => {
                 for pos in positions {
                     out.extend(pos.to_transactions());
@@ -104,7 +105,7 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
     }
 
     match xtb::find_sheet_by_prefix(path, "Open Position") {
-        Ok(sheet) => match xtb::parse_open_positions(path, &sheet) {
+        Ok(sheet) => match xtb::parse_open_positions(path, &sheet, &empty_ids) {
             Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
             Err(e) => println!("  [Erreur XTB Open] {e}"),
         },
@@ -124,18 +125,24 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
 
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
+    let cache_path = PathBuf::from("./data/price_cache.bin");
+    init_price_cache(&cache_path);
 
-    let tx_store_path = PathBuf::from("./data/tx_store.json");
-    let mut tx_store = load_tx_store(&tx_store_path)?;
-    println!("Wallet chargé : {} transaction(s) existante(s)", tx_store.transactions.len());
+    // Le wallet repart de zéro à chaque exécution
+    let mut tx_store = TxStore::new();
 
     let new_transactions = parse_binance_sources();
     let mut xtb_tx = Vec::new();
     xtb_tx.extend(parse_xtb_file(&accounts_path().join("account.xlsx")));
     xtb_tx.extend(parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
 
+    // L'ajout des transactions va automatiquement "nourrir" le cache des prix
+    // au cas où le cache binaire aurait une trouée.
     tx_store.add_transactions(new_transactions);
-    tx_store.add_transactions(xtb_tx.clone());
+    tx_store.add_transactions(xtb_tx);
+
+    let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
+    tx_store.add_transactions(manual_tx);
 
     println!("\n=== DIAGNOSTIC : BUY/DEPOSIT à quantité négative ===");
     for tx in &tx_store.transactions {
@@ -146,12 +153,6 @@ fn main() -> Result<()> {
             );
         }
     }
-
-    let replaced = tx_store.diff_platform(Platform::Xtb, xtb_tx);
-    println!("XTB : {replaced} transaction(s) (remplacement complet)");
-
-    let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
-    tx_store.diff_platform(Platform::Manual, manual_tx);
 
     // --- RÉSOLUTION DES TICKERS MANQUANTS ---
     println!("\n=== RÉSOLUTION DES TICKERS ===");
@@ -185,8 +186,13 @@ fn main() -> Result<()> {
     }
     println!("({resolved} résolus, {skipped} ignorés, {failed} échoués)");
 
+    // On écrase systématiquement tx_store.json (fichier jetable)
+    let tx_store_path = PathBuf::from("./data/tx_store.json");
     save_wallet(&tx_store, &tx_store_path)?;
+    println!("tx_store.json regénéré.");
+
     record_weekly_history(&tx_store, &PathBuf::from("./data/history.json"))?;
+    
     println!("\n=== VALORISATION ACTUELLE ===");
     let snapshot = portfolio_snapshot_at(&tx_store, None);
     let cost_basis = compute_fifo(&tx_store, None)?;
@@ -202,7 +208,7 @@ fn main() -> Result<()> {
     let mut total_pnl = 0.0;
     for asset in &snapshot.assets {
         if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") {
-            continue; // on cache les poussières
+            continue; 
         }
 
         let avg_cost = cost_basis.average_cost(&asset.symbol);
@@ -231,6 +237,7 @@ fn main() -> Result<()> {
     let prices_eur: std::collections::HashMap<String, f64> =
         snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
     let correlation_matrices = compute_correlation_matrices(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR);
+    
     let dashboard_assets: Vec<DashboardAsset> = snapshot
         .assets
         .iter()
@@ -264,6 +271,10 @@ fn main() -> Result<()> {
     let dashboard_path = PathBuf::from("./data/dashboard.json");
     std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
     println!("Dashboard écrit : {dashboard_path:?}");
+
+    // Sauvegarde atomique et définitive du cache de prix
+    save_price_cache(&cache_path);
+    println!("Cache des prix 1h sauvegardé : {cache_path:?}");
 
     Ok(())
 }

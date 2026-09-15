@@ -1,7 +1,7 @@
 //! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
 //! opérations de cash XTB, lues depuis les exports xlsx.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -268,8 +268,7 @@ fn load_rows(path: &Path, sheet_name: &str) -> Result<Vec<Vec<Data>>> {
     Ok(range.rows().map(|r| r.to_vec()).collect())
 }
 
-/// Parse l'onglet 'Closed Positions' d'un export XTB xlsx.
-pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbClosedPosition>> {
+pub fn parse_closed_positions(path: &Path, sheet_name: &str, known_ids: &std::collections::HashSet<String>) -> Result<Vec<XtbClosedPosition>> {
     let source_file = path.display().to_string();
     let rows = load_rows(path, sheet_name)?;
     let header_idx = find_header_row(&rows, "Position ID")?;
@@ -278,12 +277,19 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbCl
 
     for row in &rows[header_idx + 1..] {
         let position_id = match cell_f64(col(row, &col_map, "Position ID")?) {
-            Some(id) => id,
-            None => continue, // ligne "Total" ou vide
+            Some(id) => (id as i64).to_string(),
+            None => continue,
         };
 
+        // SKIP EARLY
+        let buy_id = format!("{}-buy", position_id);
+        let sell_id = format!("{}-sell", position_id);
+        if known_ids.contains(&buy_id) && known_ids.contains(&sell_id) {
+            continue;
+        }
+
         out.push(XtbClosedPosition {
-            position_id: (position_id as i64).to_string(),
+            position_id,
             symbol: cell_str(col(row, &col_map, "Ticker")?),
             volume: cell_f64(col(row, &col_map, "Volume")?).unwrap_or(0.0),
             open_time: cell_datetime(col(row, &col_map, "Open Time (UTC)")?)?,
@@ -295,16 +301,14 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbCl
             source_file: source_file.clone(),
         });
     }
-
     Ok(out)
 }
-
 /// Parse l'onglet 'Open Positions' d'un export XTB xlsx.
 ///
 /// Le tableau contient deux types de lignes : des lignes "résumé" par
 /// instrument (colonne Type vide) et des lignes "détail" par position
 /// individuelle (Type='BUY'). Seules les secondes sont retenues.
-pub fn parse_open_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbOpenPosition>> {
+pub fn parse_open_positions(path: &Path, sheet_name: &str, known_ids: &HashSet<String>) -> Result<Vec<XtbOpenPosition>> {
     let source_file = path.display().to_string();
     let rows = load_rows(path, sheet_name)?;
     let header_idx = find_header_row(&rows, "Instrument/Position")?;
@@ -313,11 +317,11 @@ pub fn parse_open_positions(path: &Path, sheet_name: &str) -> Result<Vec<XtbOpen
 
     for row in &rows[header_idx + 1..] {
         let side = cell_str(col(row, &col_map, "Type")?);
-        if side.is_empty() {
-            continue;
-        }
+        if side.is_empty() { continue; }
         let position_id = cell_str(col(row, &col_map, "Instrument/Position")?);
-        if position_id.is_empty() {
+        if position_id.is_empty() { continue; }
+
+        if known_ids.contains(&position_id) {
             continue;
         }
 
