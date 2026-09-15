@@ -414,15 +414,16 @@ pub fn normalize_currency_for_fx(currency: &str) -> (String, f64) {
 
 // --- NOUVELLE FONCTION HISTORICAL_PRICE_EUR AVEC CACHE 1H ---
 pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, ticker: Option<&str>) -> f64 {
-    let symbol = symbol.to_uppercase();
+      let symbol = symbol.to_uppercase();
+    let aligned_ts = time.timestamp() - (time.timestamp() % 3600);
 
     if kind == AssetKind::Cash {
-        match symbol.as_str() {
-            "EUR" | "EURI" => return 1.0,
-            "USD" | "USDT" | "USDC" | "BUSD" => return 0.92,
-            "GBP" => return 1.15,
-            _ => {}
-        }
+        return match symbol.as_str() {
+            "EUR" | "EURI" => 1.0,
+            "USD" | "USDT" | "USDC" | "BUSD" => 1.0 / eur_fx_rate_1h("USD", aligned_ts),
+            "GBP" => 1.0 / eur_fx_rate_1h("GBP", aligned_ts),
+            _ => 0.0,
+        };
     }
 
     // Aligne sur l'heure pile (1h)
