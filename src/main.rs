@@ -16,7 +16,7 @@ use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
-use portfolio_rs::store::serialize::{load_tx_store, save_wallet};
+use portfolio_rs::store::serialize::{load_tx_store, save_wallet, diff_platform};
 
 /// Seuil en-dessous duquel un actif est considéré comme une poussière et
 /// exclu de la matrice de corrélation. Les benchmarks (indices,
@@ -147,11 +147,11 @@ fn main() -> Result<()> {
         }
     }
 
-    let replaced = tx_store.replace_platform(Platform::Xtb, xtb_tx);
+    let replaced = tx_store.diff_platform(Platform::Xtb, xtb_tx);
     println!("XTB : {replaced} transaction(s) (remplacement complet)");
 
     let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
-    tx_store.replace_platform(Platform::Manual, manual_tx);
+    tx_store.diff_platform(Platform::Manual, manual_tx);
 
     // --- RÉSOLUTION DES TICKERS MANQUANTS ---
     println!("\n=== RÉSOLUTION DES TICKERS ===");

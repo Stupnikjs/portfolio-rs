@@ -4,9 +4,9 @@
 //! en liste plate avec champ "asset" = symbole).
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
-
+use std::io::Write;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,33 @@ struct WalletPayload {
     updated_at: String,
     assets: HashMap<String, AssetMeta>,
     transactions: Vec<TransactionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum TxEvent {
+    /// tx complète auto-portée (Asset inclus, pas juste le symbole) :
+    /// chaque ligne du log doit pouvoir se relire seule.
+    Add { tx: Transaction },
+    /// Ne supprime jamais une ligne : marque juste une tx antérieure
+    /// comme périmée (correction XTB, édition manuelle...).
+    Tombstone { external_id: String, reason: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TxLogRecord {
+    recorded_at: String,   // horodatage d'écriture (audit), != tx.time
+    batch_id: String,      // uuid généré une fois par run de main.rs
+    event: TxEvent,
+}
+
+fn append_events(path: &Path, records: &[TxLogRecord]) -> Result<()> {
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    for r in records {
+        writeln!(file, "{}", serde_json::to_string(r)?)?;
+    }
+    Ok(())
 }
 
 /// Conteneur en mémoire pour l'ensemble des transactions et actifs connus.
@@ -121,16 +148,21 @@ impl TxStore {
         added
     }
 
-    /// Retire toutes les transactions d'une plateforme et les remplace par
-    /// `new_transactions` -- remplacement complet, pas de merge partiel.
-    pub fn replace_platform(&mut self, platform: Platform, new_transactions: Vec<Transaction>) -> usize {
-        self.transactions.retain(|tx| tx.platform != platform);
-        self.known_external_ids = self
-            .transactions
-            .iter()
-            .filter_map(|tx| tx.external_id.clone())
-            .collect();
-        self.add_transactions(new_transactions)
+   pub fn diff_platform(tx_store: &TxStore, platform: Platform, fresh: &[Transaction]) -> (Vec<String>, Vec<Transaction>) {
+    let fresh_ids: HashSet<&str> = fresh.iter().filter_map(|t| t.external_id.as_deref()).collect();
+
+    let to_tombstone = tx_store.transactions.iter()
+        .filter(|t| t.platform == platform)
+        .filter_map(|t| t.external_id.clone())
+        .filter(|id| !fresh_ids.contains(id.as_str()))
+        .collect();
+
+    let to_add = fresh.iter()
+        .filter(|t| t.external_id.as_deref().map_or(true, |id| !tx_store.known_external_ids.contains(id)))
+        .cloned()
+        .collect();
+
+    (to_tombstone, to_add)
     }
 }
 
@@ -152,7 +184,7 @@ fn transaction_to_dto(tx: &Transaction) -> TransactionDto {
     }
 }
 
-fn dto_to_transaction(dto: TransactionDto, tx_store: &mut TxStore, assets_meta: &HashMap<String, AssetMeta>) -> Result<Transaction> {
+ fn dto_to_transaction(dto: TransactionDto, tx_store: &mut TxStore, assets_meta: &HashMap<String, AssetMeta>) -> Result<Transaction> {
     let meta = assets_meta
         .get(&dto.asset)
         .with_context(|| format!("métadonnées manquantes pour l'actif '{}'", dto.asset))?;
@@ -184,28 +216,26 @@ fn dto_to_transaction(dto: TransactionDto, tx_store: &mut TxStore, assets_meta: 
     })
 }
 
-/// Charge un serialized_tx.json existant. Retourne un TxStore vide si le
-/// fichier n'existe pas encore (premier import).
-pub fn load_tx_store(path: &Path) -> Result<TxStore> {
+   pub fn load_tx_store(path: &Path) -> Result<TxStore> {
     let mut tx_store = TxStore::new();
+    if !path.exists() { return Ok(tx_store); }
 
-    if !path.exists() {
-        return Ok(tx_store);
-    }
-
-    let raw = fs::read_to_string(path).with_context(|| format!("lecture de {:?}", path))?;
-    let payload: WalletPayload = serde_json::from_str(&raw).with_context(|| format!("parse JSON de {:?}", path))?;
-
-    for dto in payload.transactions {
-        let tx = dto_to_transaction(dto, &mut tx_store, &payload.assets)?;
-        if let Some(ext_id) = tx.external_id.clone() {
-            tx_store.known_external_ids.insert(ext_id);
+    for (i, line) in fs::read_to_string(path)?.lines().enumerate() {
+    if line.trim().is_empty() { continue; }
+    let record: TxLogRecord = serde_json::from_str(line)
+        .with_context(|| format!("ligne {} invalide", i + 1))?;
+    match record.event {
+        TxEvent::Add { tx } => {
+            tx_store.add_transactions(vec![tx]);
         }
-        tx_store.transactions.push(tx);
+        TxEvent::Tombstone { external_id, .. } => {
+            tx_store.transactions.retain(|t| t.external_id.as_deref() != Some(external_id.as_str()));
+            tx_store.known_external_ids.remove(&external_id);
+        }
     }
-
+    }
     Ok(tx_store)
-}
+    }
 
 /// Réécrit le serialized_tx.json en entier (pas d'append) -- garantit un
 /// fichier toujours cohérent avec l'état en mémoire.
