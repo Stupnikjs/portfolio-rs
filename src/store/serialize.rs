@@ -9,7 +9,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
 // CORRECTION ICI : on importe bien seed_price_cache et on ajoute le point-virgule
-use crate::market::prices::seed_price_cache;
+
 
 const TX_STORE_VERSION: u32 = 1;
 

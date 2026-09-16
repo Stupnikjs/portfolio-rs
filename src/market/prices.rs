@@ -441,7 +441,7 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
     let price = match kind {
         AssetKind::Stock => {
             let Some(ticker) = ticker else { return 0.0; };
-            match fetch_yahoo_1h(ticker, aligned_ts) {
+            match fetch_yahoo_fx_1h(ticker, aligned_ts) {
                 Ok(p) => p,
                 Err(_) => 0.0
             }

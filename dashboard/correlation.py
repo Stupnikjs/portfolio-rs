@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
-
+from clustering import assign_clusters, cluster_table, compute_linkage, render_dendrogram
 from config import BENCHMARK_LABELS, BENCHMARK_TICKERS, DEFAULT_WINDOW_ORDER, WINDOW_TO_YF_PERIOD
 from data import yfinance_ticker_for
 
@@ -115,6 +115,35 @@ def _render_full_matrix(corr_matrix: pd.DataFrame, source_note: str | None, sele
     - 🔵 **Bleu (proche de -1)** : Corrélation négative (vrais couvre-risques).
     """)
 
+def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
+    st.subheader(f"🧩 Groupes automatiques ({selected_window})")
+
+    if not (correlation_matrices and selected_window in correlation_matrices):
+        st.info("Données insuffisantes pour calculer les groupes.")
+        return
+
+    full_corr = pd.DataFrame(correlation_matrices[selected_window])
+    kept = [s for s in full_corr.columns if s in eligible_symbols]
+    corr_matrix = full_corr.loc[kept, kept] if len(kept) >= 3 else pd.DataFrame()
+
+    if corr_matrix.empty:
+        st.info("Au moins 3 actifs sont nécessaires pour former des groupes.")
+        return
+
+    max_clusters = len(corr_matrix.columns) - 1
+    n_clusters = st.slider("Nombre de groupes", min_value=2, max_value=max_clusters, value=min(4, max_clusters))
+
+    linkage_matrix = compute_linkage(corr_matrix)
+    cluster_labels = assign_clusters(corr_matrix, linkage_matrix, n_clusters)
+
+    st.plotly_chart(render_dendrogram(corr_matrix, linkage_matrix), use_container_width=True)
+    st.caption(
+        "Plus deux actifs fusionnent bas dans l'arbre, plus leur comportement "
+        "historique est proche -- indépendamment de leur type (Action/Crypto/...)."
+    )
+
+    st.dataframe(cluster_table(cluster_labels), use_container_width=True, hide_index=True)
+
 
 def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
     st.subheader(f"🔗 Corrélations par actif ({selected_window})")
@@ -192,3 +221,6 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
 
     st.divider()
     _render_per_asset(correlation_matrices, selected_window, eligible_symbols)
+
+    st.divider()
+    _render_clusters(correlation_matrices, selected_window, eligible_symbols)

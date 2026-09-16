@@ -16,7 +16,7 @@ use portfolio_rs::market::correlation::compute_correlation_matrices;
 use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
-use portfolio_rs::schema::{AssetKind, Platform, Transaction, TransactionKind};
+use portfolio_rs::schema::{AssetKind,  Transaction, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
 use portfolio_rs::market::prices::{init_price_cache, save_price_cache};
 
