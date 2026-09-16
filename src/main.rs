@@ -125,7 +125,7 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
 
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
-    let cache_path = PathBuf::from("./data/price_cache.bin");
+    let cache_path = PathBuf::from("./data");
     init_price_caches(&cache_path);
 
     // Le wallet repart de zéro à chaque exécution
