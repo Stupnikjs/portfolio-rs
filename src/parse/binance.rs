@@ -8,6 +8,7 @@ use chrono::{NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 
+// On supprime eur_fx_rate_1h : historical_price_eur gère déjà tout !
 use crate::market::prices::historical_price_eur;
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
 
@@ -40,7 +41,7 @@ fn split_space_amount(raw: &str) -> Result<(f64, String)> {
 fn normalize_currency(coin: &str) -> Option<&'static str> {
     match coin {
         "EUR" | "EURI" => Some("EUR"),
-        "USDC" | "USDT" => Some("USD"),
+        "USDC" | "BUSD" | "USD" => Some("USD"),
         _ => None,
     }
 }
@@ -59,10 +60,6 @@ fn parse_time(raw: &str) -> Result<chrono::DateTime<Utc>> {
 }
 
 /// Parse un export Binance 'Trade History' en transactions Buy/Sell + Fee.
-///
-/// Seule source Binance retenue -- le format 'Account Statement' est
-/// abandonné (pas de prix d'exécution fiable, appariement heuristique trop
-/// fragile).
 pub fn parse_trades(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
     let mut out = Vec::new();
@@ -75,13 +72,11 @@ pub fn parse_trades(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tran
         let row: HashMap<&str, &str> = headers.iter().zip(record.iter()).collect();
         let get = |k: &str| -> Result<&str> { row.get(k).copied().ok_or_else(|| anyhow!("colonne '{k}' manquante")) };
 
-        // ON CALCULE L'ID TOUT DE SUITE
         let trade_id = synthetic_id(
             "binance-trade",
             &[get("Time")?, get("Pair")?, get("Side")?, get("Price")?, get("Executed")?, get("Amount")?],
         );
 
-        // SI L'ID EST DÉJÀ CONNU, ON SAUTE LA LIGNE SANS FETCH LE PRIX !
         if known_ids.contains(&trade_id) {
             continue;
         }
@@ -108,6 +103,9 @@ pub fn parse_trades(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tran
         };
 
         let quote_currency = normalize_currency(&quote_symbol).map(String::from).unwrap_or(quote_symbol.clone());
+        
+        // --- CALCUL EN EUR ---
+        // historical_price_eur("BTC") va chercher BTCUSDC sur Binance, et le divise par EURUSDC pour nous donner le prix en EUR direct !
         let eur_price = historical_price_eur(&base_symbol, time, asset_kind_for(&base_symbol), None);
         let value_eur = base_qty * eur_price;
        
@@ -136,8 +134,8 @@ pub fn parse_trades(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tran
                 ref_currency: fee_ref_currency,
                 identifiers: AssetIdentifiers::default(),
             };
-            // Le prix et la valeur du fee doivent être basés sur l'actif du
-            // fee (ex: BNB), pas sur le base (ex: BTC).
+            
+            // On valorise le SYMBOL du fee (ex: BNB) en EUR
             let fee_price_eur = historical_price_eur(&fee_symbol, time, asset_kind_for(&fee_symbol), None);
             let fee_value_eur = fee_amount * fee_price_eur;
 
@@ -147,7 +145,7 @@ pub fn parse_trades(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tran
                 kind: TransactionKind::Fee,
                 asset: fee_asset,
                 quantity: fee_amount,
-                price: Some(eur_price),
+                price: Some(fee_price_eur), // CORRIGÉ : c'est le prix du fee, pas du base
                 amount: None,
                 quote_currency: None,
                 time,
@@ -163,8 +161,7 @@ pub fn parse_trades(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tran
 }
 
 /// Parse un export Binance 'Convert History'. Chaque ligne réussie devient
-/// deux transactions (Sell de l'actif cédé, Buy de l'actif reçu) -- les
-/// conversions échouées/annulées (Status != 'Successful') sont ignorées.
+/// deux transactions (Sell de l'actif cédé, Buy de l'actif reçu)
 pub fn parse_converts(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
     let mut out = Vec::new();
@@ -184,7 +181,6 @@ pub fn parse_converts(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tr
             &[get("Time")?, get("Wallet")?, get("Pair")?, get("Sell")?, get("Buy")?, get("Price")?],
         );
 
-        // SAUTE SI DÉJÀ CONNU
         if known_ids.contains(&format!("{convert_id}-sell")) && known_ids.contains(&format!("{convert_id}-buy")) {
             continue;
         }
@@ -208,12 +204,14 @@ pub fn parse_converts(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tr
             identifiers: AssetIdentifiers::default(),
         };
 
+        // --- CALCUL EN EUR ---
+        // On valorise l'actif vendu et l'actif acheté indépendamment en EUR
         let sell_price_eur = historical_price_eur(&sell_symbol, time, asset_kind_for(&sell_symbol), None);
-        let buy_price_eur = historical_price_eur(&buy_symbol, time, asset_kind_for(&buy_symbol), None);
-        let buy_value_eur = buy_qty * buy_price_eur;
         let sell_value_eur = sell_qty * sell_price_eur;
 
-       
+        let buy_price_eur = historical_price_eur(&buy_symbol, time, asset_kind_for(&buy_symbol), None);
+        let buy_value_eur = buy_qty * buy_price_eur;
+
         out.push(Transaction {
             platform: Platform::Binance,
             account_label: get("Wallet")?.to_string(),

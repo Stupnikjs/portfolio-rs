@@ -18,7 +18,7 @@ use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind,  Transaction, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
-use portfolio_rs::market::prices::{init_price_cache, save_price_cache};
+use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -126,7 +126,7 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
     let cache_path = PathBuf::from("./data/price_cache.bin");
-    init_price_cache(&cache_path);
+    init_price_caches(&cache_path);
 
     // Le wallet repart de zéro à chaque exécution
     let mut tx_store = TxStore::new();
@@ -273,7 +273,7 @@ fn main() -> Result<()> {
     println!("Dashboard écrit : {dashboard_path:?}");
 
     // Sauvegarde atomique et définitive du cache de prix
-    save_price_cache(&cache_path);
+    save_price_caches(&cache_path);
     println!("Cache des prix 1h sauvegardé : {cache_path:?}");
 
     Ok(())

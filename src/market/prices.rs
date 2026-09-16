@@ -3,7 +3,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
-use std::thread;
 use std::time::Duration;
 use std::path::Path;
 
@@ -26,48 +25,135 @@ pub enum PriceError {
     Http(#[from] reqwest::Error),
 }
 
-// --- CACHE PERSISTANT 1H (BINAIRE) ---
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    Hour,
+    Day,
+    Week,
+}
+
+impl Resolution {
+    fn seconds(self) -> i64 {
+        match self {
+            Resolution::Hour => 3_600,
+            Resolution::Day => 86_400,
+            Resolution::Week => 604_800,
+        }
+    }
+
+    pub fn align(self, ts: i64) -> i64 {
+        ts - ts.rem_euclid(self.seconds())
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Resolution::Hour => "1h",
+            Resolution::Day => "1d",
+            Resolution::Week => "1w",
+        }
+    }
+}
+
+// --- Cache brut : identique quelle que soit la résolution ---
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PriceCache {
-    pub data: HashMap<String, BTreeMap<i64, f64>>,
+struct PriceCache {
+    data: HashMap<String, BTreeMap<i64, f64>>,
 }
 
 impl PriceCache {
-    pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| bincode::deserialize(&bytes).ok())
+    fn load(path: &Path) -> Self {
+        std::fs::read(path).ok()
+            .and_then(|b| bincode::deserialize(&b).ok())
             .unwrap_or_default()
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(p) = path.parent() { std::fs::create_dir_all(p)?; }
-        let bytes = bincode::serialize(self).expect("bincode serialize");
-        std::fs::write(path, bytes)
+        std::fs::write(path, bincode::serialize(self).expect("bincode serialize"))
     }
 
-    pub fn get_closest(&self, symbol: &str, target_ts: i64) -> Option<f64> {
-        let map = self.data.get(&symbol.to_uppercase())?;
-        map.range(..=target_ts).next_back().map(|(_, &v)| v)
+    fn get_closest(&self, symbol: &str, target_ts: i64) -> Option<f64> {
+        self.data.get(&symbol.to_uppercase())?.range(..=target_ts).next_back().map(|(_, &v)| v)
     }
 
-    pub fn insert(&mut self, symbol: &str, ts: i64, price: f64) {
+    fn latest_ts(&self, symbol: &str) -> Option<i64> {
+        self.data.get(&symbol.to_uppercase())?.keys().next_back().copied()
+    }
+
+    fn range_since(&self, symbol: &str, since_ts: i64) -> Vec<(i64, f64)> {
+        self.data.get(&symbol.to_uppercase())
+            .map(|m| m.range(since_ts..).map(|(&k, &v)| (k, v)).collect())
+            .unwrap_or_default()
+    }
+
+    fn insert(&mut self, symbol: &str, ts: i64, price: f64) {
         self.data.entry(symbol.to_uppercase()).or_default().insert(ts, price);
     }
 }
 
-static PRICE_CACHE: Lazy<Mutex<PriceCache>> = Lazy::new(|| Mutex::new(PriceCache::default()));
-
-pub fn init_price_cache(path: &Path) {
-    let cache = PriceCache::load(path);
-    *PRICE_CACHE.lock().unwrap() = cache;
+// --- Une instance par résolution : aligne les timestamps automatiquement ---
+pub struct ResolutionCache {
+    resolution: Resolution,
+    cache: Mutex<PriceCache>,
 }
 
-
-pub fn save_price_cache(path: &Path) {
-    if let Err(e) = PRICE_CACHE.lock().unwrap().save(path) {
-        eprintln!("Erreur sauvegarde price_cache.bin: {e}");
+impl ResolutionCache {
+    fn empty(resolution: Resolution) -> Self {
+        Self { resolution, cache: Mutex::new(PriceCache::default()) }
     }
+
+    pub fn init(&self, path: &Path) {
+        *self.cache.lock().unwrap() = PriceCache::load(path);
+    }
+
+    pub fn save(&self, path: &Path) {
+        if let Err(e) = self.cache.lock().unwrap().save(path) {
+            eprintln!("Erreur sauvegarde cache {}: {e}", self.resolution.label());
+        }
+    }
+
+    pub fn get_closest(&self, symbol: &str, ts: i64) -> Option<f64> {
+        self.cache.lock().unwrap().get_closest(symbol, self.resolution.align(ts))
+    }
+
+    /// Dernier point connu en cache (pour ne fetcher que le manquant).
+    pub fn latest(&self, symbol: &str) -> Option<i64> {
+        self.cache.lock().unwrap().latest_ts(symbol)
+    }
+
+    /// Points connus depuis `days` jours, sous forme de dates (utile pour
+    /// le cache 1d : reconstruit une série jour -> prix depuis le cache).
+    pub fn range_days(&self, symbol: &str, days: i64) -> Vec<(chrono::NaiveDate, f64)> {
+        let cutoff = self.resolution.align((Utc::now() - chrono::Duration::days(days)).timestamp());
+        self.cache.lock().unwrap()
+            .range_since(symbol, cutoff)
+            .into_iter()
+            .map(|(ts, price)| (Utc.timestamp_opt(ts, 0).unwrap().date_naive(), price))
+            .collect()
+    }
+
+    pub fn insert(&self, symbol: &str, ts: i64, price: f64) {
+        self.cache.lock().unwrap().insert(symbol, self.resolution.align(ts), price);
+    }
+
+    /// Insertion par date (jour), pour le cache 1d.
+    pub fn insert_date(&self, symbol: &str, date: chrono::NaiveDate, price: f64) {
+        let ts = Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()).timestamp();
+        self.insert(symbol, ts, price);
+    }
+}
+
+static PRICE_CACHE_1H: Lazy<ResolutionCache> = Lazy::new(|| ResolutionCache::empty(Resolution::Hour));
+static PRICE_CACHE_1D: Lazy<ResolutionCache> = Lazy::new(|| ResolutionCache::empty(Resolution::Day));
+
+pub fn init_price_caches(dir: &Path) {
+    PRICE_CACHE_1H.init(&dir.join("price_cache_1h.bin"));
+    PRICE_CACHE_1D.init(&dir.join("price_cache_1d.bin"));
+}
+
+pub fn save_price_caches(dir: &Path) {
+    PRICE_CACHE_1H.save(&dir.join("price_cache_1h.bin"));
+    PRICE_CACHE_1D.save(&dir.join("price_cache_1d.bin"));
 }
 
 fn client() -> &'static reqwest::blocking::Client {
@@ -81,8 +167,7 @@ fn client() -> &'static reqwest::blocking::Client {
     &CLIENT
 }
 
-// --- caches best-effort en mémoire pour les tx ponctuelles (FX, etc) ---
-static BINANCE_KLINES_CACHE: Lazy<Mutex<HashMap<(String, String), Vec<Value>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+// --- cache best-effort en mémoire pour les lookups ponctuels (import XTB) ---
 static YAHOO_PRICE_CACHE: Lazy<Mutex<HashMap<(String, String), (f64, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 const FX_TICKERS: &[(&str, &str)] = &[
@@ -90,83 +175,79 @@ const FX_TICKERS: &[(&str, &str)] = &[
     ("GBP", "EURGBP=X"),
 ];
 
-/// Taux de change EUR -> `currency` (ex: EURUSD -> combien de USD pour 1 EUR),
-/// aligné à l'heure comme les autres prix, avec le même cache persistant.
-fn eur_fx_rate_1h(currency: &str, aligned_ts: i64) -> f64 {
-    if currency == "EUR" {
-        return 1.0;
+const CRYPTO_QUOTES: &[&str] = &["USDC", "EUR", "USDT"];
+
+fn fetch_binance_pair_close(pair: &str, start_ms: i64) -> Result<Option<f64>, PriceError> {
+    let resp = client()
+        .get(BINANCE_API)
+        .query(&[
+            ("symbol", pair),
+            ("interval", "1h"),
+            ("startTime", &start_ms.to_string()),
+            ("limit", "1"),
+        ])
+        .send()?;
+
+    match resp.status().as_u16() {
+        200..=299 => {
+            let data: Vec<Value> = resp.json()?;
+            Ok(data.first()
+                .and_then(|k| k.get(4))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok()))
+        }
+        400 => {
+            eprintln!("  [DEBUG binance] {pair}: paire inexistante (400)");
+            Ok(None)
+        }
+        status => {
+            eprintln!("  [DEBUG binance] {pair}: HTTP {status}");
+            Ok(None)
+        }
+    }
+}
+
+/// Taux de change EUR -> `currency`, aligné à l'heure, cache 1h persistant.
+pub fn eur_fx_rate_1h(currency: &str, aligned_ts: i64) -> f64 {
+    if currency == "EUR" { return 1.0; }
+
+    if let Some(rate) = PRICE_CACHE_1H.get_closest(currency, aligned_ts) {
+        return rate;
     }
 
-    // 1. Cache
-    {
-        let cache = PRICE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rate) = cache.get_closest(currency, aligned_ts) {
+    let Some((_, ticker)) = FX_TICKERS.iter().find(|(c, _)| *c == currency) else {
+        return fallback_fx_rate(currency);
+    };
+
+    if let Ok((rate, _)) = fetch_yahoo_fx_1h(ticker, aligned_ts) {
+        if rate > 0.0 {
+            PRICE_CACHE_1H.insert(currency, aligned_ts, rate);
             return rate;
         }
     }
 
-    // 2. Fetch Yahoo
-    let Some((_, ticker)) = FX_TICKERS.iter().find(|(c, _)| *c == currency) else {
-        eprintln!("  [WARN fx] devise non gérée: {currency}");
-        return fallback_fx_rate(currency);
-    };
-
-    match fetch_yahoo_fx_1h(ticker, aligned_ts) {
-        Ok((rate, _)) if rate > 0.0 => {
-            PRICE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(currency, aligned_ts, rate);
-            rate
-        }
-        Ok(_) | Err(_) => {
-            eprintln!("  [WARN fx] échec récupération {currency} au ts={aligned_ts}, fallback statique utilisé");
-            fallback_fx_rate(currency)
+    let day_str = Utc.timestamp_opt(aligned_ts, 0).unwrap().format("%Y-%m-%d").to_string();
+    if let Ok((rate, _)) = yahoo_historical_price(ticker, &day_str) {
+        if rate > 0.0 {
+            PRICE_CACHE_1H.insert(currency, aligned_ts, rate);
+            return rate;
         }
     }
+
+    eprintln!("  [WARN fx] échec {currency} ts={aligned_ts}, fallback statique");
+    fallback_fx_rate(currency)
 }
 
-/// Dernier filet de sécurité si Yahoo est injoignable -- vaut mieux une
-/// valeur approximative loggée qu'un échec total du run.
+/// Dernier filet de sécurité si Yahoo est injoignable.
 fn fallback_fx_rate(currency: &str) -> f64 {
     match currency {
-        "USD" => 1.08, // ~1 EUR en USD
-        "GBP" => 0.87, // ~1 EUR en GBP
+        "USD" => 1.08,
+        "GBP" => 0.87,
         _ => 1.0,
     }
 }
 
-
-
-fn binance_klines(symbol_pair: &str, day_str: &str) -> Result<Vec<Value>, PriceError> {
-    let key = (symbol_pair.to_string(), day_str.to_string());
-    if let Some(cached) = BINANCE_KLINES_CACHE.lock().unwrap().get(&key) {
-        return Ok(cached.clone());
-    }
-
-    thread::sleep(Duration::from_millis(100));
-
-    let dt = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d")
-        .map_err(|e| PriceError::Message(e.to_string()))?
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
-    let start_ms = Utc.from_utc_datetime(&dt).timestamp_millis();
-
-    let resp = client()
-        .get(BINANCE_API)
-        .query(&[
-            ("symbol", symbol_pair),
-            ("interval", "1d"),
-            ("startTime", &start_ms.to_string()),
-            ("limit", "1"),
-        ])
-        .send()?
-        .error_for_status()?;
-
-    let data: Vec<Value> = resp.json()?;
-    BINANCE_KLINES_CACHE.lock().unwrap().insert(key, data.clone());
-    Ok(data)
-}
-
-
-/// Récupère la dernière clôture Yahoo disponible <= day_str.
+/// Récupère la dernière clôture Yahoo disponible <= day_str (import XTB).
 pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, String), PriceError> {
     let key = (ticker.to_string(), day_str.to_string());
     if let Some(cached) = YAHOO_PRICE_CACHE.lock().unwrap().get(&key) {
@@ -236,39 +317,17 @@ pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, Strin
     Ok((price, currency))
 }
 
-fn get_price_from_binance(symbol: &str, time: DateTime<Utc>) -> Result<f64, PriceError> {
-    let day_str = time.format("%Y-%m-%d").to_string();
-
-    match binance_klines(&format!("{symbol}EUR"), &day_str) {
-        Ok(data) if !data.is_empty() => {
-            if let Some(close) = data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
-                return Ok(close);
-            }
-        }
-        Err(PriceError::Http(e)) if e.status().map(|s| s.as_u16()) != Some(400) => {
-            return Err(PriceError::Message(format!("API Binance KO pour {symbol}EUR")));
-        }
-        _ => {}
-    }
-
-    let usdt_data = binance_klines(&format!("{symbol}USDT"), &day_str);
-    let eurusdt_data = binance_klines("EURUSDT", &day_str);
-    if let (Ok(usdt_data), Ok(eurusdt_data)) = (usdt_data, eurusdt_data) {
-        if !usdt_data.is_empty() && !eurusdt_data.is_empty() {
-            let price_usdt: Option<f64> = usdt_data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
-            let eurusdt_rate: Option<f64> = eurusdt_data[0].get(4).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
-            if let (Some(price_usdt), Some(eurusdt_rate)) = (price_usdt, eurusdt_rate) {
-                if eurusdt_rate > 0.0 {
-                    return Ok(price_usdt / eurusdt_rate);
-                }
-            }
-        }
-    }
-
-    Err(PriceError::Message(format!("Binance n'a pas trouvé le prix pour {symbol} au {day_str}")))
-}
-
 pub fn yahoo_daily_closes(ticker: &str, days: i64) -> Result<Vec<(chrono::NaiveDate, f64)>, PriceError> {
+    let cache_key = format!("YHO:{ticker}");
+    let yesterday = Utc::now().date_naive() - chrono::Duration::days(1);
+    let yesterday_ts = Resolution::Day.align(Utc.from_utc_datetime(&yesterday.and_hms_opt(0, 0, 0).unwrap()).timestamp());
+
+    if let Some(latest) = PRICE_CACHE_1D.latest(&cache_key) {
+        if latest >= yesterday_ts {
+            return Ok(PRICE_CACHE_1D.range_days(&cache_key, days));
+        }
+    }
+
     let end = Utc::now();
     let start = end - chrono::Duration::days(days + 5);
     let period1 = start.timestamp();
@@ -317,7 +376,6 @@ pub fn yahoo_daily_closes(ticker: &str, days: i64) -> Result<Vec<(chrono::NaiveD
         .map(|arr| arr.iter().map(|v| v.as_f64()).collect())
         .unwrap_or_default();
 
-    let mut out = Vec::new();
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         let Some(mut close) = *close else { continue };
         let dt = Utc.timestamp_opt(*ts, 0).single().ok_or_else(|| PriceError::Message("timestamp invalide".into()))?;
@@ -328,10 +386,10 @@ pub fn yahoo_daily_closes(ticker: &str, days: i64) -> Result<Vec<(chrono::NaiveD
             let Some(fx_rate) = fx_series.get(&day) else { continue };
             close /= fx_rate;
         }
-        out.push((day, close));
+        PRICE_CACHE_1D.insert_date(&cache_key, day, close);
     }
 
-    Ok(out)
+    Ok(PRICE_CACHE_1D.range_days(&cache_key, days))
 }
 
 fn yahoo_daily_closes_raw(ticker: &str) -> Result<Vec<(chrono::NaiveDate, f64)>, PriceError> {
@@ -379,6 +437,16 @@ fn yahoo_daily_closes_raw(ticker: &str) -> Result<Vec<(chrono::NaiveDate, f64)>,
 }
 
 pub fn binance_daily_closes(symbol: &str, days: i64) -> Result<Vec<(chrono::NaiveDate, f64)>, PriceError> {
+    let cache_key = format!("BIN:{symbol}");
+    let yesterday = Utc::now().date_naive() - chrono::Duration::days(1);
+    let yesterday_ts = Resolution::Day.align(Utc.from_utc_datetime(&yesterday.and_hms_opt(0, 0, 0).unwrap()).timestamp());
+
+    if let Some(latest) = PRICE_CACHE_1D.latest(&cache_key) {
+        if latest >= yesterday_ts {
+            return Ok(PRICE_CACHE_1D.range_days(&cache_key, days));
+        }
+    }
+
     let end_ms = Utc::now().timestamp_millis();
     let start_ms = (Utc::now() - chrono::Duration::days(days + 2)).timestamp_millis();
 
@@ -395,14 +463,14 @@ pub fn binance_daily_closes(symbol: &str, days: i64) -> Result<Vec<(chrono::Naiv
         .error_for_status()?;
 
     let data: Vec<Value> = resp.json()?;
-    let mut out = Vec::new();
-    for kline in data {
+    for kline in &data {
         let Some(open_time_ms) = kline.get(0).and_then(|v| v.as_i64()) else { continue };
         let Some(close) = kline.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) else { continue };
         let dt = Utc.timestamp_millis_opt(open_time_ms).single().ok_or_else(|| PriceError::Message("timestamp invalide".into()))?;
-        out.push((dt.date_naive(), close));
+        PRICE_CACHE_1D.insert_date(&cache_key, dt.date_naive(), close);
     }
-    Ok(out)
+
+    Ok(PRICE_CACHE_1D.range_days(&cache_key, days))
 }
 
 pub fn normalize_currency_for_fx(currency: &str) -> (String, f64) {
@@ -413,10 +481,9 @@ pub fn normalize_currency_for_fx(currency: &str) -> (String, f64) {
     }
 }
 
-// --- NOUVELLE FONCTION HISTORICAL_PRICE_EUR AVEC CACHE 1H ---
 pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, ticker: Option<&str>) -> f64 {
-      let symbol = symbol.to_uppercase();
-    let aligned_ts = time.timestamp() - (time.timestamp() % 3600);
+    let symbol = symbol.to_uppercase();
+    let aligned_ts = Resolution::Hour.align(time.timestamp());
 
     if kind == AssetKind::Cash {
         return match symbol.as_str() {
@@ -427,45 +494,44 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
         };
     }
 
-    // Aligne sur l'heure pile (1h)
-    let aligned_ts = time.timestamp() - (time.timestamp() % 3600);
-
-    // 1. Vérifier le cache
-    {
-        let cache = PRICE_CACHE.lock().unwrap();
-        if let Some(price) = cache.get_closest(&symbol, aligned_ts) {
-            return price;
-        }
+    if let Some(price) = PRICE_CACHE_1H.get_closest(&symbol, aligned_ts) {
+        return price;
     }
 
-    // 2. Si absent, fetch et insertion
     let price = match kind {
         AssetKind::Stock => {
-    let Some(ticker) = ticker else { return 0.0; };
-        match fetch_yahoo_fx_1h(ticker, aligned_ts) {
-            Ok((raw_price, currency)) => {
+            let Some(ticker) = ticker else { return 0.0; };
+
+            if let Ok((raw_price, currency)) = fetch_yahoo_fx_1h(ticker, aligned_ts) {
                 let (fx_currency, price_factor) = normalize_currency_for_fx(&currency);
                 let price = raw_price * price_factor;
-                if fx_currency != "EUR" {
+                let eur_price = if fx_currency != "EUR" {
                     price / eur_fx_rate_1h(&fx_currency, aligned_ts)
-                } else {
-                    price
-                }
+                } else { price };
+                if eur_price > 0.0 { return eur_price; }
             }
-            Err(_) => 0.0,
-        }
+
+            let day_str = Utc.timestamp_opt(aligned_ts, 0).unwrap().format("%Y-%m-%d").to_string();
+            if let Ok((raw_price, currency)) = yahoo_historical_price(ticker, &day_str) {
+                let (fx_currency, price_factor) = normalize_currency_for_fx(&currency);
+                let price = raw_price * price_factor;
+                return if fx_currency != "EUR" {
+                    price / eur_fx_rate_1h(&fx_currency, aligned_ts)
+                } else { price };
+            }
+            0.0
         }
         AssetKind::Crypto => {
             match fetch_binance_1h(&symbol, aligned_ts) {
                 Ok(p) => p,
-                Err(_) => 0.0
+                Err(e) => { eprintln!("  [DEBUG binance] {symbol}: {e}"); 0.0 }
             }
         }
-        _ => 0.0
+        _ => 0.0,
     };
 
     if price > 0.0 {
-        PRICE_CACHE.lock().unwrap().insert(&symbol, aligned_ts, price);
+        PRICE_CACHE_1H.insert(&symbol, aligned_ts, price);
     }
 
     price
@@ -473,55 +539,33 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
 
 fn fetch_binance_1h(symbol: &str, aligned_ts: i64) -> Result<f64, PriceError> {
     let start_ms = aligned_ts * 1000;
-    let resp = client()
-        .get(BINANCE_API)
-        .query(&[
-            ("symbol", format!("{symbol}EUR")),
-            ("interval", "1h".to_string()),
-            ("startTime", start_ms.to_string()),
-            ("limit", "1".to_string()),
-        ])
-        .send()?
-        .error_for_status()?;
 
-    let data: Vec<Value> = resp.json()?;
-    if let Some(kline) = data.first() {
-        if let Some(close) = kline.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
-            return Ok(close);
-        }
-    }
+    // 1. Récupérer le prix de la crypto en USDC
+    let quote = "USDC";
+    let pair = format!("{symbol}{quote}");
     
-    // Fallback USDT
-    let resp_usdt = client()
-        .get(BINANCE_API)
-        .query(&[
-            ("symbol", format!("{symbol}USDT")),
-            ("interval", "1h".to_string()),
-            ("startTime", start_ms.to_string()),
-            ("limit", "1".to_string()),
-        ])
-        .send()?;
-
-    let data_usdt: Vec<Value> = resp_usdt.json()?;
-    if let Some(kline) = data_usdt.first() {
-        if let Some(close_usdt) = kline.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
-            let resp_eur = client().get(BINANCE_API)
-                .query(&[("symbol", "EURUSDT".to_string()), ("interval", "1h".to_string()), ("startTime", start_ms.to_string()), ("limit", "1".to_string())]).send()?;
-            let data_eur: Vec<Value> = resp_eur.json()?;
-            if let Some(kline_eur) = data_eur.first() {
-                if let Some(rate_eur) = kline_eur.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
-                    if rate_eur > 0.0 { return Ok(close_usdt / rate_eur); }
-                }
+    if let Some(close) = fetch_binance_pair_close(&pair, start_ms)? {
+        // 2. Récupérer le taux de change pour convertir l'USDC en EUR (ex: EURUSDC)
+        let fx_pair = format!("EUR{quote}");
+        match fetch_binance_pair_close(&fx_pair, start_ms)? {
+            Some(rate) if rate > 0.0 => {
+                // 3. Effectuer la division pour obtenir le prix en EUR
+                return Ok(close / rate);
+            }
+            _ => {
+                eprintln!("  [DEBUG binance] {symbol}: prix {quote} trouvé mais pas de taux {fx_pair}");
             }
         }
     }
-    Err(PriceError::Message("Prix Binance 1h introuvable".into()))
+
+    Err(PriceError::Message(format!(
+        "{symbol}: aucune paire valide sur Binance (USDC avec taux EUR)",
+    )))
 }
 
-
 /// Récupère la bougie 1h exacte (ou la dernière disponible avant) pour une
-/// paire FX Yahoo (ex: "EURUSD=X"). Contrairement à fetch_yahoo_1h, pas de
-/// normalisation de devise supplémentaire : la paire EST déjà le taux.
+/// paire FX/action Yahoo (ex: "EURUSD=X", "AAPL"). Pas de normalisation de
+/// devise ici : c'est à l'appelant de gérer via normalize_currency_for_fx.
 fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<(f64, String), PriceError> {
     let target = Utc.timestamp_opt(aligned_ts, 0).unwrap();
     let period1 = (target - chrono::Duration::days(2)).timestamp();
@@ -552,13 +596,11 @@ fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<(f64, String)
         .and_then(|q| q.as_array()).and_then(|arr| arr.first()).and_then(|q0| q0.get("close"))
         .and_then(|c| c.as_array()).map(|arr| arr.iter().map(|v| v.as_f64()).collect()).unwrap_or_default();
 
-    // Bougie exacte
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         if *ts == aligned_ts {
             if let Some(c) = *close { return Ok((c, currency)); }
         }
     }
-    // Sinon, dernière bougie connue avant aligned_ts (marché fermé le week-end)
     let mut best: Option<(i64, f64)> = None;
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         if *ts <= aligned_ts {
