@@ -112,7 +112,7 @@ fn eur_fx_rate_1h(currency: &str, aligned_ts: i64) -> f64 {
     };
 
     match fetch_yahoo_fx_1h(ticker, aligned_ts) {
-        Ok(rate) if rate > 0.0 => {
+        Ok((rate, _)) if rate > 0.0 => {
             PRICE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).insert(currency, aligned_ts, rate);
             rate
         }
@@ -164,6 +164,7 @@ fn binance_klines(symbol_pair: &str, day_str: &str) -> Result<Vec<Value>, PriceE
     BINANCE_KLINES_CACHE.lock().unwrap().insert(key, data.clone());
     Ok(data)
 }
+
 
 /// Récupère la dernière clôture Yahoo disponible <= day_str.
 pub fn yahoo_historical_price(ticker: &str, day_str: &str) -> Result<(f64, String), PriceError> {
@@ -440,11 +441,19 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
     // 2. Si absent, fetch et insertion
     let price = match kind {
         AssetKind::Stock => {
-            let Some(ticker) = ticker else { return 0.0; };
-            match fetch_yahoo_fx_1h(ticker, aligned_ts) {
-                Ok(p) => p,
-                Err(_) => 0.0
+    let Some(ticker) = ticker else { return 0.0; };
+        match fetch_yahoo_fx_1h(ticker, aligned_ts) {
+            Ok((raw_price, currency)) => {
+                let (fx_currency, price_factor) = normalize_currency_for_fx(&currency);
+                let price = raw_price * price_factor;
+                if fx_currency != "EUR" {
+                    price / eur_fx_rate_1h(&fx_currency, aligned_ts)
+                } else {
+                    price
+                }
             }
+            Err(_) => 0.0,
+        }
         }
         AssetKind::Crypto => {
             match fetch_binance_1h(&symbol, aligned_ts) {
@@ -513,7 +522,7 @@ fn fetch_binance_1h(symbol: &str, aligned_ts: i64) -> Result<f64, PriceError> {
 /// Récupère la bougie 1h exacte (ou la dernière disponible avant) pour une
 /// paire FX Yahoo (ex: "EURUSD=X"). Contrairement à fetch_yahoo_1h, pas de
 /// normalisation de devise supplémentaire : la paire EST déjà le taux.
-fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<f64, PriceError> {
+fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<(f64, String), PriceError> {
     let target = Utc.timestamp_opt(aligned_ts, 0).unwrap();
     let period1 = (target - chrono::Duration::days(2)).timestamp();
     let period2 = (target + chrono::Duration::days(1)).timestamp();
@@ -535,6 +544,8 @@ fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<f64, PriceErr
         .get("chart").and_then(|c| c.get("result")).and_then(|r| r.as_array()).and_then(|arr| arr.first())
         .ok_or_else(|| PriceError::Message(format!("Yahoo KO pour {pair_ticker}")))?;
 
+    let currency = result.get("meta").and_then(|m| m.get("currency")).and_then(|c| c.as_str()).unwrap_or("USD").to_string();
+
     let timestamps: Vec<i64> = result.get("timestamp").and_then(|t| t.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect()).unwrap_or_default();
     let closes: Vec<Option<f64>> = result.get("indicators").and_then(|i| i.get("quote"))
@@ -544,10 +555,10 @@ fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<f64, PriceErr
     // Bougie exacte
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         if *ts == aligned_ts {
-            if let Some(c) = *close { return Ok(c); }
+            if let Some(c) = *close { return Ok((c, currency)); }
         }
     }
-    // Sinon, dernière bougie connue avant aligned_ts (marché FX fermé le week-end)
+    // Sinon, dernière bougie connue avant aligned_ts (marché fermé le week-end)
     let mut best: Option<(i64, f64)> = None;
     for (ts, close) in timestamps.iter().zip(closes.iter()) {
         if *ts <= aligned_ts {
@@ -558,5 +569,5 @@ fn fetch_yahoo_fx_1h(pair_ticker: &str, aligned_ts: i64) -> Result<f64, PriceErr
             }
         }
     }
-    best.map(|(_, c)| c).ok_or_else(|| PriceError::Message(format!("Pas de taux FX pour {pair_ticker}")))
+    best.map(|(_, c)| (c, currency)).ok_or_else(|| PriceError::Message(format!("Pas de taux FX pour {pair_ticker}")))
 }

@@ -35,6 +35,7 @@ fn xtb_to_yahoo_suffix() -> &'static [(&'static str, &'static str)] {
 fn manual_ticker_overrides() -> &'static [(&'static str, &'static str)] {
     &[
         ("MSTR.US", "MSTR"),
+        ("PRIM.US", "PRIM"),
         ("XFVT.DE", "XFVT.DE"), // plusieurs classes de parts homonymes -> ambigu pour la recherche Yahoo
     ]
 }
