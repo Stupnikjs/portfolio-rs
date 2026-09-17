@@ -159,3 +159,123 @@ pub fn save_price_caches(dir: &Path) {
     CACHE_1H.save(&dir.join("price_cache_1h.bin"));
     CACHE_1D.save(&dir.join("price_cache_1d.bin"));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn hours(n: i64) -> i64 {
+        n * 3_600
+    }
+
+    fn days(n: i64) -> i64 {
+        n * 86_400
+    }
+
+    // --- get_exact vs get_closest : le coeur du bug "prix figé" ---
+
+    #[test]
+    fn get_exact_only_matches_the_same_bucket() {
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        let ts0 = 0; // bucket 0
+
+        cache.insert("BTC", ts0, 100.0);
+
+        assert_eq!(cache.get_exact("BTC", ts0), Some(100.0));
+        // Une heure plus tard -> bucket différent -> get_exact ne doit RIEN
+        // renvoyer (sinon on ressert indéfiniment une vieille valeur pour
+        // un prix "maintenant", c'était le bug initial).
+        assert_eq!(cache.get_exact("BTC", ts0 + hours(1)), None);
+    }
+
+    #[test]
+    fn get_closest_reuses_the_last_known_value_across_buckets() {
+        // Documente le comportement VOULU de get_closest : correct pour une
+        // date passée immuable, mais surtout pas pour "maintenant" (voir
+        // get_exact pour ce cas).
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        let ts0 = 0;
+
+        cache.insert("BTC", ts0, 100.0);
+
+        assert_eq!(cache.get_closest("BTC", ts0 + hours(5)), Some(100.0));
+    }
+
+    #[test]
+    fn get_closest_never_returns_a_future_point() {
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        cache.insert("BTC", hours(10), 100.0);
+
+        // Rien de connu au ou avant ts=0, même si un point existe plus tard.
+        assert_eq!(cache.get_closest("BTC", 0), None);
+    }
+
+    #[test]
+    fn symbol_lookup_is_case_insensitive() {
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        cache.insert("btc", 0, 42.0);
+
+        assert_eq!(cache.get_exact("BTC", 0), Some(42.0));
+        assert_eq!(cache.get_closest("Btc", 0), Some(42.0));
+    }
+
+    #[test]
+    fn insert_aligns_timestamps_to_the_resolution_bucket() {
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        // Deux insertions dans le même bucket horaire -> la seconde écrase
+        // la première (une seule entrée par bucket).
+        cache.insert("BTC", 0, 100.0);
+        cache.insert("BTC", 1_800, 200.0); // 30 min plus tard, même bucket
+
+        assert_eq!(cache.get_exact("BTC", 0), Some(200.0));
+    }
+
+    // --- is_live_bucket ---
+
+    #[test]
+    fn is_live_bucket_detects_the_current_hour_only() {
+        let now_aligned = Resolution::Hour.align(Utc::now().timestamp());
+
+        assert!(is_live_bucket(now_aligned, Resolution::Hour));
+        assert!(!is_live_bucket(now_aligned - hours(2), Resolution::Hour));
+    }
+
+    // --- earliest / latest : nécessaires pour détecter un historique tronqué ---
+
+    #[test]
+    fn earliest_and_latest_track_the_full_inserted_range() {
+        let cache = ResolutionCache::empty(Resolution::Day);
+        cache.insert("AAPL", days(10), 1.0);
+        cache.insert("AAPL", days(20), 2.0);
+        cache.insert("AAPL", days(15), 1.5);
+
+        assert_eq!(cache.earliest("AAPL"), Some(days(10)));
+        assert_eq!(cache.latest("AAPL"), Some(days(20)));
+    }
+
+    #[test]
+    fn range_days_excludes_points_older_than_the_window() {
+        let cache = ResolutionCache::empty(Resolution::Day);
+        let today = Utc::now().date_naive();
+
+        cache.insert_date("AAPL", today - chrono::Duration::days(100), 1.0);
+        cache.insert_date("AAPL", today - chrono::Duration::days(5), 2.0);
+
+        let range = cache.range_days("AAPL", 30);
+        let dates: Vec<NaiveDate> = range.iter().map(|(d, _)| *d).collect();
+
+        assert!(!dates.contains(&(today - chrono::Duration::days(100))));
+        assert!(dates.contains(&(today - chrono::Duration::days(5))));
+    }
+
+    #[test]
+    fn unknown_symbol_returns_none_everywhere() {
+        let cache = ResolutionCache::empty(Resolution::Hour);
+
+        assert_eq!(cache.get_exact("DOES_NOT_EXIST", 0), None);
+        assert_eq!(cache.get_closest("DOES_NOT_EXIST", 0), None);
+        assert_eq!(cache.latest("DOES_NOT_EXIST"), None);
+        assert_eq!(cache.earliest("DOES_NOT_EXIST"), None);
+    }
+}
