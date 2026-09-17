@@ -323,3 +323,145 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
     }
     price
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // --- Fonctions pures : pas de réseau, testables directement ---
+
+    #[test]
+    fn normalize_currency_for_fx_converts_pence_to_pounds() {
+        let (currency, factor) = normalize_currency_for_fx("GBp");
+        assert_eq!(currency, "GBP");
+        assert_eq!(factor, 0.01);
+
+        let (currency, factor) = normalize_currency_for_fx("GBX");
+        assert_eq!(currency, "GBP");
+        assert_eq!(factor, 0.01);
+    }
+
+    #[test]
+    fn normalize_currency_for_fx_leaves_other_currencies_untouched() {
+        let (currency, factor) = normalize_currency_for_fx("EUR");
+        assert_eq!(currency, "EUR");
+        assert_eq!(factor, 1.0);
+
+        let (currency, factor) = normalize_currency_for_fx("USD");
+        assert_eq!(currency, "USD");
+        assert_eq!(factor, 1.0);
+    }
+
+    #[test]
+    fn closest_at_or_before_picks_the_latest_point_not_after_ts() {
+        let points = vec![(10, 1.0), (20, 2.0), (30, 3.0)];
+
+        assert_eq!(closest_at_or_before(&points, 25), Some(2.0));
+        assert_eq!(closest_at_or_before(&points, 30), Some(3.0));
+    }
+
+    #[test]
+    fn closest_at_or_before_returns_none_if_everything_is_in_the_future() {
+        let points = vec![(10, 1.0), (20, 2.0)];
+        assert_eq!(closest_at_or_before(&points, 5), None);
+    }
+
+    // --- daily_closes_cached : orchestration du cache, fetch injecté donc
+    // testable sans réseau. C'est ici que vivait le bug de troncature
+    // silencieuse (cache "frais" mais pas assez "profond").
+
+    fn fake_points(days_back: i64, count: i64) -> Vec<(i64, f64)> {
+        let today = Utc::now().date_naive();
+        (0..count)
+            .map(|i| {
+                let day = today - chrono::Duration::days(days_back - i);
+                let ts = Utc.from_utc_datetime(&day.and_hms_opt(0, 0, 0).unwrap()).timestamp();
+                (ts, 100.0)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn daily_closes_cached_fetches_once_on_a_cold_cache() {
+        let key = "TEST:cold_cache";
+        let calls = AtomicUsize::new(0);
+
+        let result = daily_closes_cached(key, 10, |_start_ts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fake_points(15, 16)) // 15 jours en arrière jusqu'à aujourd'hui
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn daily_closes_cached_does_not_refetch_when_fresh_and_deep_enough() {
+        let key = "TEST:no_refetch_needed";
+        let calls = AtomicUsize::new(0);
+
+        // Premier appel : cache vide -> fetch, on peuple 40 jours d'historique.
+        let _ = daily_closes_cached(key, 30, |_start_ts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fake_points(39, 40))
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Deuxième appel, même profondeur (30j) demandée : le cache est
+        // déjà frais ET assez profond -> aucun nouveau fetch.
+        let _ = daily_closes_cached(key, 30, |_start_ts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn daily_closes_cached_refetches_when_a_deeper_history_is_requested() {
+        // Ce test verrouille explicitement le bug corrigé : avant le
+        // refactor, un cache "frais" (dernier point récent) était considéré
+        // valide même s'il ne couvrait pas la fenêtre demandée, et
+        // renvoyait silencieusement un historique tronqué.
+        let key = "TEST:refetch_on_deeper_request";
+        let calls = AtomicUsize::new(0);
+
+        // Cache initial peu profond (15 jours).
+        let _ = daily_closes_cached(key, 10, |_start_ts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(fake_points(14, 15))
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // On redemande un historique bien plus long (365j) : le cache est
+        // frais mais pas assez profond -> doit redéclencher un fetch.
+        let _ = daily_closes_cached(key, 365, |_start_ts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn daily_closes_cached_refetches_when_the_cache_is_stale() {
+        let key = "TEST:refetch_on_stale_cache";
+        let calls = AtomicUsize::new(0);
+
+        // Cache initial dont le dernier point est vieux de 5 jours (pas
+        // "hier ou plus récent" -> pas frais).
+        let old_day = Utc::now().date_naive() - chrono::Duration::days(5);
+        let ts = Utc.from_utc_datetime(&old_day.and_hms_opt(0, 0, 0).unwrap()).timestamp();
+        let _ = daily_closes_cached(key, 10, |_start_ts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![(ts, 100.0)])
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let _ = daily_closes_cached(key, 10, |_start_ts| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
