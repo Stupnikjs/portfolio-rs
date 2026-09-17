@@ -146,6 +146,78 @@ def render_positions_table(df: pd.DataFrame) -> None:
 
 ################################################################################
 # Dossier : dashboard
+# Fichier : clustering.py
+# Chemin relatif : clustering.py
+################################################################################
+
+"""Regroupement automatique des actifs par similarité de comportement
+(corrélation), sans classification a priori -- deux actifs très corrélés
+finissent dans le même groupe peu importe leur type (Action/Crypto/...)."""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
+from scipy.spatial.distance import squareform
+
+import plotly.graph_objects as go
+
+from theme import PASTEL_DARK_SEQUENCE
+
+
+def distance_matrix(corr_matrix: pd.DataFrame) -> np.ndarray:
+    """d = sqrt(2 * (1 - corr)) -- vraie métrique, contrairement à 1 - corr
+    qui ne respecte pas l'inégalité triangulaire."""
+    corr = corr_matrix.clip(-1, 1)
+    dist = np.sqrt(2 * (1 - corr.values))
+    np.fill_diagonal(dist, 0.0)
+    return (dist + dist.T) / 2  # symétrise (absorbe les arrondis flottants)
+
+
+def compute_linkage(corr_matrix: pd.DataFrame, method: str = "average") -> np.ndarray:
+    """Linkage hiérarchique scipy à partir de la matrice de corrélation."""
+    condensed = squareform(distance_matrix(corr_matrix), checks=False)
+    return linkage(condensed, method=method)
+
+
+def assign_clusters(corr_matrix: pd.DataFrame, linkage_matrix: np.ndarray, n_clusters: int) -> pd.Series:
+    """Coupe le dendrogramme pour obtenir exactement `n_clusters` groupes."""
+    labels = fcluster(linkage_matrix, t=n_clusters, criterion="maxclust")
+    return pd.Series(labels, index=corr_matrix.columns, name="cluster")
+
+
+def cluster_table(cluster_labels: pd.Series) -> pd.DataFrame:
+    """Une ligne par groupe, avec la liste des actifs qu'il contient."""
+    grouped = cluster_labels.groupby(cluster_labels).apply(lambda s: ", ".join(sorted(s.index)))
+    return pd.DataFrame({"Groupe": grouped.index, "Actifs": grouped.values})
+
+
+def render_dendrogram(corr_matrix: pd.DataFrame, linkage_matrix: np.ndarray) -> go.Figure:
+    """Dendrogramme interactif -- scipy calcule la géométrie, plotly l'affiche."""
+    dendro = dendrogram(linkage_matrix, labels=corr_matrix.columns.tolist(), no_plot=True)
+    icoord = np.array(dendro["icoord"])
+    dcoord = np.array(dendro["dcoord"])
+    ordered_labels = dendro["ivl"]
+
+    fig = go.Figure()
+    for xs, ys in zip(icoord, dcoord):
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines",
+            line=dict(color=PASTEL_DARK_SEQUENCE[0], width=1.5),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    tickvals = [5 + 10 * i for i in range(len(ordered_labels))]
+    fig.update_layout(
+        xaxis=dict(tickmode="array", tickvals=tickvals, ticktext=ordered_labels, tickangle=45),
+        yaxis_title="Distance (0 = comportement identique)",
+        height=450,
+        margin=dict(t=20, b=90, l=40, r=20),
+    )
+    return fig
+
+################################################################################
+# Dossier : dashboard
 # Fichier : config.py
 # Chemin relatif : config.py
 ################################################################################
@@ -200,7 +272,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
-
+from clustering import assign_clusters, cluster_table, compute_linkage, render_dendrogram
 from config import BENCHMARK_LABELS, BENCHMARK_TICKERS, DEFAULT_WINDOW_ORDER, WINDOW_TO_YF_PERIOD
 from data import yfinance_ticker_for
 
@@ -307,6 +379,35 @@ def _render_full_matrix(corr_matrix: pd.DataFrame, source_note: str | None, sele
     - 🔵 **Bleu (proche de -1)** : Corrélation négative (vrais couvre-risques).
     """)
 
+def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
+    st.subheader(f"🧩 Groupes automatiques ({selected_window})")
+
+    if not (correlation_matrices and selected_window in correlation_matrices):
+        st.info("Données insuffisantes pour calculer les groupes.")
+        return
+
+    full_corr = pd.DataFrame(correlation_matrices[selected_window])
+    kept = [s for s in full_corr.columns if s in eligible_symbols]
+    corr_matrix = full_corr.loc[kept, kept] if len(kept) >= 3 else pd.DataFrame()
+
+    if corr_matrix.empty:
+        st.info("Au moins 3 actifs sont nécessaires pour former des groupes.")
+        return
+
+    max_clusters = len(corr_matrix.columns) - 1
+    n_clusters = st.slider("Nombre de groupes", min_value=2, max_value=max_clusters, value=min(4, max_clusters))
+
+    linkage_matrix = compute_linkage(corr_matrix)
+    cluster_labels = assign_clusters(corr_matrix, linkage_matrix, n_clusters)
+
+    st.plotly_chart(render_dendrogram(corr_matrix, linkage_matrix), use_container_width=True)
+    st.caption(
+        "Plus deux actifs fusionnent bas dans l'arbre, plus leur comportement "
+        "historique est proche -- indépendamment de leur type (Action/Crypto/...)."
+    )
+
+    st.dataframe(cluster_table(cluster_labels), use_container_width=True, hide_index=True)
+
 
 def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
     st.subheader(f"🔗 Corrélations par actif ({selected_window})")
@@ -384,6 +485,9 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
 
     st.divider()
     _render_per_asset(correlation_matrices, selected_window, eligible_symbols)
+
+    st.divider()
+    _render_clusters(correlation_matrices, selected_window, eligible_symbols)
 
 
 ################################################################################
@@ -504,12 +608,14 @@ if salaire != cash_data["salaire_net_mensuel"]:
 st.divider()
 
 # --- Dépenses fixes ---
+# --- Dépenses fixes ---
 st.subheader("Dépenses mensuelles fixes")
 df_fixes = (
     pd.DataFrame(cash_data["depenses_fixes"])
     if cash_data["depenses_fixes"]
-    else pd.DataFrame(columns=["nom", "montant"])
+    else pd.DataFrame({"nom": pd.Series(dtype="object"), "montant": pd.Series(dtype="float64")})
 )
+df_fixes["montant"] = pd.to_numeric(df_fixes["montant"], errors="coerce")
 
 edited_fixes = st.data_editor(
     df_fixes,
