@@ -508,8 +508,8 @@ pub mod history;
 //! Ré-exécutable sans risque : le tx_store est recréé from scratch à chaque run.
 //! Le cache des prix (price_cache.bin) persiste et bloque les appels API inutiles.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+
+use std::path::{PathBuf};
 
 use anyhow::Result;
 
@@ -520,33 +520,12 @@ use portfolio_rs::market::correlation::compute_correlation_matrices;
 use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
-use portfolio_rs::schema::{AssetKind,  Transaction, TransactionKind};
+use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
 use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
-#[derive(serde::Serialize)]
-struct DashboardAsset {
-    symbol: String,
-    kind: String,
-    ticker: Option<String>,
-    quantity: f64,
-    price_eur: f64,
-    value_eur: f64,
-    cost_basis_eur: f64,
-    pnl_eur: f64,
-    pnl_pct: f64,
-}
-
-#[derive(serde::Serialize)]
-struct DashboardData {
-    total_value_eur: f64,
-    total_cost_basis_eur: f64,
-    total_pnl_eur: f64,
-    assets: Vec<DashboardAsset>,
-    correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, f64>>>,
-}
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -556,76 +535,7 @@ fn accounts_path() -> PathBuf {
     data_dir().join("accounts")
 }
 
-fn parse_binance_sources() -> Vec<Transaction> {
-    let mut out = Vec::new();
-    let trades_path = accounts_path().join("trades.csv");
-    let converts_path = accounts_path().join("convert.csv");
 
-    if trades_path.exists() {
-        println!("Lecture Binance Trades : {trades_path:?}");
-        let empty_ids = HashSet::new();
-        match binance::parse_trades(&trades_path, &empty_ids) {
-            Ok(mut tx) => out.append(&mut tx),
-            Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
-        }
-    } else {
-        println!("[Omis] Fichier introuvable : {trades_path:?}");
-    }
-
-    if converts_path.exists() {
-        println!("Lecture Binance Converts : {converts_path:?}");
-        let empty_ids = HashSet::new();
-        match binance::parse_converts(&converts_path, &empty_ids) {
-            Ok(mut tx) => out.append(&mut tx),
-            Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
-        }
-    } else {
-        println!("[Omis] Fichier introuvable : {converts_path:?}");
-    }
-
-    out
-}
-
-fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
-    let mut out = Vec::new();
-    if !path.exists() {
-        println!("[Omis] Fichier introuvable : {path:?}");
-        return out;
-    }
-
-    println!("Lecture XTB : {path:?}");
-    let empty_ids = HashSet::new();
-
-    match xtb::find_sheet_by_prefix(path, "Closed Position") {
-        Ok(sheet) => match xtb::parse_closed_positions(path, &sheet, &empty_ids) {
-            Ok(positions) => {
-                for pos in positions {
-                    out.extend(pos.to_transactions());
-                }
-            }
-            Err(e) => println!("  [Erreur XTB Closed] {e}"),
-        },
-        Err(e) => println!("  [Erreur XTB Closed] {e}"),
-    }
-
-    match xtb::find_sheet_by_prefix(path, "Open Position") {
-        Ok(sheet) => match xtb::parse_open_positions(path, &sheet, &empty_ids) {
-            Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
-            Err(e) => println!("  [Erreur XTB Open] {e}"),
-        },
-        Err(e) => println!("  [Erreur XTB Open] {e}"),
-    }
-
-    match xtb::find_sheet_by_prefix(path, "Cash") {
-        Ok(sheet) => match xtb::parse_cash_operations(path, &sheet) {
-            Ok(mut tx) => out.append(&mut tx),
-            Err(e) => println!("  [Erreur XTB Cash] {e}"),
-        },
-        Err(e) => println!("  [Erreur XTB Cash] {e}"),
-    }
-
-    out
-}
 
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
@@ -635,10 +545,10 @@ fn main() -> Result<()> {
     // Le wallet repart de zéro à chaque exécution
     let mut tx_store = TxStore::new();
 
-    let new_transactions = parse_binance_sources();
+    let new_transactions = binance::parse_binance_sources(accounts_path());
     let mut xtb_tx = Vec::new();
-    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account.xlsx")));
-    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
+    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account.xlsx")));
+    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
 
     // L'ajout des transactions va automatiquement "nourrir" le cache des prix
     // au cas où le cache binaire aurait une trouée.
@@ -736,6 +646,58 @@ fn main() -> Result<()> {
 
     println!("\nP&L latent total : {total_pnl:>+.2} EUR");
 
+        
+    // On ignore la crypto : les WITHDRAW (transferts entre wallets/exchanges)
+    // sont comptés comme des "ventes" FIFO, ce qui gonfle artificiellement le
+    // P&L réalisé alors qu'aucune vente réelle n'a eu lieu côté crypto.
+    let stock_symbols: std::collections::HashSet<&str> = tx_store
+        .assets
+        .values()
+        .filter(|a| a.kind == AssetKind::Stock)
+        .map(|a| a.symbol.as_str())
+        .collect();
+
+    let total_realized_pnl_stocks: f64 = cost_basis
+        .realized_gains
+        .iter()
+        .filter(|g| stock_symbols.contains(g.symbol.as_str()))
+        .map(|g| g.pnl_eur)
+        .sum();
+
+    let overall_pnl = total_pnl + total_realized_pnl_stocks;
+
+    println!("P&L réalisé total (actions uniquement) : {total_realized_pnl_stocks:>+.2} EUR");
+    println!("\n=== PERFORMANCE GLOBALE (latent + réalisé actions) ===");
+    println!("Overall P&L : {overall_pnl:>+.2} EUR  (latent {total_pnl:>+.2} + réalisé {total_realized_pnl_stocks:>+.2})");
+
+
+    println!("\nDétail P&L réalisé par action :");
+    println!("  {:<10} {:>10} {:>12} {:>12} {:>12}", "Symbole", "Qty", "Produit", "Coût", "P&L");
+
+    let mut realized_by_stock: std::collections::HashMap<&str, Vec<&portfolio_rs::ledger::cost_basis::RealizedGain>> =
+        std::collections::HashMap::new();
+    for g in cost_basis.realized_gains.iter().filter(|g| stock_symbols.contains(g.symbol.as_str())) {
+        realized_by_stock.entry(g.symbol.as_str()).or_default().push(g);
+    }
+
+    let mut symbols_sorted: Vec<&&str> = realized_by_stock.keys().collect();
+    symbols_sorted.sort();
+
+    for symbol in symbols_sorted {
+        let gains = &realized_by_stock[symbol];
+        let qty: f64 = gains.iter().map(|g| g.quantity).sum();
+        let proceeds: f64 = gains.iter().map(|g| g.proceeds_eur).sum();
+        let cost: f64 = gains.iter().map(|g| g.cost_eur).sum();
+        let pnl: f64 = gains.iter().map(|g| g.pnl_eur).sum();
+        let has_incomplete = gains.iter().any(|g| g.incomplete);
+
+        println!(
+            "  {:<10} {:>10.4} {:>12.2} {:>12.2} {:>+12.2}{}",
+            symbol, qty, proceeds, cost, pnl,
+            if has_incomplete { "  ⚠ incomplet" } else { "" }
+        );
+    }
+
     println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
     let holdings = non_zero_holdings_at(&tx_store, None);
     let prices_eur: std::collections::HashMap<String, f64> =
@@ -799,13 +761,16 @@ fn main() -> Result<()> {
 /// avec la liste `BENCHMARK_LABELS` côté dashboard.py si tu changes les
 /// noms ici.
 pub const BENCHMARKS: &[(&str, &str)] = &[
-    ("MSCI China", "MCHI"), // pas d'indice ^MXCN sur Yahoo -> proxy ETF iShares
+    ("MSCI China", "MCHI"),
     ("CAC 40", "^FCHI"),
     ("S&P 500", "^GSPC"),
     ("Or", "GC=F"),
     ("Argent", "SI=F"),
+    ("NVIDIA", "NVDA"),
+    ("Indice Dollar", "DX-Y.NYB"),
+    ("NASDAQ", "^NDX"),
 ];
-
+ 
 
 ################################################################################
 # Dossier : src/market
@@ -1173,10 +1138,21 @@ fn to_returns(prices: &BTreeMap<NaiveDate, f64>) -> BTreeMap<NaiveDate, f64> {
 
 /// Corrélation de Pearson entre deux séries de rendements, restreinte aux
 /// dates communes aux deux. `None` si moins de 5 points communs (pas
-/// assez de signal pour qu'un coefficient veuille dire quelque chose).
-fn pearson(a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option<f64> {
+/// assez de signal pour qu'un coefficient veuille dire quelque chose), ou
+/// si l'une des deux séries a une variance nulle sur la fenêtre (prix figé
+/// -- souvent un symptôme de données Yahoo/Binance dégradées plutôt qu'une
+/// vraie absence de mouvement).
+///
+/// `None` ici veut dire "on ne sait pas", pas "zéro" -- à ne JAMAIS
+/// convertir en 0.0 en amont : ça rendrait indiscernables une vraie
+/// décorrélation et un simple manque de données.
+fn pearson(label_a: &str, label_b: &str, a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option<f64> {
     let common: Vec<(f64, f64)> = a.iter().filter_map(|(date, ra)| b.get(date).map(|rb| (*ra, *rb))).collect();
     if common.len() < 5 {
+        eprintln!(
+            "  [DEBUG corrélation] {label_a} / {label_b} : seulement {} date(s) commune(s) (< 5), coefficient = null",
+            common.len()
+        );
         return None;
     }
 
@@ -1196,6 +1172,10 @@ fn pearson(a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option
     }
 
     if var_a <= 0.0 || var_b <= 0.0 {
+        eprintln!(
+            "  [DEBUG corrélation] {label_a} / {label_b} : variance nulle (var_a={var_a:.6}, var_b={var_b:.6}) sur {} points, coefficient = null",
+            common.len()
+        );
         return None;
     }
     Some(cov / (var_a.sqrt() * var_b.sqrt()))
@@ -1203,20 +1183,22 @@ fn pearson(a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option
 
 /// Calcule la matrice de corrélation complète : actifs détenus dont la
 /// valeur courante dépasse `min_value_eur`, plus les benchmarks fixes.
-/// Résultat au format dict-de-dicts (label -> label -> coefficient),
-/// directement sérialisable pour dashboard.json et consommable tel quel
-/// par `pd.DataFrame(...)` côté Streamlit.
+/// Résultat au format dict-de-dicts (label -> label -> coefficient), avec
+/// `None` (sérialisé en `null`) pour les paires où le coefficient n'a pas
+/// pu être calculé -- à ne pas confondre avec une vraie corrélation nulle.
+/// Directement sérialisable pour dashboard.json et consommable tel quel
+/// par `pd.DataFrame(...)` côté Streamlit (les `null` deviennent `NaN`).
+///
 /// Calcule les matrices de corrélation pour toutes les fenêtres de
 /// `CORRELATION_WINDOWS`, en une seule passe de fetch de prix (sur la
 /// fenêtre la plus large) pour éviter de solliciter Yahoo/Binance une
-/// fois par fenêtre. Résultat : label de fenêtre -> matrice (label ->
-/// label -> coefficient), directement sérialisable pour dashboard.json.
+/// fois par fenêtre.
 pub fn compute_correlation_matrices(
     tx_store: &TxStore,
     holdings: &HashMap<String, f64>,
     prices_eur: &HashMap<String, f64>,
     min_value_eur: f64,
-) -> HashMap<String, HashMap<String, HashMap<String, f64>>> {
+) -> HashMap<String, HashMap<String, HashMap<String, Option<f64>>>> {
     let max_lookback = CORRELATION_WINDOWS.iter().map(|(_, d)| *d).max().unwrap_or(365);
 
     let mut series: Vec<(String, BTreeMap<NaiveDate, f64>)> = Vec::new();
@@ -1252,7 +1234,7 @@ pub fn compute_correlation_matrices(
     let full_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> =
         series.into_iter().map(|(label, prices)| (label, to_returns(&prices))).collect();
 
-    let mut result: HashMap<String, HashMap<String, HashMap<String, f64>>> = HashMap::new();
+    let mut result: HashMap<String, HashMap<String, HashMap<String, Option<f64>>>> = HashMap::new();
 
     for (window_label, window_days) in CORRELATION_WINDOWS {
         let windowed_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> = full_returns
@@ -1260,11 +1242,15 @@ pub fn compute_correlation_matrices(
             .map(|(label, r)| (label.clone(), windowed(r, *window_days)))
             .collect();
 
-        let mut matrix: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut matrix: HashMap<String, HashMap<String, Option<f64>>> = HashMap::new();
         for (label_a, returns_a) in &windowed_returns {
             let mut row = HashMap::new();
             for (label_b, returns_b) in &windowed_returns {
-                let coeff = if label_a == label_b { 1.0 } else { pearson(returns_a, returns_b).unwrap_or(0.0) };
+                let coeff = if label_a == label_b {
+                    Some(1.0)
+                } else {
+                    pearson(label_a, label_b, returns_a, returns_b)
+                };
                 row.insert(label_b.clone(), coeff);
             }
             matrix.insert(label_a.clone(), row);
@@ -1274,7 +1260,6 @@ pub fn compute_correlation_matrices(
 
     result
 }
-
 
 ################################################################################
 # Dossier : src/market
@@ -1530,7 +1515,7 @@ fn fetch_binance_close(pair: &str, start_ms: i64, interval: &str, limit: &str) -
     Ok(data
         .iter()
         .filter_map(|k| {
-            let ts = k.get(0)?.as_i64()?;
+            let ts = k.get(0)?.as_i64()? / 1000;
             let close = k.get(4)?.as_str()?.parse::<f64>().ok()?;
             Some((ts, close))
         })
@@ -1965,7 +1950,7 @@ pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
 //! Portage de src/parse/binance.py.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDateTime, TimeZone, Utc};
@@ -2210,6 +2195,38 @@ pub fn parse_converts(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tr
 
     Ok(out)
 }
+
+
+pub fn parse_binance_sources(accounts_path:PathBuf) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    let trades_path = accounts_path.join("trades.csv");
+    let converts_path = accounts_path.join("convert.csv");
+
+    if trades_path.exists() {
+        println!("Lecture Binance Trades : {trades_path:?}");
+        let empty_ids = HashSet::new();
+        match parse_trades(&trades_path, &empty_ids) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
+        }
+    } else {
+        println!("[Omis] Fichier introuvable : {trades_path:?}");
+    }
+
+    if converts_path.exists() {
+        println!("Lecture Binance Converts : {converts_path:?}");
+        let empty_ids = HashSet::new();
+        match parse_converts(&converts_path, &empty_ids) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
+        }
+    } else {
+        println!("[Omis] Fichier introuvable : {converts_path:?}");
+    }
+
+    out
+}
+
 
 ################################################################################
 # Dossier : src/parse
@@ -2744,6 +2761,48 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
 
 
 
+pub fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    if !path.exists() {
+        println!("[Omis] Fichier introuvable : {path:?}");
+        return out;
+    }
+
+    println!("Lecture XTB : {path:?}");
+    let empty_ids = HashSet::new();
+
+    match find_sheet_by_prefix(path, "Closed Position") {
+        Ok(sheet) => match parse_closed_positions(path, &sheet, &empty_ids) {
+            Ok(positions) => {
+                for pos in positions {
+                    out.extend(pos.to_transactions());
+                }
+            }
+            Err(e) => println!("  [Erreur XTB Closed] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Closed] {e}"),
+    }
+
+    match find_sheet_by_prefix(path, "Open Position") {
+        Ok(sheet) => match parse_open_positions(path, &sheet, &empty_ids) {
+            Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
+            Err(e) => println!("  [Erreur XTB Open] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Open] {e}"),
+    }
+
+    match find_sheet_by_prefix(path, "Cash") {
+        Ok(sheet) => match parse_cash_operations(path, &sheet) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => println!("  [Erreur XTB Cash] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Cash] {e}"),
+    }
+
+    out
+}
+
+
 ################################################################################
 # Dossier : src
 # Fichier : schema.rs
@@ -2846,6 +2905,30 @@ pub struct Transaction {
     pub external_id: Option<String>,
     pub remark: Option<String>,
     pub source_file: String,
+}
+
+
+
+#[derive(serde::Serialize)]
+pub struct DashboardAsset {
+    pub symbol: String,
+    pub kind: String,
+    pub ticker: Option<String>,
+    pub quantity: f64,
+    pub price_eur: f64,
+    pub value_eur: f64,
+    pub cost_basis_eur: f64,
+    pub pnl_eur: f64,
+    pub pnl_pct: f64,
+}
+
+#[derive(serde::Serialize)]
+pub struct DashboardData {
+    pub total_value_eur: f64,
+    pub total_cost_basis_eur: f64,
+    pub total_pnl_eur: f64,
+    pub assets: Vec<DashboardAsset>,
+    pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
 }
 
 

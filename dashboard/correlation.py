@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
-from clustering import assign_clusters, cluster_table, compute_linkage, render_dendrogram
+from clustering import assign_clusters, cluster_summary, cluster_table, compute_linkage, format_cluster_summary, render_dendrogram
 from config import BENCHMARK_LABELS, BENCHMARK_TICKERS, DEFAULT_WINDOW_ORDER, WINDOW_TO_YF_PERIOD
 from data import yfinance_ticker_for
 
@@ -53,31 +53,12 @@ def _compute_corr_matrix(
 ) -> tuple[pd.DataFrame, str | None]:
     yf_period = WINDOW_TO_YF_PERIOD.get(selected_window, "3mo")
 
-    """
-    if extra_tickers:
-        # Mode "recalcul en direct" : on appelle Yahoo Finance sur la fenêtre choisie.
-        eligible_rows = df[df["symbol"].isin(eligible_symbols)]
-        portfolio_tickers = {row["symbol"]: yfinance_ticker_for(row) for _, row in eligible_rows.iterrows()}
-        label_by_ticker = {
-            **{v: k for k, v in portfolio_tickers.items()},
-            **{v: k for k, v in BENCHMARK_TICKERS.items()},
-            **{t: t for t in extra_tickers},
-        }
-
-        with st.spinner("Récupération des historiques de prix (Yahoo Finance)..."):
-            returns = fetch_returns(tuple(sorted(set(label_by_ticker.keys()))), period=yf_period)
-
-        missing = set(label_by_ticker.keys()) - set(returns.columns)
-        if missing:
-            st.caption(f"Tickers non résolus par Yahoo Finance, ignorés : {', '.join(sorted(missing))}")
-
-        returns = returns.rename(columns=label_by_ticker)
-        corr_matrix = returns.corr() if returns.shape[1] >= 2 else pd.DataFrame()
-        return corr_matrix, f"Corrélation recalculée en direct (Yahoo Finance, fenêtre={selected_window})"
-    """
     if correlation_matrices and selected_window in correlation_matrices:
         # Cas nominal : on réutilise la matrice pré-calculée par le Rust pour
         # la fenêtre sélectionnée, en filtrant selon le seuil de valeur.
+        # Les paires sans signal suffisant arrivent en `null` -> NaN pandas,
+        # pas en 0.0 : ne jamais les re-remplir avec .fillna(0), sous peine
+        # de recréer le bug (absence de données affichée comme décorrélation).
         full_corr = pd.DataFrame(correlation_matrices[selected_window])
         kept = [s for s in full_corr.columns if s in eligible_symbols]
         corr_matrix = full_corr.loc[kept, kept] if len(kept) >= 2 else pd.DataFrame()
@@ -108,14 +89,25 @@ def _render_full_matrix(corr_matrix: pd.DataFrame, source_note: str | None, sele
     )
     st.plotly_chart(fig_corr, use_container_width=True)
 
+    n_missing = int(corr_matrix.isna().sum().sum())
+    if n_missing:
+        st.caption(f"⬜ Cases vides : {n_missing} paire(s) sans assez de données communes pour calculer un coefficient.")
+
     st.markdown("""
     **Comment lire cette matrice ?**
     - 🔴 **Rouge (proche de 1)** : Les actifs bougent ensemble (mauvaise diversification).
     - ⚪ **Blanc (proche de 0)** : Aucune corrélation (idéal pour stabiliser).
     - 🔵 **Bleu (proche de -1)** : Corrélation négative (vrais couvre-risques).
+    - ▪️ **Case vide** : pas assez de données communes pour calculer un coefficient (à ne pas lire comme "décorrélé").
     """)
 
-def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
+def _render_clusters(
+    correlation_matrices: dict,
+    selected_window: str,
+    eligible_symbols: set[str],
+    df: pd.DataFrame,
+    total_portfolio_value: float,
+) -> None:
     st.subheader(f"🧩 Groupes automatiques ({selected_window})")
 
     if not (correlation_matrices and selected_window in correlation_matrices):
@@ -131,7 +123,12 @@ def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_
         return
 
     max_clusters = len(corr_matrix.columns) - 1
-    n_clusters = st.slider("Nombre de groupes", min_value=2, max_value=max_clusters, value=min(4, max_clusters))
+    n_clusters = st.slider(
+        "Nombre de groupes",
+        min_value=2,
+        max_value=max_clusters,
+        value=min(4, max_clusters),
+    )
 
     linkage_matrix = compute_linkage(corr_matrix)
     cluster_labels = assign_clusters(corr_matrix, linkage_matrix, n_clusters)
@@ -142,8 +139,88 @@ def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_
         "historique est proche -- indépendamment de leur type (Action/Crypto/...)."
     )
 
-    st.dataframe(cluster_table(cluster_labels), use_container_width=True, hide_index=True)
+    # --- Récap par groupe avec métriques financières ---
+    summary = cluster_summary(cluster_labels, df, total_portfolio_value)
 
+    if summary.empty:
+        st.info("Aucun actif du portefeuille trouvé dans les groupes.")
+        return
+
+    # Multiselect pour agréger les groupes souhaités
+    group_options = summary["Groupe"].tolist()
+    selected_groups = st.multiselect(
+        "Sélectionner les groupes à agréger",
+        options=group_options,
+        default=group_options,
+        help="Les KPIs et graphiques ci-dessous ne prennent en compte que les groupes sélectionnés.",
+    )
+
+    st.markdown("##### Détail par groupe")
+    st.dataframe(
+        format_cluster_summary(summary),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not selected_groups:
+        st.info("Sélectionne au moins un groupe pour voir l'agrégat.")
+        return
+
+    sel = summary[summary["Groupe"].isin(selected_groups)].copy()
+    total_sel_value = float(sel["Valeur (€)"].sum())
+    total_sel_cost = float(sel["Cost Basis (€)"].sum())
+    total_sel_pnl = float(sel["P&L (€)"].sum())
+    sel_perf = (total_sel_pnl / total_sel_cost * 100) if total_sel_cost > 0 else 0.0
+    sel_weight = (total_sel_value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
+
+    # --- KPIs agrégés ---
+    st.markdown("##### 📊 Agrégat des groupes sélectionnés")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Valeur agrégée", f"{total_sel_value:,.2f} €")
+    c2.metric("Cost Basis agrégé", f"{total_sel_cost:,.2f} €")
+    c3.metric("P&L agrégé", f"{total_sel_pnl:+,.2f} €")
+    c4.metric("Performance agrégée", f"{sel_perf:+.2f} %")
+    c5.metric("% du portefeuille", f"{sel_weight:.2f} %")
+
+    # --- Graphiques : poids dans le portefeuille + performance par groupe ---
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("##### 🥧 Poids de chaque groupe dans le portefeuille")
+        fig_pie = px.pie(
+            sel,
+            values="Valeur (€)",
+            names="Groupe",
+            hole=0.4,
+        )
+        fig_pie.update_traces(
+            textposition="inside",
+            textinfo="percent+label",
+        )
+        fig_pie.update_layout(
+            showlegend=False,
+            margin=dict(t=0, b=0, l=0, r=0),
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_right:
+        st.markdown("##### 📊 Performance par groupe (P&L %)")
+        fig_bar = px.bar(
+            sel,
+            x="Groupe",
+            y="P&L (%)",
+            color="P&L (%)",
+            color_continuous_scale="RdYlGn",
+            range_color=[-max(abs(sel["P&L (%)"].min()), abs(sel["P&L (%)"].max())) * 1.1,
+                         max(abs(sel["P&L (%)"].min()), abs(sel["P&L (%)"].max())) * 1.1],
+            text=sel["P&L (%)"].apply(lambda v: f"{v:+.2f} %"),
+        )
+        fig_bar.update_traces(textposition="outside")
+        fig_bar.update_layout(
+            margin=dict(t=0, b=0, l=0, r=0),
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
 
 def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
     st.subheader(f"🔗 Corrélations par actif ({selected_window})")
@@ -161,7 +238,17 @@ def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible
         return
 
     selected_asset = st.selectbox("Choisir un actif", options=corr_matrix_asset.columns.tolist())
-    corr_series = corr_matrix_asset[selected_asset].drop(selected_asset).sort_values(ascending=True)
+    full_series = corr_matrix_asset[selected_asset].drop(selected_asset)
+
+    # Avant le patch Rust, les paires sans données arrivaient en 0.0 --
+    # indiscernables d'une vraie décorrélation. Elles arrivent maintenant en
+    # NaN : on les retire du graphe plutôt que de les afficher comme des 0.
+    corr_series = full_series.dropna().sort_values(ascending=True)
+    missing = full_series[full_series.isna()].index.tolist()
+
+    if corr_series.empty:
+        st.info(f"Aucun coefficient calculable pour {selected_asset} sur cette fenêtre (données insuffisantes pour toutes les autres paires).")
+        return
 
     fig_corr_asset = go.Figure(go.Bar(
         x=corr_series.values,
@@ -191,6 +278,8 @@ def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible
         "🔵 Bleu = corrélation négative (couvre-risque) · "
         "Proche de 0 = décorrélé"
     )
+    if missing:
+        st.caption(f"⚠️ Non calculable (données insuffisantes) : {', '.join(sorted(missing))}")
 
 
 def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
@@ -205,22 +294,21 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
         min_value=0.0, value=10.0, step=5.0,
         help="Filtre uniquement tes positions -- les indices/matières premières de référence restent toujours affichés.",
     )
-    """
-    extra_tickers_input = st.text_input(
-        "Ajouter d'autres tickers Yahoo Finance à la demande (séparés par des virgules)",
-        placeholder="ex: ^IXIC, TLT, AAPL",
-    )
-    
-    extra_tickers = [t.strip().upper() for t in extra_tickers_input.split(",") if t.strip()]
-    """
     eligible_symbols = set(df.loc[df["value_eur"] >= min_value_eur, "symbol"]) | BENCHMARK_LABELS
-
+    """
     corr_matrix, source_note = _compute_corr_matrix(
         df, correlation_matrices, selected_window, eligible_symbols
     )
-
+    _render_full_matrix(corr_matrix, source_note, selected_window)
+    """
     st.divider()
     _render_per_asset(correlation_matrices, selected_window, eligible_symbols)
 
     st.divider()
-    _render_clusters(correlation_matrices, selected_window, eligible_symbols)
+    _render_clusters(
+    correlation_matrices,
+    selected_window,
+    eligible_symbols,
+    df,
+    data["total_value_eur"],
+)

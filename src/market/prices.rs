@@ -234,7 +234,7 @@ fn fetch_binance_close(pair: &str, start_ms: i64, interval: &str, limit: &str) -
     Ok(data
         .iter()
         .filter_map(|k| {
-            let ts = k.get(0)?.as_i64()?;
+            let ts = k.get(0)?.as_i64()? / 1000;
             let close = k.get(4)?.as_str()?.parse::<f64>().ok()?;
             Some((ts, close))
         })

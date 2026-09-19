@@ -28,5 +28,8 @@ BENCHMARK_TICKERS = {
     "S&P 500": "^GSPC",
     "Or": "GC=F",
     "Argent": "SI=F",
+    "NVIDIA": "NDVA",
+    "Indice Dollar" :"DX-Y.NYB",
+    "NASDAQ": "^NDX",
 }
 BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())

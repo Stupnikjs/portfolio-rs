@@ -429,3 +429,45 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
     Ok(out)
 }
 
+
+
+pub fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    if !path.exists() {
+        println!("[Omis] Fichier introuvable : {path:?}");
+        return out;
+    }
+
+    println!("Lecture XTB : {path:?}");
+    let empty_ids = HashSet::new();
+
+    match find_sheet_by_prefix(path, "Closed Position") {
+        Ok(sheet) => match parse_closed_positions(path, &sheet, &empty_ids) {
+            Ok(positions) => {
+                for pos in positions {
+                    out.extend(pos.to_transactions());
+                }
+            }
+            Err(e) => println!("  [Erreur XTB Closed] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Closed] {e}"),
+    }
+
+    match find_sheet_by_prefix(path, "Open Position") {
+        Ok(sheet) => match parse_open_positions(path, &sheet, &empty_ids) {
+            Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
+            Err(e) => println!("  [Erreur XTB Open] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Open] {e}"),
+    }
+
+    match find_sheet_by_prefix(path, "Cash") {
+        Ok(sheet) => match parse_cash_operations(path, &sheet) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => println!("  [Erreur XTB Cash] {e}"),
+        },
+        Err(e) => println!("  [Erreur XTB Cash] {e}"),
+    }
+
+    out
+}

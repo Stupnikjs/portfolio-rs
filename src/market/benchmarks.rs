@@ -8,10 +8,13 @@
 /// avec la liste `BENCHMARK_LABELS` côté dashboard.py si tu changes les
 /// noms ici.
 pub const BENCHMARKS: &[(&str, &str)] = &[
-      ("MSTR.US", "MSTR"),
-       ("PRIM.US", "PRIM"),
-        ("XFVT.DE", "XFVT.DE"), // plusieurs classes de parts homonymes -> ambigu pour la recherche Yahoo
-        ("STM.FR", "STMPA.PA"), // STMicroelectronics a changé de symbole Euronext Paris en 2023
-        ("CNYA.DE", "CNYA"),  
-
+    ("MSCI China", "MCHI"),
+    ("CAC 40", "^FCHI"),
+    ("S&P 500", "^GSPC"),
+    ("Or", "GC=F"),
+    ("Argent", "SI=F"),
+    ("NVIDIA", "NVDA"),
+    ("Indice Dollar", "DX-Y.NYB"),
+    ("NASDAQ", "^NDX"),
 ];
+ 

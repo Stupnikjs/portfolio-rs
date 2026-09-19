@@ -1,7 +1,7 @@
 //! Portage de src/parse/binance.py.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{NaiveDateTime, TimeZone, Utc};
@@ -245,4 +245,35 @@ pub fn parse_converts(path: &Path, known_ids: &HashSet<String>) -> Result<Vec<Tr
     }
 
     Ok(out)
+}
+
+
+pub fn parse_binance_sources(accounts_path:PathBuf) -> Vec<Transaction> {
+    let mut out = Vec::new();
+    let trades_path = accounts_path.join("trades.csv");
+    let converts_path = accounts_path.join("convert.csv");
+
+    if trades_path.exists() {
+        println!("Lecture Binance Trades : {trades_path:?}");
+        let empty_ids = HashSet::new();
+        match parse_trades(&trades_path, &empty_ids) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
+        }
+    } else {
+        println!("[Omis] Fichier introuvable : {trades_path:?}");
+    }
+
+    if converts_path.exists() {
+        println!("Lecture Binance Converts : {converts_path:?}");
+        let empty_ids = HashSet::new();
+        match parse_converts(&converts_path, &empty_ids) {
+            Ok(mut tx) => out.append(&mut tx),
+            Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
+        }
+    } else {
+        println!("[Omis] Fichier introuvable : {converts_path:?}");
+    }
+
+    out
 }

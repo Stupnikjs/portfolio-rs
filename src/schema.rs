@@ -95,3 +95,27 @@ pub struct Transaction {
     pub remark: Option<String>,
     pub source_file: String,
 }
+
+
+
+#[derive(serde::Serialize)]
+pub struct DashboardAsset {
+    pub symbol: String,
+    pub kind: String,
+    pub ticker: Option<String>,
+    pub quantity: f64,
+    pub price_eur: f64,
+    pub value_eur: f64,
+    pub cost_basis_eur: f64,
+    pub pnl_eur: f64,
+    pub pnl_pct: f64,
+}
+
+#[derive(serde::Serialize)]
+pub struct DashboardData {
+    pub total_value_eur: f64,
+    pub total_cost_basis_eur: f64,
+    pub total_pnl_eur: f64,
+    pub assets: Vec<DashboardAsset>,
+    pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
+}

@@ -4,8 +4,8 @@
 //! Ré-exécutable sans risque : le tx_store est recréé from scratch à chaque run.
 //! Le cache des prix (price_cache.bin) persiste et bloque les appels API inutiles.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+
+use std::path::{PathBuf};
 
 use anyhow::Result;
 
@@ -16,33 +16,12 @@ use portfolio_rs::market::correlation::compute_correlation_matrices;
 use portfolio_rs::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
-use portfolio_rs::schema::{AssetKind,  Transaction, TransactionKind};
+use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
 use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
-#[derive(serde::Serialize)]
-struct DashboardAsset {
-    symbol: String,
-    kind: String,
-    ticker: Option<String>,
-    quantity: f64,
-    price_eur: f64,
-    value_eur: f64,
-    cost_basis_eur: f64,
-    pnl_eur: f64,
-    pnl_pct: f64,
-}
-
-#[derive(serde::Serialize)]
-struct DashboardData {
-    total_value_eur: f64,
-    total_cost_basis_eur: f64,
-    total_pnl_eur: f64,
-    assets: Vec<DashboardAsset>,
-    correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, f64>>>,
-}
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -52,76 +31,7 @@ fn accounts_path() -> PathBuf {
     data_dir().join("accounts")
 }
 
-fn parse_binance_sources() -> Vec<Transaction> {
-    let mut out = Vec::new();
-    let trades_path = accounts_path().join("trades.csv");
-    let converts_path = accounts_path().join("convert.csv");
 
-    if trades_path.exists() {
-        println!("Lecture Binance Trades : {trades_path:?}");
-        let empty_ids = HashSet::new();
-        match binance::parse_trades(&trades_path, &empty_ids) {
-            Ok(mut tx) => out.append(&mut tx),
-            Err(e) => eprintln!("  [Erreur Binance Trades] {e}"),
-        }
-    } else {
-        println!("[Omis] Fichier introuvable : {trades_path:?}");
-    }
-
-    if converts_path.exists() {
-        println!("Lecture Binance Converts : {converts_path:?}");
-        let empty_ids = HashSet::new();
-        match binance::parse_converts(&converts_path, &empty_ids) {
-            Ok(mut tx) => out.append(&mut tx),
-            Err(e) => eprintln!("  [Erreur Binance Converts] {e}"),
-        }
-    } else {
-        println!("[Omis] Fichier introuvable : {converts_path:?}");
-    }
-
-    out
-}
-
-fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
-    let mut out = Vec::new();
-    if !path.exists() {
-        println!("[Omis] Fichier introuvable : {path:?}");
-        return out;
-    }
-
-    println!("Lecture XTB : {path:?}");
-    let empty_ids = HashSet::new();
-
-    match xtb::find_sheet_by_prefix(path, "Closed Position") {
-        Ok(sheet) => match xtb::parse_closed_positions(path, &sheet, &empty_ids) {
-            Ok(positions) => {
-                for pos in positions {
-                    out.extend(pos.to_transactions());
-                }
-            }
-            Err(e) => println!("  [Erreur XTB Closed] {e}"),
-        },
-        Err(e) => println!("  [Erreur XTB Closed] {e}"),
-    }
-
-    match xtb::find_sheet_by_prefix(path, "Open Position") {
-        Ok(sheet) => match xtb::parse_open_positions(path, &sheet, &empty_ids) {
-            Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
-            Err(e) => println!("  [Erreur XTB Open] {e}"),
-        },
-        Err(e) => println!("  [Erreur XTB Open] {e}"),
-    }
-
-    match xtb::find_sheet_by_prefix(path, "Cash") {
-        Ok(sheet) => match xtb::parse_cash_operations(path, &sheet) {
-            Ok(mut tx) => out.append(&mut tx),
-            Err(e) => println!("  [Erreur XTB Cash] {e}"),
-        },
-        Err(e) => println!("  [Erreur XTB Cash] {e}"),
-    }
-
-    out
-}
 
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
@@ -131,10 +41,10 @@ fn main() -> Result<()> {
     // Le wallet repart de zéro à chaque exécution
     let mut tx_store = TxStore::new();
 
-    let new_transactions = parse_binance_sources();
+    let new_transactions = binance::parse_binance_sources(accounts_path());
     let mut xtb_tx = Vec::new();
-    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account.xlsx")));
-    xtb_tx.extend(parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
+    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account.xlsx")));
+    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
 
     // L'ajout des transactions va automatiquement "nourrir" le cache des prix
     // au cas où le cache binaire aurait une trouée.
