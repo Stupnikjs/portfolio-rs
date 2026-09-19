@@ -125,7 +125,7 @@ fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
 
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
-    let cache_path = PathBuf::from("./data");
+    let cache_path = PathBuf::from("./data/cache");
     init_price_caches(&cache_path);
 
     // Le wallet repart de zéro à chaque exécution
@@ -231,6 +231,58 @@ fn main() -> Result<()> {
     }
 
     println!("\nP&L latent total : {total_pnl:>+.2} EUR");
+
+        
+    // On ignore la crypto : les WITHDRAW (transferts entre wallets/exchanges)
+    // sont comptés comme des "ventes" FIFO, ce qui gonfle artificiellement le
+    // P&L réalisé alors qu'aucune vente réelle n'a eu lieu côté crypto.
+    let stock_symbols: std::collections::HashSet<&str> = tx_store
+        .assets
+        .values()
+        .filter(|a| a.kind == AssetKind::Stock)
+        .map(|a| a.symbol.as_str())
+        .collect();
+
+    let total_realized_pnl_stocks: f64 = cost_basis
+        .realized_gains
+        .iter()
+        .filter(|g| stock_symbols.contains(g.symbol.as_str()))
+        .map(|g| g.pnl_eur)
+        .sum();
+
+    let overall_pnl = total_pnl + total_realized_pnl_stocks;
+
+    println!("P&L réalisé total (actions uniquement) : {total_realized_pnl_stocks:>+.2} EUR");
+    println!("\n=== PERFORMANCE GLOBALE (latent + réalisé actions) ===");
+    println!("Overall P&L : {overall_pnl:>+.2} EUR  (latent {total_pnl:>+.2} + réalisé {total_realized_pnl_stocks:>+.2})");
+
+
+    println!("\nDétail P&L réalisé par action :");
+    println!("  {:<10} {:>10} {:>12} {:>12} {:>12}", "Symbole", "Qty", "Produit", "Coût", "P&L");
+
+    let mut realized_by_stock: std::collections::HashMap<&str, Vec<&portfolio_rs::ledger::cost_basis::RealizedGain>> =
+        std::collections::HashMap::new();
+    for g in cost_basis.realized_gains.iter().filter(|g| stock_symbols.contains(g.symbol.as_str())) {
+        realized_by_stock.entry(g.symbol.as_str()).or_default().push(g);
+    }
+
+    let mut symbols_sorted: Vec<&&str> = realized_by_stock.keys().collect();
+    symbols_sorted.sort();
+
+    for symbol in symbols_sorted {
+        let gains = &realized_by_stock[symbol];
+        let qty: f64 = gains.iter().map(|g| g.quantity).sum();
+        let proceeds: f64 = gains.iter().map(|g| g.proceeds_eur).sum();
+        let cost: f64 = gains.iter().map(|g| g.cost_eur).sum();
+        let pnl: f64 = gains.iter().map(|g| g.pnl_eur).sum();
+        let has_incomplete = gains.iter().any(|g| g.incomplete);
+
+        println!(
+            "  {:<10} {:>10.4} {:>12.2} {:>12.2} {:>+12.2}{}",
+            symbol, qty, proceeds, cost, pnl,
+            if has_incomplete { "  ⚠ incomplet" } else { "" }
+        );
+    }
 
     println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
     let holdings = non_zero_holdings_at(&tx_store, None);

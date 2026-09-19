@@ -8,9 +8,10 @@
 /// avec la liste `BENCHMARK_LABELS` côté dashboard.py si tu changes les
 /// noms ici.
 pub const BENCHMARKS: &[(&str, &str)] = &[
-    ("MSCI China", "MCHI"), // pas d'indice ^MXCN sur Yahoo -> proxy ETF iShares
-    ("CAC 40", "^FCHI"),
-    ("S&P 500", "^GSPC"),
-    ("Or", "GC=F"),
-    ("Argent", "SI=F"),
+      ("MSTR.US", "MSTR"),
+       ("PRIM.US", "PRIM"),
+        ("XFVT.DE", "XFVT.DE"), // plusieurs classes de parts homonymes -> ambigu pour la recherche Yahoo
+        ("STM.FR", "STMPA.PA"), // STMicroelectronics a changé de symbole Euronext Paris en 2023
+        ("CNYA.DE", "CNYA"),  
+
 ];
