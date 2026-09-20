@@ -222,36 +222,39 @@ def cluster_summary(
     df: pd.DataFrame,
     total_portfolio_value: float,
 ) -> pd.DataFrame:
-    """Une ligne par groupe avec :
-    - la liste des actifs,
+    """Une ligne par groupe contenant des actifs du portefeuille, avec :
+    - la liste des actifs détenus,
     - la valeur totale, le cost basis, le P&L (€), le P&L (%),
     - le poids du groupe dans le portefeuille global.
 
-    Les actifs présents dans la matrice de corrélation mais absents du
-    portefeuille (ex: benchmarks) sont listés mais ne pèsent rien
-    financièrement."""
+    Les actifs non détenus (benchmarks comme les indices ou matières premières)
+    sont totalement ignorés. Les groupes ne contenant aucun actif réel
+    n'apparaissent pas dans le résumé."""
     df_indexed = df.set_index("symbol")
     rows = []
 
     for cluster_id in sorted(cluster_labels.unique()):
         symbols_in_cluster = cluster_labels[cluster_labels == cluster_id].index.tolist()
-        available_symbols = [s for s in symbols_in_cluster if s in df_indexed.index]
+        
+        # On ne garde QUE les actifs qui sont réellement dans le portefeuille
+        portfolio_assets = [s for s in symbols_in_cluster if s in df_indexed.index]
 
-        if available_symbols:
-            sub = df_indexed.loc[available_symbols]
-            value = float(sub["value_eur"].sum())
-            cost = float(sub["cost_basis_eur"].sum())
-            pnl = float(sub["pnl_eur"].sum())
-        else:
-            value = cost = pnl = 0.0
+        if not portfolio_assets:
+            # Si le groupe ne contient que des benchmarks (hors portefeuille), on l'ignore
+            continue
+
+        sub = df_indexed.loc[portfolio_assets]
+        value = float(sub["value_eur"].sum())
+        cost = float(sub["cost_basis_eur"].sum())
+        pnl = float(sub["pnl_eur"].sum())
 
         pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
         weight = (value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
 
         rows.append({
             "Groupe": int(cluster_id),
-            "Actifs": ", ".join(sorted(symbols_in_cluster)),
-            "Nb actifs": len(symbols_in_cluster),
+            "Actifs": ", ".join(sorted(portfolio_assets)),
+            "Nb actifs": len(portfolio_assets),
             "Valeur (€)": value,
             "Cost Basis (€)": cost,
             "P&L (€)": pnl,
@@ -260,7 +263,6 @@ def cluster_summary(
         })
 
     return pd.DataFrame(rows)
-
 
 def format_cluster_summary(summary: pd.DataFrame) -> pd.DataFrame:
     """Version formatée pour st.dataframe."""
@@ -308,7 +310,7 @@ BENCHMARK_TICKERS = {
     "S&P 500": "^GSPC",
     "Or": "GC=F",
     "Argent": "SI=F",
-    "NVIDIA": "N",
+    "NVIDIA": "NDVA",
     "Indice Dollar" :"DX-Y.NYB",
     "NASDAQ": "^NDX",
 }
@@ -331,7 +333,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
-from clustering import assign_clusters, cluster_table, compute_linkage, render_dendrogram
+from clustering import assign_clusters, cluster_summary, cluster_table, compute_linkage, format_cluster_summary, render_dendrogram
 from config import BENCHMARK_LABELS, BENCHMARK_TICKERS, DEFAULT_WINDOW_ORDER, WINDOW_TO_YF_PERIOD
 from data import yfinance_ticker_for
 
@@ -424,7 +426,13 @@ def _render_full_matrix(corr_matrix: pd.DataFrame, source_note: str | None, sele
     - ▪️ **Case vide** : pas assez de données communes pour calculer un coefficient (à ne pas lire comme "décorrélé").
     """)
 
-def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
+def _render_clusters(
+    correlation_matrices: dict,
+    selected_window: str,
+    eligible_symbols: set[str],
+    df: pd.DataFrame,
+    total_portfolio_value: float,
+) -> None:
     st.subheader(f"🧩 Groupes automatiques ({selected_window})")
 
     if not (correlation_matrices and selected_window in correlation_matrices):
@@ -435,20 +443,17 @@ def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_
     kept = [s for s in full_corr.columns if s in eligible_symbols]
     corr_matrix = full_corr.loc[kept, kept] if len(kept) >= 3 else pd.DataFrame()
 
-    # Le clustering hiérarchique a besoin d'une matrice complète : les paires
-    # sans coefficient (NaN) feraient planter le linkage scipy. On exclut donc
-    # les actifs qui ont au moins un NaN vis-à-vis du reste du groupe, plutôt
-    # que de fillna(0) qui fausserait silencieusement le clustering.
-    if not corr_matrix.empty:
-        corr_matrix = corr_matrix.dropna(axis=0, how="any").dropna(axis=1, how="any")
-        corr_matrix = corr_matrix.loc[corr_matrix.index.intersection(corr_matrix.columns)]
-
-    if corr_matrix.empty or corr_matrix.shape[1] < 3:
-        st.info("Au moins 3 actifs avec des coefficients complets sont nécessaires pour former des groupes.")
+    if corr_matrix.empty:
+        st.info("Au moins 3 actifs sont nécessaires pour former des groupes.")
         return
 
     max_clusters = len(corr_matrix.columns) - 1
-    n_clusters = st.slider("Nombre de groupes", min_value=2, max_value=max_clusters, value=min(4, max_clusters))
+    n_clusters = st.slider(
+        "Nombre de groupes",
+        min_value=2,
+        max_value=max_clusters,
+        value=min(4, max_clusters),
+    )
 
     linkage_matrix = compute_linkage(corr_matrix)
     cluster_labels = assign_clusters(corr_matrix, linkage_matrix, n_clusters)
@@ -459,8 +464,88 @@ def _render_clusters(correlation_matrices: dict, selected_window: str, eligible_
         "historique est proche -- indépendamment de leur type (Action/Crypto/...)."
     )
 
-    st.dataframe(cluster_table(cluster_labels), use_container_width=True, hide_index=True)
+    # --- Récap par groupe avec métriques financières ---
+    summary = cluster_summary(cluster_labels, df, total_portfolio_value)
 
+    if summary.empty:
+        st.info("Aucun actif du portefeuille trouvé dans les groupes.")
+        return
+
+    # Multiselect pour agréger les groupes souhaités
+    group_options = summary["Groupe"].tolist()
+    selected_groups = st.multiselect(
+        "Sélectionner les groupes à agréger",
+        options=group_options,
+        default=group_options,
+        help="Les KPIs et graphiques ci-dessous ne prennent en compte que les groupes sélectionnés.",
+    )
+
+    st.markdown("##### Détail par groupe")
+    st.dataframe(
+        format_cluster_summary(summary),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not selected_groups:
+        st.info("Sélectionne au moins un groupe pour voir l'agrégat.")
+        return
+
+    sel = summary[summary["Groupe"].isin(selected_groups)].copy()
+    total_sel_value = float(sel["Valeur (€)"].sum())
+    total_sel_cost = float(sel["Cost Basis (€)"].sum())
+    total_sel_pnl = float(sel["P&L (€)"].sum())
+    sel_perf = (total_sel_pnl / total_sel_cost * 100) if total_sel_cost > 0 else 0.0
+    sel_weight = (total_sel_value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
+
+    # --- KPIs agrégés ---
+    st.markdown("##### 📊 Agrégat des groupes sélectionnés")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Valeur agrégée", f"{total_sel_value:,.2f} €")
+    c2.metric("Cost Basis agrégé", f"{total_sel_cost:,.2f} €")
+    c3.metric("P&L agrégé", f"{total_sel_pnl:+,.2f} €")
+    c4.metric("Performance agrégée", f"{sel_perf:+.2f} %")
+    c5.metric("% du portefeuille", f"{sel_weight:.2f} %")
+
+    # --- Graphiques : poids dans le portefeuille + performance par groupe ---
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("##### 🥧 Poids de chaque groupe dans le portefeuille")
+        fig_pie = px.pie(
+            sel,
+            values="Valeur (€)",
+            names="Groupe",
+            hole=0.4,
+        )
+        fig_pie.update_traces(
+            textposition="inside",
+            textinfo="percent+label",
+        )
+        fig_pie.update_layout(
+            showlegend=False,
+            margin=dict(t=0, b=0, l=0, r=0),
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_right:
+        st.markdown("##### 📊 Performance par groupe (P&L %)")
+        fig_bar = px.bar(
+            sel,
+            x="Groupe",
+            y="P&L (%)",
+            color="P&L (%)",
+            color_continuous_scale="RdYlGn",
+            range_color=[-max(abs(sel["P&L (%)"].min()), abs(sel["P&L (%)"].max())) * 1.1,
+                         max(abs(sel["P&L (%)"].min()), abs(sel["P&L (%)"].max())) * 1.1],
+            text=sel["P&L (%)"].apply(lambda v: f"{v:+.2f} %"),
+        )
+        fig_bar.update_traces(textposition="outside")
+        fig_bar.update_layout(
+            margin=dict(t=0, b=0, l=0, r=0),
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(fig_bar, use_container_width=True)
 
 def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
     st.subheader(f"🔗 Corrélations par actif ({selected_window})")
@@ -535,17 +620,22 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
         help="Filtre uniquement tes positions -- les indices/matières premières de référence restent toujours affichés.",
     )
     eligible_symbols = set(df.loc[df["value_eur"] >= min_value_eur, "symbol"]) | BENCHMARK_LABELS
-
-    corr_matrix, source_note = _compute_corr_matrix(
-        df, correlation_matrices, selected_window, eligible_symbols
-    )
-    _render_full_matrix(corr_matrix, source_note, selected_window)
-
+    """
+    corr_matrix, source_note = _compute_corr_matrix(...)
+    _render_full_matrix(...)
+    """
     st.divider()
     _render_per_asset(correlation_matrices, selected_window, eligible_symbols)
 
     st.divider()
-    _render_clusters(correlation_matrices, selected_window, eligible_symbols)
+    _render_clusters(
+        correlation_matrices,
+        selected_window,
+        eligible_symbols - BENCHMARK_LABELS,   # <- clustering sur tes positions uniquement
+        df,
+        data["total_value_eur"],
+    )
+
 
 ################################################################################
 # Dossier : dashboard

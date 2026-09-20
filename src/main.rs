@@ -117,7 +117,7 @@ fn main() -> Result<()> {
 
     let mut total_pnl = 0.0;
     for asset in &snapshot.assets {
-        if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") {
+        if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") || asset.kind == AssetKind::Cash {
             continue; 
         }
 

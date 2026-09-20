@@ -296,19 +296,17 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
     )
     eligible_symbols = set(df.loc[df["value_eur"] >= min_value_eur, "symbol"]) | BENCHMARK_LABELS
     """
-    corr_matrix, source_note = _compute_corr_matrix(
-        df, correlation_matrices, selected_window, eligible_symbols
-    )
-    _render_full_matrix(corr_matrix, source_note, selected_window)
+    corr_matrix, source_note = _compute_corr_matrix(...)
+    _render_full_matrix(...)
     """
     st.divider()
     _render_per_asset(correlation_matrices, selected_window, eligible_symbols)
 
     st.divider()
     _render_clusters(
-    correlation_matrices,
-    selected_window,
-    eligible_symbols,
-    df,
-    data["total_value_eur"],
-)
+        correlation_matrices,
+        selected_window,
+        eligible_symbols - BENCHMARK_LABELS,   # <- clustering sur tes positions uniquement
+        df,
+        data["total_value_eur"],
+    )
