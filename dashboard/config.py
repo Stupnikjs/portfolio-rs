@@ -31,5 +31,6 @@ BENCHMARK_TICKERS = {
     "NVIDIA": "NDVA",
     "Indice Dollar" :"DX-Y.NYB",
     "NASDAQ": "^NDX",
+    "SU.FR": "SU.PA",
 }
 BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())

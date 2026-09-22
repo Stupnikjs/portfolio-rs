@@ -16,5 +16,5 @@ pub const BENCHMARKS: &[(&str, &str)] = &[
     ("NVIDIA", "NVDA"),
     ("Indice Dollar", "DX-Y.NYB"),
     ("NASDAQ", "^NDX"),
+    ("SU.FR", "SU.PA"),
 ];
- 
