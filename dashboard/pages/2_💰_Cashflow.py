@@ -139,7 +139,7 @@ if not edited_ponctuelles.empty:
     )
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.update_layout(margin=dict(t=10, b=0, l=0, r=0))
-    st.plotly_chart(fig, use_container_width=True)
+
 
     st.dataframe(
         monthly_ponctuelles.rename(columns={
@@ -154,21 +154,25 @@ else:
     st.info("Aucune dépense ponctuelle enregistrée -- la capacité réelle correspond à la capacité théorique chaque mois.")
 
 st.divider()
-
-# --- Solde réel du compte (vérité terrain, saisie manuelle mensuelle) ---
+# --- Solde réel du compte (vérité terrain, checkpoint à date libre) ---
 st.subheader("🏦 Solde réel du compte")
-st.caption("Saisi à la main chaque mois -- sert à corriger l'estimation ci-dessus, qui repose sur des dépenses approximatives.")
-
+st.caption(
+    "Ajoute un checkpoint quand tu veux -- pas forcément un par mois. "
+    "Sert à corriger l'estimation ci-dessus, qui repose sur des dépenses approximatives."
+)
+ 
 df_soldes = (
     pd.DataFrame(cash_data["soldes_reels"])
     if cash_data["soldes_reels"]
-    else pd.DataFrame(columns=["mois", "solde"])
+    else pd.DataFrame(columns=["date", "solde"])
 )
-
+if not df_soldes.empty:
+    df_soldes["date"] = pd.to_datetime(df_soldes["date"]).dt.date
+ 
 edited_soldes = st.data_editor(
     df_soldes,
     column_config={
-        "mois": st.column_config.TextColumn("Mois (YYYY-MM)", help="Ex: 2026-09"),
+        "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY", default=date.today()),
         "solde": st.column_config.NumberColumn("Solde réel (€)", step=10.0, format="%.2f €"),
     },
     hide_index=True,
@@ -176,20 +180,38 @@ edited_soldes = st.data_editor(
     use_container_width=True,
     key="soldes_editor",
 )
-
+ 
 if not edited_soldes.equals(df_soldes):
-    to_save = edited_soldes.dropna(subset=["mois"]).sort_values("mois")
+    to_save = edited_soldes.dropna(subset=["date"]).copy()
+    to_save["date"] = to_save["date"].apply(lambda d: d.isoformat() if not isinstance(d, str) else d)
+    to_save = to_save.sort_values("date")
     cash_data["soldes_reels"] = to_save.to_dict("records")
     save_cash_data(cash_data)
     st.rerun()
-
-# --- Comparaison estimé vs réel ---
-if len(edited_soldes) >= 2:
+ 
+# --- Évolution du solde réel (tous les checkpoints, granularité libre) ---
+soldes_sorted = edited_soldes.dropna(subset=["date", "solde"]).sort_values("date").reset_index(drop=True)
+if not soldes_sorted.empty:
+    soldes_sorted["date"] = pd.to_datetime(soldes_sorted["date"])
+ 
+if len(soldes_sorted) >= 2:
+    fig_solde = px.line(
+        soldes_sorted, x="date", y="solde", markers=True,
+        labels={"solde": "Solde réel (€)", "date": "Date"},
+    )
+    fig_solde.update_layout(margin=dict(t=10, b=0, l=0, r=0))
+   
+ 
+# --- Comparaison estimé vs réel (resamplée au mois, quelle que soit la
+#     fréquence des checkpoints -- on garde le dernier checkpoint de
+#     chaque mois comme valeur de fin de mois) ---
+if len(soldes_sorted) >= 2:
     st.subheader("Écart estimé vs réel")
-
-    soldes_sorted = edited_soldes.dropna(subset=["mois", "solde"]).sort_values("mois").reset_index(drop=True)
-    soldes_sorted["variation_reelle"] = soldes_sorted["solde"].diff()
-
+ 
+    soldes_sorted["mois"] = soldes_sorted["date"].dt.to_period("M").astype(str)
+    monthly_soldes = soldes_sorted.groupby("mois", as_index=False).last()
+    monthly_soldes["variation_reelle"] = monthly_soldes["solde"].diff()
+ 
     if not edited_ponctuelles.empty:
         df_pct = edited_ponctuelles.copy()
         df_pct["date"] = pd.to_datetime(df_pct["date"])
@@ -197,16 +219,16 @@ if len(edited_soldes) >= 2:
         ponctuelles_par_mois = df_pct.groupby("mois")["montant"].sum()
     else:
         ponctuelles_par_mois = pd.Series(dtype=float)
-
-    soldes_sorted["capacite_theorique_du_mois"] = soldes_sorted["mois"].apply(
+ 
+    monthly_soldes["capacite_theorique_du_mois"] = monthly_soldes["mois"].apply(
         lambda m: capacite_theorique - ponctuelles_par_mois.get(m, 0.0)
     )
-    soldes_sorted["ecart"] = soldes_sorted["variation_reelle"] - soldes_sorted["capacite_theorique_du_mois"]
-
-    comparison = soldes_sorted.dropna(subset=["variation_reelle"])[
+    monthly_soldes["ecart"] = monthly_soldes["variation_reelle"] - monthly_soldes["capacite_theorique_du_mois"]
+ 
+    comparison = monthly_soldes.dropna(subset=["variation_reelle"])[
         ["mois", "solde", "variation_reelle", "capacite_theorique_du_mois", "ecart"]
     ]
-
+ 
     st.dataframe(
         comparison.rename(columns={
             "mois": "Mois",
@@ -218,17 +240,10 @@ if len(edited_soldes) >= 2:
         use_container_width=True,
         hide_index=True,
     )
-
-    fig_ecart = px.bar(
-        comparison,
-        x="mois",
-        y=["variation_reelle", "capacite_theorique_du_mois"],
-        barmode="group",
-        labels={"value": "Montant (€)", "mois": "Mois", "variable": ""},
-    )
-    fig_ecart.update_layout(margin=dict(t=10, b=0, l=0, r=0), legend_title_text="")
-    st.plotly_chart(fig_ecart, use_container_width=True)
-elif len(edited_soldes) == 1:
-    st.info("Ajoute le solde d'au moins un deuxième mois pour voir la variation réelle et la comparer à l'estimation.")
+ 
+    
+elif len(soldes_sorted) == 1:
+    st.info("Ajoute un deuxième checkpoint pour voir la variation réelle et la comparer à l'estimation.")
 else:
     st.info("Aucun solde réel enregistré pour le moment.")
+ 
