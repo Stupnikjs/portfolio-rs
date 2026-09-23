@@ -12,7 +12,7 @@ import plotly.express as px
 import plotly.io as pio
 import streamlit as st
 
-from cash_data import load_cash_data, save_cash_data
+from cash_data import load_cash_data, save_cash_data, compute_monthly_capacity
 from theme import BG_COLOR, TEXT_COLOR, GRID_COLOR
 
 # Applique uniquement le template Plotly (set_page_config est déjà géré par app.py)
@@ -106,54 +106,6 @@ if not edited_ponctuelles.equals(df_ponctuelles):
 
 st.divider()
 
-# --- Capacité d'investissement ---
-st.subheader("📊 Capacité d'investissement")
-
-capacite_theorique = salaire - total_fixes
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Salaire net", f"{salaire:,.2f} €")
-col2.metric("Dépenses fixes", f"{total_fixes:,.2f} €")
-col3.metric(
-    "Capacité théorique",
-    f"{capacite_theorique:,.2f} €",
-    help="Salaire net - dépenses fixes. Ne tient pas compte des ponctuelles.",
-)
-
-# --- Capacité réelle par mois (brute, sans lissage) ---
-if not edited_ponctuelles.empty:
-    df_chart = edited_ponctuelles.copy()
-    df_chart["date"] = pd.to_datetime(df_chart["date"])
-    df_chart["mois"] = df_chart["date"].dt.to_period("M").astype(str)
-    monthly_ponctuelles = df_chart.groupby("mois")["montant"].sum().reset_index()
-    monthly_ponctuelles["capacite_reelle"] = capacite_theorique - monthly_ponctuelles["montant"]
-
-    st.subheader("Capacité réelle par mois")
-    st.caption("Capacité théorique - dépenses ponctuelles du mois. Aucun lissage : un mois à 0€ ou négatif reste affiché tel quel.")
-
-    fig = px.bar(
-        monthly_ponctuelles,
-        x="mois",
-        y="capacite_reelle",
-        labels={"capacite_reelle": "Capacité réelle (€)", "mois": "Mois"},
-    )
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
-    fig.update_layout(margin=dict(t=10, b=0, l=0, r=0))
-
-
-    st.dataframe(
-        monthly_ponctuelles.rename(columns={
-            "mois": "Mois",
-            "montant": "Dépenses ponctuelles (€)",
-            "capacite_reelle": "Capacité réelle (€)",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.info("Aucune dépense ponctuelle enregistrée -- la capacité réelle correspond à la capacité théorique chaque mois.")
-
-st.divider()
 # --- Solde réel du compte (vérité terrain, checkpoint à date libre) ---
 st.subheader("🏦 Solde réel du compte")
 st.caption(
@@ -200,50 +152,68 @@ if len(soldes_sorted) >= 2:
         labels={"solde": "Solde réel (€)", "date": "Date"},
     )
     fig_solde.update_layout(margin=dict(t=10, b=0, l=0, r=0))
+    # st.plotly_chart(fig_solde, use_container_width=True)
    
  
-# --- Comparaison estimé vs réel (resamplée au mois, quelle que soit la
-#     fréquence des checkpoints -- on garde le dernier checkpoint de
-#     chaque mois comme valeur de fin de mois) ---
-if len(soldes_sorted) >= 2:
-    st.subheader("Écart estimé vs réel")
- 
-    soldes_sorted["mois"] = soldes_sorted["date"].dt.to_period("M").astype(str)
-    monthly_soldes = soldes_sorted.groupby("mois", as_index=False).last()
-    monthly_soldes["variation_reelle"] = monthly_soldes["solde"].diff()
- 
-    if not edited_ponctuelles.empty:
-        df_pct = edited_ponctuelles.copy()
-        df_pct["date"] = pd.to_datetime(df_pct["date"])
-        df_pct["mois"] = df_pct["date"].dt.to_period("M").astype(str)
-        ponctuelles_par_mois = df_pct.groupby("mois")["montant"].sum()
-    else:
-        ponctuelles_par_mois = pd.Series(dtype=float)
- 
-    monthly_soldes["capacite_theorique_du_mois"] = monthly_soldes["mois"].apply(
-        lambda m: capacite_theorique - ponctuelles_par_mois.get(m, 0.0)
-    )
-    monthly_soldes["ecart"] = monthly_soldes["variation_reelle"] - monthly_soldes["capacite_theorique_du_mois"]
- 
-    comparison = monthly_soldes.dropna(subset=["variation_reelle"])[
-        ["mois", "solde", "variation_reelle", "capacite_theorique_du_mois", "ecart"]
-    ]
- 
-    st.dataframe(
-        comparison.rename(columns={
-            "mois": "Mois",
-            "solde": "Solde réel (€)",
-            "variation_reelle": "Variation réelle (€)",
-            "capacite_theorique_du_mois": "Capacité estimée (€)",
-            "ecart": "Écart (€)",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
- 
-    
-elif len(soldes_sorted) == 1:
-    st.info("Ajoute un deuxième checkpoint pour voir la variation réelle et la comparer à l'estimation.")
-else:
-    st.info("Aucun solde réel enregistré pour le moment.")
- 
+st.divider()
+
+# --- Capacité d'investissement par mois ---
+st.subheader("📊 Capacité d'investissement")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Salaire net", f"{salaire:,.2f} €")
+col2.metric("Dépenses fixes", f"{total_fixes:,.2f} €")
+col3.metric(
+    "Flux mensuel théorique",
+    f"{salaire - total_fixes:,.2f} €",
+    help="Salaire net - dépenses fixes, avant dépenses ponctuelles.",
+)
+
+horizon = st.slider("Mois futurs à projeter", min_value=0, max_value=12, value=3)
+
+capacity_df = compute_monthly_capacity(
+    salaire=salaire,
+    total_fixes=total_fixes,
+    ponctuelles=edited_ponctuelles,
+    soldes=edited_soldes,
+    horizon_mois=horizon,
+)
+
+st.caption(
+    "Capacité = épargne de départ + salaire - dépenses fixes - ponctuelles du mois. "
+    "Un mois « Réel » reprend ton dernier checkpoint du mois (qui recale la chaîne) ; "
+    "un mois « Projeté » part du solde du mois précédent en supposant que tu n'investis rien "
+    "entre-temps. Pas de lissage : un mois négatif reste négatif."
+)
+if edited_soldes.dropna(subset=["date", "solde"]).empty:
+    st.info("Aucun checkpoint : sans solde de départ, la capacité affichée se limite au flux du mois.")
+
+fig_cap = px.bar(
+    capacity_df,
+    x="mois",
+    y="capacite",
+    color="source",
+    color_discrete_map={"Réel": "#4C9AFF", "Projeté": "#F5B942", "Flux seul": "#8A8F98"},
+    labels={"capacite": "Capacité d'investissement (€)", "mois": "Mois", "source": ""},
+)
+fig_cap.add_hline(y=0, line_dash="dash", line_color="gray")
+fig_cap.update_layout(margin=dict(t=10, b=0, l=0, r=0))
+st.plotly_chart(fig_cap, use_container_width=True)
+
+euro = lambda label: st.column_config.NumberColumn(label, format="%.2f €")
+st.dataframe(
+    capacity_df[["mois", "epargne_depart", "salaire", "fixes", "ponctuelles", "flux", "capacite", "source", "ecart"]],
+    column_config={
+        "mois": "Mois",
+        "epargne_depart": euro("Épargne de départ"),
+        "salaire": euro("Salaire"),
+        "fixes": euro("Fixes"),
+        "ponctuelles": euro("Ponctuelles"),
+        "flux": euro("Flux du mois"),
+        "capacite": euro("Capacité d'investissement"),
+        "source": "Source",
+        "ecart": euro("Écart réel vs estimé"),
+    },
+    hide_index=True,
+    use_container_width=True,
+)

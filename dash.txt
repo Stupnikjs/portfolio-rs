@@ -11,7 +11,7 @@ from __future__ import annotations
 import streamlit as st
 
 from theme import apply_theme
-from data import load_data, build_assets_df
+from data import load_data, build_assets_df, compute_kpis
 from charts import render_kpis, render_allocation_and_pnl, render_positions_table
 from correlation import render_correlation_section
 
@@ -19,8 +19,10 @@ apply_theme()  # doit être appelé avant tout autre st.* ou px.*
 
 data = load_data()
 df = build_assets_df(data)
+kpis = compute_kpis(df, realized_pnl_eur=data.get("realized_pnl_eur", 0.0))
 
-render_kpis(data)
+render_kpis(kpis)
+
 st.divider()
 
 render_allocation_and_pnl(df)
@@ -90,20 +92,25 @@ from data import format_display_df
 from theme import GAIN_COLOR, LOSS_COLOR
 
 
-def render_kpis(data: dict) -> None:
+def render_kpis(kpis: dict) -> None:
     st.title("📈 Mon Portefeuille")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Valeur Totale", f"{data['total_value_eur']:,.2f} €")
-    col2.metric("Cost Basis", f"{data['total_cost_basis_eur']:,.2f} €")
-    col3.metric("P&L Latent Total", f"{data['total_pnl_eur']:,.2f} €")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Valeur Totale", f"{kpis['total_value_eur']:,.2f} €")
+    col2.metric("Cost Basis", f"{kpis['total_cost_basis_eur']:,.2f} €")
+    col3.metric("P&L Latent", f"{kpis['total_pnl_latent_eur']:,.2f} €")
+    col4.metric("P&L Réalisé", f"{kpis['total_pnl_realized_eur']:,.2f} €")
+    col5.metric(
+        "P&L Total",
+        f"{kpis['total_pnl_eur']:,.2f} €",
+        help="Latent + réalisé",
+    )
 
     pnl_pct_global = (
-        data["total_pnl_eur"] / data["total_cost_basis_eur"] * 100
-        if data["total_cost_basis_eur"] > 0 else 0
+        kpis["total_pnl_eur"] / kpis["total_cost_basis_eur"] * 100
+        if kpis["total_cost_basis_eur"] > 0 else 0
     )
-    col4.metric("Performance Globale", f"{pnl_pct_global:+.2f} %")
-
+    st.metric("Performance Globale", f"{pnl_pct_global:+.2f} %")
 
 def render_allocation_and_pnl(df: pd.DataFrame) -> None:
     col_left, col_right = st.columns(2)
@@ -656,6 +663,25 @@ import streamlit as st
 from config import DATA_PATH
 
 
+CASH_KIND = "Cash"  # ajuste si besoin
+
+def compute_kpis(df: pd.DataFrame, realized_pnl_eur: float = 0.0, exclude_cash: bool = True) -> dict:
+    """Recalcule les totaux globaux à partir du df (cash exclu par défaut),
+    et ajoute le P&L réalisé (positions déjà clôturées, hors df puisque
+    ce ne sont plus des positions ouvertes)."""
+    scope = df[df["kind"] != CASH_KIND] if exclude_cash else df
+    total_value = float(scope["value_eur"].sum())
+    total_cost = float(scope["cost_basis_eur"].sum())
+    total_pnl_latent = float(scope["pnl_eur"].sum())
+
+    return {
+        "total_value_eur": total_value,
+        "total_cost_basis_eur": total_cost,
+        "total_pnl_latent_eur": total_pnl_latent,
+        "total_pnl_realized_eur": realized_pnl_eur,
+        "total_pnl_eur": total_pnl_latent + realized_pnl_eur,  # total global
+    }
+
 def load_data(path: Path = DATA_PATH) -> dict:
     """Charge le JSON du pipeline Rust. Arrête l'app proprement s'il est absent."""
     if not path.exists():
@@ -851,7 +877,7 @@ if not edited_ponctuelles.empty:
     )
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
     fig.update_layout(margin=dict(t=10, b=0, l=0, r=0))
-    st.plotly_chart(fig, use_container_width=True)
+
 
     st.dataframe(
         monthly_ponctuelles.rename(columns={
@@ -866,21 +892,25 @@ else:
     st.info("Aucune dépense ponctuelle enregistrée -- la capacité réelle correspond à la capacité théorique chaque mois.")
 
 st.divider()
-
-# --- Solde réel du compte (vérité terrain, saisie manuelle mensuelle) ---
+# --- Solde réel du compte (vérité terrain, checkpoint à date libre) ---
 st.subheader("🏦 Solde réel du compte")
-st.caption("Saisi à la main chaque mois -- sert à corriger l'estimation ci-dessus, qui repose sur des dépenses approximatives.")
-
+st.caption(
+    "Ajoute un checkpoint quand tu veux -- pas forcément un par mois. "
+    "Sert à corriger l'estimation ci-dessus, qui repose sur des dépenses approximatives."
+)
+ 
 df_soldes = (
     pd.DataFrame(cash_data["soldes_reels"])
     if cash_data["soldes_reels"]
-    else pd.DataFrame(columns=["mois", "solde"])
+    else pd.DataFrame(columns=["date", "solde"])
 )
-
+if not df_soldes.empty:
+    df_soldes["date"] = pd.to_datetime(df_soldes["date"]).dt.date
+ 
 edited_soldes = st.data_editor(
     df_soldes,
     column_config={
-        "mois": st.column_config.TextColumn("Mois (YYYY-MM)", help="Ex: 2026-09"),
+        "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY", default=date.today()),
         "solde": st.column_config.NumberColumn("Solde réel (€)", step=10.0, format="%.2f €"),
     },
     hide_index=True,
@@ -888,20 +918,38 @@ edited_soldes = st.data_editor(
     use_container_width=True,
     key="soldes_editor",
 )
-
+ 
 if not edited_soldes.equals(df_soldes):
-    to_save = edited_soldes.dropna(subset=["mois"]).sort_values("mois")
+    to_save = edited_soldes.dropna(subset=["date"]).copy()
+    to_save["date"] = to_save["date"].apply(lambda d: d.isoformat() if not isinstance(d, str) else d)
+    to_save = to_save.sort_values("date")
     cash_data["soldes_reels"] = to_save.to_dict("records")
     save_cash_data(cash_data)
     st.rerun()
-
-# --- Comparaison estimé vs réel ---
-if len(edited_soldes) >= 2:
+ 
+# --- Évolution du solde réel (tous les checkpoints, granularité libre) ---
+soldes_sorted = edited_soldes.dropna(subset=["date", "solde"]).sort_values("date").reset_index(drop=True)
+if not soldes_sorted.empty:
+    soldes_sorted["date"] = pd.to_datetime(soldes_sorted["date"])
+ 
+if len(soldes_sorted) >= 2:
+    fig_solde = px.line(
+        soldes_sorted, x="date", y="solde", markers=True,
+        labels={"solde": "Solde réel (€)", "date": "Date"},
+    )
+    fig_solde.update_layout(margin=dict(t=10, b=0, l=0, r=0))
+   
+ 
+# --- Comparaison estimé vs réel (resamplée au mois, quelle que soit la
+#     fréquence des checkpoints -- on garde le dernier checkpoint de
+#     chaque mois comme valeur de fin de mois) ---
+if len(soldes_sorted) >= 2:
     st.subheader("Écart estimé vs réel")
-
-    soldes_sorted = edited_soldes.dropna(subset=["mois", "solde"]).sort_values("mois").reset_index(drop=True)
-    soldes_sorted["variation_reelle"] = soldes_sorted["solde"].diff()
-
+ 
+    soldes_sorted["mois"] = soldes_sorted["date"].dt.to_period("M").astype(str)
+    monthly_soldes = soldes_sorted.groupby("mois", as_index=False).last()
+    monthly_soldes["variation_reelle"] = monthly_soldes["solde"].diff()
+ 
     if not edited_ponctuelles.empty:
         df_pct = edited_ponctuelles.copy()
         df_pct["date"] = pd.to_datetime(df_pct["date"])
@@ -909,16 +957,16 @@ if len(edited_soldes) >= 2:
         ponctuelles_par_mois = df_pct.groupby("mois")["montant"].sum()
     else:
         ponctuelles_par_mois = pd.Series(dtype=float)
-
-    soldes_sorted["capacite_theorique_du_mois"] = soldes_sorted["mois"].apply(
+ 
+    monthly_soldes["capacite_theorique_du_mois"] = monthly_soldes["mois"].apply(
         lambda m: capacite_theorique - ponctuelles_par_mois.get(m, 0.0)
     )
-    soldes_sorted["ecart"] = soldes_sorted["variation_reelle"] - soldes_sorted["capacite_theorique_du_mois"]
-
-    comparison = soldes_sorted.dropna(subset=["variation_reelle"])[
+    monthly_soldes["ecart"] = monthly_soldes["variation_reelle"] - monthly_soldes["capacite_theorique_du_mois"]
+ 
+    comparison = monthly_soldes.dropna(subset=["variation_reelle"])[
         ["mois", "solde", "variation_reelle", "capacite_theorique_du_mois", "ecart"]
     ]
-
+ 
     st.dataframe(
         comparison.rename(columns={
             "mois": "Mois",
@@ -930,20 +978,13 @@ if len(edited_soldes) >= 2:
         use_container_width=True,
         hide_index=True,
     )
-
-    fig_ecart = px.bar(
-        comparison,
-        x="mois",
-        y=["variation_reelle", "capacite_theorique_du_mois"],
-        barmode="group",
-        labels={"value": "Montant (€)", "mois": "Mois", "variable": ""},
-    )
-    fig_ecart.update_layout(margin=dict(t=10, b=0, l=0, r=0), legend_title_text="")
-    st.plotly_chart(fig_ecart, use_container_width=True)
-elif len(edited_soldes) == 1:
-    st.info("Ajoute le solde d'au moins un deuxième mois pour voir la variation réelle et la comparer à l'estimation.")
+ 
+    
+elif len(soldes_sorted) == 1:
+    st.info("Ajoute un deuxième checkpoint pour voir la variation réelle et la comparer à l'estimation.")
 else:
     st.info("Aucun solde réel enregistré pour le moment.")
+ 
 
 ################################################################################
 # Dossier : dashboard
