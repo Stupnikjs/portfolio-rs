@@ -116,6 +116,7 @@ pub struct DashboardData {
     pub total_value_eur: f64,
     pub total_cost_basis_eur: f64,
     pub total_pnl_eur: f64,
+    pub realized_pnl_eur: f64,          // <-- nouveau
     pub assets: Vec<DashboardAsset>,
     pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
 }

@@ -226,6 +226,7 @@ fn main() -> Result<()> {
         total_value_eur: snapshot.total_value_eur,
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
+        realized_pnl_eur: total_realized_pnl_stocks,   // <-- nouveau
         assets: dashboard_assets,
         correlation_matrices,
     };

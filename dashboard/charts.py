@@ -9,20 +9,25 @@ from data import format_display_df
 from theme import GAIN_COLOR, LOSS_COLOR
 
 
-def render_kpis(data: dict) -> None:
+def render_kpis(kpis: dict) -> None:
     st.title("📈 Mon Portefeuille")
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Valeur Totale", f"{data['total_value_eur']:,.2f} €")
-    col2.metric("Cost Basis", f"{data['total_cost_basis_eur']:,.2f} €")
-    col3.metric("P&L Latent Total", f"{data['total_pnl_eur']:,.2f} €")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Valeur Totale", f"{kpis['total_value_eur']:,.2f} €")
+    col2.metric("Cost Basis", f"{kpis['total_cost_basis_eur']:,.2f} €")
+    col3.metric("P&L Latent", f"{kpis['total_pnl_latent_eur']:,.2f} €")
+    col4.metric("P&L Réalisé", f"{kpis['total_pnl_realized_eur']:,.2f} €")
+    col5.metric(
+        "P&L Total",
+        f"{kpis['total_pnl_eur']:,.2f} €",
+        help="Latent + réalisé",
+    )
 
     pnl_pct_global = (
-        data["total_pnl_eur"] / data["total_cost_basis_eur"] * 100
-        if data["total_cost_basis_eur"] > 0 else 0
+        kpis["total_pnl_eur"] / kpis["total_cost_basis_eur"] * 100
+        if kpis["total_cost_basis_eur"] > 0 else 0
     )
-    col4.metric("Performance Globale", f"{pnl_pct_global:+.2f} %")
-
+    st.metric("Performance Globale", f"{pnl_pct_global:+.2f} %")
 
 def render_allocation_and_pnl(df: pd.DataFrame) -> None:
     col_left, col_right = st.columns(2)
