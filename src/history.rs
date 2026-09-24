@@ -34,7 +34,7 @@ pub struct WeeklyHistoryEntry {
 }
 
 /// Dimanche de la semaine ISO contenant `date` (lundi = début de semaine).
-fn week_end(date: NaiveDate) -> NaiveDate {
+pub fn week_end(date: NaiveDate) -> NaiveDate {
     let offset = (Weekday::Sun.num_days_from_monday() as i64
         - date.weekday().num_days_from_monday() as i64
         + 7)

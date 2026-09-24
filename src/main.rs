@@ -19,7 +19,7 @@ use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
 use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
-use portfolio_rs::watchlist::write_watchlist; 
+use portfolio_rs::trades::{build_trade_frequency, build_trades};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -228,14 +228,15 @@ fn main() -> Result<()> {
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
         realized_pnl_eur: total_realized_pnl_stocks,   // <-- nouveau
+        trades: build_trades(&tx_store),
+        trade_frequency: build_trade_frequency(&tx_store),
         assets: dashboard_assets,
         correlation_matrices,
     };
-
-    let watch_list_path = PathBuf::from("./data/watchlist.txt");  
+ 
     let dashboard_path = PathBuf::from("./data/dashboard.json");
 
-    write_watchlist(&dashboard_data, &watch_list_path)?; 
+
     std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
     println!("Dashboard écrit : {dashboard_path:?}");
 
