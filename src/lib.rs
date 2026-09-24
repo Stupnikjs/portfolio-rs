@@ -4,3 +4,4 @@ pub mod ledger;
 pub mod market;
 pub mod parse;
 pub mod history;
+pub mod watchlist;
