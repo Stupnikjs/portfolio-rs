@@ -8,7 +8,9 @@
 """
 from __future__ import annotations
 
-import pandas as pd
+import json
+from pathlib import Path
+
 import streamlit as st
 
 from assets_data import (
@@ -33,6 +35,97 @@ def render_assets_section(assets_data: dict) -> None:
     _render_add_form(assets_data)
 
 
+# --- Carte par actif --------------------------------------------------------
+
+def _load_thesis(analysis_path: str) -> tuple[dict | None, str | None]:
+    """Charge la thèse pointée par analysis_path. Renvoie (json_dict, None)
+    si un .json structuré (généré par md_to_thesis_json.py) est trouvé --
+    soit directement, soit à côté d'un .md de même nom -- sinon
+    (None, texte_markdown_brut), sinon (None, None) si rien n'est lisible."""
+    if not analysis_path:
+        return None, None
+    path = Path(analysis_path)
+
+    json_path = path if path.suffix == ".json" else path.with_suffix(".json")
+    if json_path.exists():
+        try:
+            return json.loads(json_path.read_text(encoding="utf-8")), None
+        except Exception:
+            pass
+
+    if path.exists():
+        try:
+            return None, path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    return None, None
+
+
+def _render_thesis_json(thesis: dict) -> None:
+    donnees = thesis.get("donnees_financieres") or {}
+    if donnees:
+        st.markdown("**Données financières**")
+        st.markdown(" · ".join(f"{k} : {v}" for k, v in donnees.items() if v is not None))
+
+    avis = thesis.get("avis_analystes") or {}
+    if avis:
+        bits = []
+        if avis.get("recommandation"):
+            bits.append(f"**{avis['recommandation']}**")
+        if avis.get("nb_analystes"):
+            bits.append(f"{avis['nb_analystes']} analystes")
+        if avis.get("objectif_cours") is not None:
+            bit = f"objectif {avis['objectif_cours']:,.2f}"
+            if avis.get("potentiel_pct") is not None:
+                bit += f" ({avis['potentiel_pct']:+.1f} %)"
+            bits.append(bit)
+        if bits:
+            st.markdown("**Avis analystes**")
+            st.markdown(" · ".join(bits))
+
+    if thesis.get("thesis"):
+        st.markdown("**Thèse**")
+        st.markdown(thesis["thesis"])
+
+    if thesis.get("invalidation_scenario"):
+        st.markdown("**🚩 Scénario d'invalidation**")
+        st.markdown(thesis["invalidation_scenario"])
+
+
+def _render_asset_card(a: Asset, price: float | None, montant: float | None = None) -> None:
+    """Une carte par actif : nom/ticker, prix bien visible, éventuellement
+    le montant DCA/mois, et la thèse d'investissement dépliable."""
+    with st.container(border=True):
+        col_head, col_price = st.columns([3, 1])
+        with col_head:
+            st.markdown(f"**{a.name}** · `{a.ticker}`")
+            if montant is not None:
+                st.caption(f"{a.quantite_dca_mensuelle:g} / mois ≈ {montant:,.2f} €/mois")
+            elif a.in_dca:
+                st.caption(f"{a.quantite_dca_mensuelle:g} / mois -- montant non estimable")
+        with col_price:
+            if price is not None:
+                st.markdown(f"### {price:,.2f} €")
+            else:
+                st.markdown("### —")
+                st.caption("prix indisponible")
+
+        thesis_json, thesis_md = _load_thesis(a.analysis_path)
+        label = "📄 Thèse d'investissement"
+        if a.last_analysis_update:
+            label += f" (màj {a.last_analysis_update})"
+        with st.expander(label, expanded=False):
+            if thesis_json:
+                _render_thesis_json(thesis_json)
+            elif thesis_md:
+                st.markdown(thesis_md)
+            elif a.analysis_path:
+                st.caption(f"Fichier introuvable : {a.analysis_path}")
+            else:
+                st.caption("Aucune note d'analyse renseignée.")
+
+
 # --- DCA actif ----------------------------------------------------------------
 
 def _render_dca_section(assets_data: dict) -> None:
@@ -43,34 +136,19 @@ def _render_dca_section(assets_data: dict) -> None:
         st.info("Aucun actif en DCA pour l'instant.")
         return
 
-    rows = []
+    priced = []
     for a in dca_assets:
         price = get_price_eur(a.ticker)
         montant = a.quantite_dca_mensuelle * price if price is not None else None
-        rows.append({
-            "Nom": a.name,
-            "Ticker": a.ticker,
-            "Quantité / mois": a.quantite_dca_mensuelle,
-            "Prix actuel (€)": price,
-            "Montant DCA / mois (€)": montant,
-            "Dernière analyse": a.last_analysis_update or "—",
-        })
-    df = pd.DataFrame(rows)
+        priced.append((a, price, montant))
 
-    total = df["Montant DCA / mois (€)"].sum(skipna=True)
-    if df["Montant DCA / mois (€)"].isna().any():
+    total = sum(m for _, _, m in priced if m is not None)
+    if any(m is None for _, _, m in priced):
         st.caption("⚠️ Prix indisponible pour au moins un actif -- total calculé hors actifs concernés.")
     st.metric("Total DCA mensuel", f"{total:,.0f} €")
 
-    disp = df.copy()
-    disp["Quantité / mois"] = disp["Quantité / mois"].apply(lambda x: f"{x:g}")
-    disp["Prix actuel (€)"] = disp["Prix actuel (€)"].apply(
-        lambda x: f"{x:,.2f} €" if pd.notna(x) else "indisponible"
-    )
-    disp["Montant DCA / mois (€)"] = disp["Montant DCA / mois (€)"].apply(
-        lambda x: f"{x:,.2f} €" if pd.notna(x) else "indisponible"
-    )
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+    for a, price, montant in priced:
+        _render_asset_card(a, price, montant)
 
     with st.expander("Gérer les positions DCA"):
         ticker = st.selectbox("Actif", options=[a.ticker for a in dca_assets], key="dca_manage_select")
@@ -109,21 +187,9 @@ def _render_watchlist_section(assets_data: dict) -> None:
         st.caption("Aucun candidat en watchlist.")
         return
 
-    rows = []
     for a in candidates:
         price = get_price_eur(a.ticker)
-        rows.append({
-            "Nom": a.name,
-            "Ticker": a.ticker,
-            "Prix actuel (€)": price,
-            "Analyse": a.analysis_path or "—",
-            "Dernière analyse": a.last_analysis_update or "—",
-        })
-    disp = pd.DataFrame(rows)
-    disp["Prix actuel (€)"] = disp["Prix actuel (€)"].apply(
-        lambda x: f"{x:,.2f} €" if pd.notna(x) else "indisponible"
-    )
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+        _render_asset_card(a, price)
 
     with st.expander("Promouvoir un candidat vers le DCA"):
         ticker = st.selectbox("Candidat", options=[a.ticker for a in candidates], key="watchlist_promote_select")
