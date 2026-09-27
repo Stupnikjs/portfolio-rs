@@ -36,6 +36,342 @@ render_correlation_section(df, data)
 
 ################################################################################
 # Dossier : dashboard
+# Fichier : assets_data.py
+# Chemin relatif : assets_data.py
+################################################################################
+
+"""Modèle Asset : un actif suivi (en DCA actif ou en watchlist), avec son
+analyse associée. Persistant dans data/assets.json -- séparé de
+dashboard.json (pipeline Rust, lecture seule)."""
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import streamlit as st
+import yfinance as yf
+
+from config import ROOT_DIR
+
+ASSETS_PATH = ROOT_DIR / "data" / "assets.json"
+
+
+@dataclass
+class Asset:
+    name: str
+    ticker: str
+    in_dca: bool
+    analysis_path: str = ""            # chemin vers la note d'analyse (markdown, etc.)
+    last_analysis_update: str = ""     # "YYYY-MM-DD"
+    montant_dca_mensuel: float = 0.0   # n'a de sens que si in_dca=True
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(d: dict) -> "Asset":
+        return Asset(**{k: d.get(k, Asset.__dataclass_fields__[k].default) for k in Asset.__dataclass_fields__})
+
+
+DEFAULT_ASSETS_DATA = {"assets": []}
+
+
+# --- Chargement / sauvegarde -------------------------------------------------
+
+def load_assets_data(path: Path = ASSETS_PATH) -> dict:
+    if not path.exists():
+        return {"assets": []}
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    raw.setdefault("assets", [])
+    return raw
+
+
+def save_assets_data(data: dict, path: Path = ASSETS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# --- Accès aux objets Asset ---------------------------------------------------
+
+def _assets(data: dict) -> list[Asset]:
+    return [Asset.from_dict(a) for a in data["assets"]]
+
+
+def _find(data: dict, ticker: str) -> dict | None:
+    for a in data["assets"]:
+        if a["ticker"] == ticker:
+            return a
+    return None
+
+
+def add_asset(data: dict, asset: Asset) -> None:
+    if _find(data, asset.ticker) is not None:
+        raise ValueError(f"{asset.ticker} existe déjà.")
+    data["assets"].append(asset.to_dict())
+
+
+def update_asset(data: dict, ticker: str, **changes) -> None:
+    raw = _find(data, ticker)
+    if raw is None:
+        raise ValueError(f"{ticker} introuvable.")
+    allowed = set(Asset.__dataclass_fields__) - {"ticker"}
+    unknown = set(changes) - allowed
+    if unknown:
+        raise ValueError(f"Champs inconnus : {unknown}")
+    raw.update(changes)
+
+
+def remove_asset(data: dict, ticker: str) -> None:
+    data["assets"] = [a for a in data["assets"] if a["ticker"] != ticker]
+
+
+def promote_to_dca(data: dict, ticker: str, montant_dca_mensuel: float) -> None:
+    """Passe un candidat de la watchlist au panier DCA actif."""
+    update_asset(data, ticker, in_dca=True, montant_dca_mensuel=montant_dca_mensuel)
+
+
+def demote_to_watchlist(data: dict, ticker: str) -> None:
+    """Sort un actif du DCA sans le supprimer -- il redevient un candidat suivi."""
+    update_asset(data, ticker, in_dca=False, montant_dca_mensuel=0.0)
+
+
+def get_dca_assets(data: dict) -> list[Asset]:
+    return [a for a in _assets(data) if a.in_dca]
+
+
+def get_watchlist_assets(data: dict) -> list[Asset]:
+    return [a for a in _assets(data) if not a.in_dca]
+
+
+def sync_watchlist_with_portfolio(data: dict, portfolio_df, ticker_resolver=None) -> int:
+    """Ajoute automatiquement en watchlist tout actif détenu dans le
+    portefeuille (df issu de build_assets_df) mais absent de assets.json.
+    Ne touche jamais aux actifs déjà présents -- statut DCA, montant,
+    analyse restent tels quels, y compris si l'actif a été vendu depuis.
+    `ticker_resolver` (ex. data.yfinance_ticker_for) convertit le symbole
+    du portefeuille en ticker yfinance si les deux diffèrent.
+    Renvoie le nombre d'actifs ajoutés."""
+    if portfolio_df is None or portfolio_df.empty:
+        return 0
+
+    existing_tickers = {a["ticker"] for a in data["assets"]}
+    added = 0
+    for symbol in portfolio_df["symbol"]:
+        ticker = ticker_resolver(symbol) if ticker_resolver else symbol
+        if ticker in existing_tickers:
+            continue
+        add_asset(data, Asset(name=symbol, ticker=ticker, in_dca=False))
+        existing_tickers.add(ticker)
+        added += 1
+    return added
+
+
+# --- Prix en EUR (yfinance) --------------------------------------------------
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fx_rate_to_eur(currency: str) -> float | None:
+    if currency == "EUR":
+        return 1.0
+    try:
+        hist = yf.Ticker(f"{currency}EUR=X").history(period="5d", interval="1d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_price_eur(ticker: str) -> float | None:
+    """Dernier prix connu, converti en EUR. None si indisponible."""
+    try:
+        t = yf.Ticker(ticker)
+        fast = t.fast_info
+        price = fast.get("lastPrice") if hasattr(fast, "get") else getattr(fast, "last_price", None)
+        currency = (fast.get("currency") if hasattr(fast, "get") else getattr(fast, "currency", None)) or "USD"
+        if price is None:
+            hist = t.history(period="5d", interval="1d")
+            if hist.empty:
+                return None
+            price = float(hist["Close"].iloc[-1])
+        rate = _fx_rate_to_eur(currency)
+        if rate is None:
+            return None
+        return float(price) * rate
+    except Exception:
+        return None
+
+
+################################################################################
+# Dossier : dashboard
+# Fichier : assets_view.py
+# Chemin relatif : assets_view.py
+################################################################################
+
+"""Section Streamlit Actifs : DCA actif + Watchlist. À appeler depuis app.py :
+
+    from assets_data import load_assets_data
+    from assets_view import render_assets_section
+    ...
+    assets_data_ = load_assets_data()
+    render_assets_section(assets_data_)
+"""
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from assets_data import (
+    Asset,
+    add_asset,
+    demote_to_watchlist,
+    get_dca_assets,
+    get_price_eur,
+    get_watchlist_assets,
+    promote_to_dca,
+    remove_asset,
+    save_assets_data,
+    update_asset,
+)
+
+
+def render_assets_section(assets_data: dict) -> None:
+    _render_dca_section(assets_data)
+    st.divider()
+    _render_watchlist_section(assets_data)
+    st.divider()
+    _render_add_form(assets_data)
+
+
+# --- DCA actif ----------------------------------------------------------------
+
+def _render_dca_section(assets_data: dict) -> None:
+    st.subheader("💶 DCA actif")
+    dca_assets = get_dca_assets(assets_data)
+
+    if not dca_assets:
+        st.info("Aucun actif en DCA pour l'instant.")
+        return
+
+    rows = []
+    for a in dca_assets:
+        price = get_price_eur(a.ticker)
+        rows.append({
+            "Nom": a.name,
+            "Ticker": a.ticker,
+            "Montant DCA / mois (€)": a.montant_dca_mensuel,
+            "Prix actuel (€)": price,
+            "Dernière analyse": a.last_analysis_update or "—",
+        })
+    df = pd.DataFrame(rows)
+
+    total = df["Montant DCA / mois (€)"].sum()
+    st.metric("Total DCA mensuel", f"{total:,.0f} €")
+
+    disp = df.copy()
+    disp["Montant DCA / mois (€)"] = disp["Montant DCA / mois (€)"].apply(lambda x: f"{x:,.0f} €")
+    disp["Prix actuel (€)"] = disp["Prix actuel (€)"].apply(
+        lambda x: f"{x:,.2f} €" if pd.notna(x) else "indisponible"
+    )
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    with st.expander("Gérer les positions DCA"):
+        ticker = st.selectbox("Actif", options=[a.ticker for a in dca_assets], key="dca_manage_select")
+        col1, col2 = st.columns(2)
+        new_montant = col1.number_input(
+            "Nouveau montant mensuel (€)",
+            min_value=0.0, step=10.0,
+            value=next(a.montant_dca_mensuel for a in dca_assets if a.ticker == ticker),
+            key="dca_manage_montant",
+        )
+        if col1.button("Mettre à jour le montant"):
+            update_asset(assets_data, ticker, montant_dca_mensuel=new_montant)
+            save_assets_data(assets_data)
+            st.rerun()
+        if col2.button("↩️ Repasser en watchlist"):
+            demote_to_watchlist(assets_data, ticker)
+            save_assets_data(assets_data)
+            st.rerun()
+
+
+# --- Watchlist ------------------------------------------------------------
+
+def _render_watchlist_section(assets_data: dict) -> None:
+    st.subheader("👀 Watchlist")
+    candidates = get_watchlist_assets(assets_data)
+
+    if not candidates:
+        st.caption("Aucun candidat en watchlist.")
+        return
+
+    rows = []
+    for a in candidates:
+        price = get_price_eur(a.ticker)
+        rows.append({
+            "Nom": a.name,
+            "Ticker": a.ticker,
+            "Prix actuel (€)": price,
+            "Analyse": a.analysis_path or "—",
+            "Dernière analyse": a.last_analysis_update or "—",
+        })
+    disp = pd.DataFrame(rows)
+    disp["Prix actuel (€)"] = disp["Prix actuel (€)"].apply(
+        lambda x: f"{x:,.2f} €" if pd.notna(x) else "indisponible"
+    )
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    with st.expander("Promouvoir un candidat vers le DCA"):
+        ticker = st.selectbox("Candidat", options=[a.ticker for a in candidates], key="watchlist_promote_select")
+        montant = st.number_input("Montant DCA mensuel (€)", min_value=0.0, step=10.0, key="watchlist_promote_montant")
+        col1, col2 = st.columns(2)
+        if col1.button("✅ Ajouter au DCA"):
+            promote_to_dca(assets_data, ticker, montant)
+            save_assets_data(assets_data)
+            st.rerun()
+        if col2.button("🗑️ Retirer de la watchlist"):
+            remove_asset(assets_data, ticker)
+            save_assets_data(assets_data)
+            st.rerun()
+
+
+# --- Ajout d'un nouvel actif ---------------------------------------------
+
+def _render_add_form(assets_data: dict) -> None:
+    st.markdown("##### ➕ Ajouter un actif")
+    with st.form("asset_add_form", clear_on_submit=True):
+        name = st.text_input("Nom")
+        ticker = st.text_input("Ticker (format yfinance)").strip().upper()
+        in_dca = st.radio("Destination", options=["Watchlist", "DCA actif"], horizontal=True) == "DCA actif"
+        montant = st.number_input("Montant DCA mensuel (€)", min_value=0.0, step=10.0) if in_dca else 0.0
+        analysis_path = st.text_input("Chemin de l'analyse (optionnel)")
+        last_update = st.date_input("Date de dernière analyse", value=None)
+        submitted = st.form_submit_button("Ajouter")
+
+    if submitted:
+        if not name or not ticker:
+            st.error("Nom et ticker sont obligatoires.")
+            return
+        try:
+            add_asset(assets_data, Asset(
+                name=name,
+                ticker=ticker,
+                in_dca=in_dca,
+                analysis_path=analysis_path,
+                last_analysis_update=last_update.isoformat() if last_update else "",
+                montant_dca_mensuel=montant,
+            ))
+            save_assets_data(assets_data)
+            st.success(f"{ticker} ajouté.")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+
+
+################################################################################
+# Dossier : dashboard
 # Fichier : cash_data.py
 # Chemin relatif : cash_data.py
 ################################################################################
@@ -44,6 +380,11 @@ render_correlation_section(df, data)
 ponctuelles, soldes réels de compte), persistant dans data/cash.json --
 séparé de dashboard.json qui, lui, est en lecture seule (pipeline Rust)."""
 from __future__ import annotations
+
+
+from datetime import date
+
+import pandas as pd
 
 import json
 from pathlib import Path
@@ -74,6 +415,122 @@ def save_cash_data(data: dict, path: Path = CASH_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+
+
+"""Capacité d'investissement mensuelle.
+
+Pour chaque mois M :
+
+    flux(M)      = salaire net - dépenses fixes - dépenses ponctuelles(M)
+    solde_fin(M) = dernier checkpoint réel du mois si il y en a un,
+                   sinon solde_fin(M-1) + flux(M)   (projection)
+    capacité(M)  = solde_fin(M)  = épargne de départ + flux du mois
+
+Autrement dit : ce qu'il y a sur le compte au départ + ce que le mois
+rapporte net. Un checkpoint réel « recale » la chaîne, donc l'erreur des
+dépenses approximatives ne se cumule jamais au-delà du prochain checkpoint.
+
+Conventions (identiques à celles de la page Cashflow) :
+- le dernier checkpoint d'un mois vaut solde de fin de mois ;
+- pas de lissage : une capacité nulle ou négative reste affichée telle quelle ;
+- entre deux checkpoints, la projection suppose qu'aucun investissement
+  n'est sorti du compte (le checkpoint suivant le reflétera).
+"""
+
+
+COLUMNS = [
+    "mois", "epargne_depart", "salaire", "fixes", "ponctuelles",
+    "flux", "capacite", "source", "ecart",
+]
+
+
+def _ponctuelles_par_mois(ponctuelles: pd.DataFrame | None) -> pd.Series:
+    if ponctuelles is None or ponctuelles.empty:
+        return pd.Series(dtype=float)
+    df = ponctuelles.dropna(subset=["date"]).copy()
+    df["montant"] = pd.to_numeric(df["montant"], errors="coerce").fillna(0.0)
+    df["mois"] = pd.to_datetime(df["date"]).dt.to_period("M")
+    return df.groupby("mois")["montant"].sum()
+
+
+def _checkpoints_par_mois(soldes: pd.DataFrame | None) -> pd.Series:
+    """Dernier checkpoint de chaque mois (valeur de fin de mois)."""
+    if soldes is None or soldes.empty:
+        return pd.Series(dtype=float)
+    df = soldes.dropna(subset=["date", "solde"]).copy()
+    if df.empty:
+        return pd.Series(dtype=float)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
+    df["mois"] = df["date"].dt.to_period("M")
+    return df.groupby("mois")["solde"].last().astype(float)
+
+
+def compute_monthly_capacity(
+    salaire: float,
+    total_fixes: float,
+    ponctuelles: pd.DataFrame | None,
+    soldes: pd.DataFrame | None,
+    horizon_mois: int = 3,
+    today: date | None = None,
+) -> pd.DataFrame:
+    """Une ligne par mois, du premier checkpoint jusqu'à `horizon_mois` mois
+    après le mois courant (ou uniquement à partir du mois courant s'il n'y a
+    aucun checkpoint).
+
+    Colonnes : mois, epargne_depart, salaire, fixes, ponctuelles, flux,
+    capacite, source ("Réel" | "Projeté" | "Flux seul"), ecart.
+    `ecart` = solde réel - solde estimé, uniquement pour les mois avec checkpoint
+    ayant un mois précédent connu.
+    """
+    current = pd.Timestamp(today or date.today()).to_period("M")
+    ponct = _ponctuelles_par_mois(ponctuelles)
+    checkpoints = _checkpoints_par_mois(soldes)
+
+    if checkpoints.empty:
+        start, end = current, current + horizon_mois
+    else:
+        start = checkpoints.index.min()
+        end = max(current + horizon_mois, checkpoints.index.max())
+
+    rows = []
+    prev_fin: float | None = None  # solde de fin du mois précédent (None = inconnu)
+
+    for m in pd.period_range(start, end, freq="M"):
+        depenses_ponct = float(ponct.get(m, 0.0))
+        flux = float(salaire) - float(total_fixes) - depenses_ponct
+
+        ecart = None
+        if m in checkpoints.index:
+            solde_fin = float(checkpoints[m])
+            source = "Réel"
+            if prev_fin is not None:
+                ecart = solde_fin - (prev_fin + flux)
+        elif prev_fin is not None:
+            solde_fin = prev_fin + flux
+            source = "Projeté"
+        else:  # aucun checkpoint du tout : on ne connaît que le flux
+            solde_fin = None
+            source = "Flux seul"
+
+        rows.append({
+            "mois": str(m),
+            "epargne_depart": prev_fin,
+            "salaire": float(salaire),
+            "fixes": float(total_fixes),
+            "ponctuelles": depenses_ponct,
+            "flux": flux,
+            "capacite": solde_fin if solde_fin is not None else flux,
+            "source": source,
+            "ecart": ecart,
+        })
+        prev_fin = solde_fin
+
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    df[["epargne_depart", "ecart"]] = df[["epargne_depart", "ecart"]].astype(float)  # None -> NaN
+    return df
 
 ################################################################################
 # Dossier : dashboard
@@ -731,9 +1188,9 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 ################################################################################
-# Dossier : dashboard/pages
+# Dossier : dashboard\pages
 # Fichier : 2_💰_Cashflow.py
-# Chemin relatif : pages/2_💰_Cashflow.py
+# Chemin relatif : pages\2_💰_Cashflow.py
 ################################################################################
 
 """Page 2 : cashflow personnel (salaire, dépenses fixes et ponctuelles,
@@ -750,7 +1207,7 @@ import plotly.express as px
 import plotly.io as pio
 import streamlit as st
 
-from cash_data import load_cash_data, save_cash_data
+from cash_data import load_cash_data, save_cash_data, compute_monthly_capacity
 from theme import BG_COLOR, TEXT_COLOR, GRID_COLOR
 
 # Applique uniquement le template Plotly (set_page_config est déjà géré par app.py)
@@ -844,54 +1301,6 @@ if not edited_ponctuelles.equals(df_ponctuelles):
 
 st.divider()
 
-# --- Capacité d'investissement ---
-st.subheader("📊 Capacité d'investissement")
-
-capacite_theorique = salaire - total_fixes
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Salaire net", f"{salaire:,.2f} €")
-col2.metric("Dépenses fixes", f"{total_fixes:,.2f} €")
-col3.metric(
-    "Capacité théorique",
-    f"{capacite_theorique:,.2f} €",
-    help="Salaire net - dépenses fixes. Ne tient pas compte des ponctuelles.",
-)
-
-# --- Capacité réelle par mois (brute, sans lissage) ---
-if not edited_ponctuelles.empty:
-    df_chart = edited_ponctuelles.copy()
-    df_chart["date"] = pd.to_datetime(df_chart["date"])
-    df_chart["mois"] = df_chart["date"].dt.to_period("M").astype(str)
-    monthly_ponctuelles = df_chart.groupby("mois")["montant"].sum().reset_index()
-    monthly_ponctuelles["capacite_reelle"] = capacite_theorique - monthly_ponctuelles["montant"]
-
-    st.subheader("Capacité réelle par mois")
-    st.caption("Capacité théorique - dépenses ponctuelles du mois. Aucun lissage : un mois à 0€ ou négatif reste affiché tel quel.")
-
-    fig = px.bar(
-        monthly_ponctuelles,
-        x="mois",
-        y="capacite_reelle",
-        labels={"capacite_reelle": "Capacité réelle (€)", "mois": "Mois"},
-    )
-    fig.add_hline(y=0, line_dash="dash", line_color="gray")
-    fig.update_layout(margin=dict(t=10, b=0, l=0, r=0))
-
-
-    st.dataframe(
-        monthly_ponctuelles.rename(columns={
-            "mois": "Mois",
-            "montant": "Dépenses ponctuelles (€)",
-            "capacite_reelle": "Capacité réelle (€)",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.info("Aucune dépense ponctuelle enregistrée -- la capacité réelle correspond à la capacité théorique chaque mois.")
-
-st.divider()
 # --- Solde réel du compte (vérité terrain, checkpoint à date libre) ---
 st.subheader("🏦 Solde réel du compte")
 st.caption(
@@ -938,53 +1347,71 @@ if len(soldes_sorted) >= 2:
         labels={"solde": "Solde réel (€)", "date": "Date"},
     )
     fig_solde.update_layout(margin=dict(t=10, b=0, l=0, r=0))
+    # st.plotly_chart(fig_solde, use_container_width=True)
    
  
-# --- Comparaison estimé vs réel (resamplée au mois, quelle que soit la
-#     fréquence des checkpoints -- on garde le dernier checkpoint de
-#     chaque mois comme valeur de fin de mois) ---
-if len(soldes_sorted) >= 2:
-    st.subheader("Écart estimé vs réel")
- 
-    soldes_sorted["mois"] = soldes_sorted["date"].dt.to_period("M").astype(str)
-    monthly_soldes = soldes_sorted.groupby("mois", as_index=False).last()
-    monthly_soldes["variation_reelle"] = monthly_soldes["solde"].diff()
- 
-    if not edited_ponctuelles.empty:
-        df_pct = edited_ponctuelles.copy()
-        df_pct["date"] = pd.to_datetime(df_pct["date"])
-        df_pct["mois"] = df_pct["date"].dt.to_period("M").astype(str)
-        ponctuelles_par_mois = df_pct.groupby("mois")["montant"].sum()
-    else:
-        ponctuelles_par_mois = pd.Series(dtype=float)
- 
-    monthly_soldes["capacite_theorique_du_mois"] = monthly_soldes["mois"].apply(
-        lambda m: capacite_theorique - ponctuelles_par_mois.get(m, 0.0)
-    )
-    monthly_soldes["ecart"] = monthly_soldes["variation_reelle"] - monthly_soldes["capacite_theorique_du_mois"]
- 
-    comparison = monthly_soldes.dropna(subset=["variation_reelle"])[
-        ["mois", "solde", "variation_reelle", "capacite_theorique_du_mois", "ecart"]
-    ]
- 
-    st.dataframe(
-        comparison.rename(columns={
-            "mois": "Mois",
-            "solde": "Solde réel (€)",
-            "variation_reelle": "Variation réelle (€)",
-            "capacite_theorique_du_mois": "Capacité estimée (€)",
-            "ecart": "Écart (€)",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
- 
-    
-elif len(soldes_sorted) == 1:
-    st.info("Ajoute un deuxième checkpoint pour voir la variation réelle et la comparer à l'estimation.")
-else:
-    st.info("Aucun solde réel enregistré pour le moment.")
- 
+st.divider()
+
+# --- Capacité d'investissement par mois ---
+st.subheader("📊 Capacité d'investissement")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Salaire net", f"{salaire:,.2f} €")
+col2.metric("Dépenses fixes", f"{total_fixes:,.2f} €")
+col3.metric(
+    "Flux mensuel théorique",
+    f"{salaire - total_fixes:,.2f} €",
+    help="Salaire net - dépenses fixes, avant dépenses ponctuelles.",
+)
+
+horizon = st.slider("Mois futurs à projeter", min_value=0, max_value=12, value=3)
+
+capacity_df = compute_monthly_capacity(
+    salaire=salaire,
+    total_fixes=total_fixes,
+    ponctuelles=edited_ponctuelles,
+    soldes=edited_soldes,
+    horizon_mois=horizon,
+)
+
+st.caption(
+    "Capacité = épargne de départ + salaire - dépenses fixes - ponctuelles du mois. "
+    "Un mois « Réel » reprend ton dernier checkpoint du mois (qui recale la chaîne) ; "
+    "un mois « Projeté » part du solde du mois précédent en supposant que tu n'investis rien "
+    "entre-temps. Pas de lissage : un mois négatif reste négatif."
+)
+if edited_soldes.dropna(subset=["date", "solde"]).empty:
+    st.info("Aucun checkpoint : sans solde de départ, la capacité affichée se limite au flux du mois.")
+
+fig_cap = px.bar(
+    capacity_df,
+    x="mois",
+    y="capacite",
+    color="source",
+    color_discrete_map={"Réel": "#4C9AFF", "Projeté": "#F5B942", "Flux seul": "#8A8F98"},
+    labels={"capacite": "Capacité d'investissement (€)", "mois": "Mois", "source": ""},
+)
+fig_cap.add_hline(y=0, line_dash="dash", line_color="gray")
+fig_cap.update_layout(margin=dict(t=10, b=0, l=0, r=0))
+st.plotly_chart(fig_cap, use_container_width=True)
+
+euro = lambda label: st.column_config.NumberColumn(label, format="%.2f €")
+st.dataframe(
+    capacity_df[["mois", "epargne_depart", "salaire", "fixes", "ponctuelles", "flux", "capacite", "source", "ecart"]],
+    column_config={
+        "mois": "Mois",
+        "epargne_depart": euro("Épargne de départ"),
+        "salaire": euro("Salaire"),
+        "fixes": euro("Fixes"),
+        "ponctuelles": euro("Ponctuelles"),
+        "flux": euro("Flux du mois"),
+        "capacite": euro("Capacité d'investissement"),
+        "source": "Source",
+        "ecart": euro("Écart réel vs estimé"),
+    },
+    hide_index=True,
+    use_container_width=True,
+)
 
 ################################################################################
 # Dossier : dashboard
