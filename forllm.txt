@@ -41,7 +41,7 @@ pub struct WeeklyHistoryEntry {
 }
 
 /// Dimanche de la semaine ISO contenant `date` (lundi = début de semaine).
-fn week_end(date: NaiveDate) -> NaiveDate {
+pub fn week_end(date: NaiveDate) -> NaiveDate {
     let offset = (Weekday::Sun.num_days_from_monday() as i64
         - date.weekday().num_days_from_monday() as i64
         + 7)
@@ -122,9 +122,9 @@ pub fn record_weekly_history(tx_store: &TxStore, path: &Path) -> Result<()> {
 }
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src\ledger
 # Fichier : cost_basis.rs
-# Chemin relatif : ledger/cost_basis.rs
+# Chemin relatif : ledger\cost_basis.rs
 ################################################################################
 
 //! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
@@ -354,9 +354,9 @@ pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<Cos
 
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src\ledger
 # Fichier : mod.rs
-# Chemin relatif : ledger/mod.rs
+# Chemin relatif : ledger\mod.rs
 ################################################################################
 
 pub mod positions;
@@ -365,9 +365,9 @@ pub mod portfolio;
 
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src\ledger
 # Fichier : portfolio.rs
-# Chemin relatif : ledger/portfolio.rs
+# Chemin relatif : ledger\portfolio.rs
 ################################################################################
 
 //! Portage de src/ledger/portfolio.py -- valorisation du portefeuille à
@@ -429,9 +429,9 @@ pub fn portfolio_snapshot_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> P
 
 
 ################################################################################
-# Dossier : src/ledger
+# Dossier : src\ledger
 # Fichier : positions.rs
-# Chemin relatif : ledger/positions.rs
+# Chemin relatif : ledger\positions.rs
 ################################################################################
 
 //! Portage de src/ledger/positions.py -- reconstruction des positions
@@ -512,6 +512,7 @@ pub mod ledger;
 pub mod market;
 pub mod parse;
 pub mod history;
+pub mod trades;
 
 ################################################################################
 # Dossier : src
@@ -540,6 +541,7 @@ use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
 use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
+use portfolio_rs::trades::{build_trade_frequency, build_trades};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -748,11 +750,15 @@ fn main() -> Result<()> {
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
         realized_pnl_eur: total_realized_pnl_stocks,   // <-- nouveau
+        trades: build_trades(&tx_store),
+        trade_frequency: build_trade_frequency(&tx_store),
         assets: dashboard_assets,
         correlation_matrices,
     };
-
+ 
     let dashboard_path = PathBuf::from("./data/dashboard.json");
+
+
     std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
     println!("Dashboard écrit : {dashboard_path:?}");
 
@@ -764,9 +770,9 @@ fn main() -> Result<()> {
 }
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : benchmarks.rs
-# Chemin relatif : market/benchmarks.rs
+# Chemin relatif : market\benchmarks.rs
 ################################################################################
 
 //! Indices régionaux et matières premières suivis par défaut dans la
@@ -791,9 +797,9 @@ pub const BENCHMARKS: &[(&str, &str)] = &[
 ];
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : cache.rs
-# Chemin relatif : market/cache.rs
+# Chemin relatif : market\cache.rs
 ################################################################################
 
 //! src/market/cache.rs — cache de prix persistant (bincode), par résolution
@@ -1080,9 +1086,9 @@ mod tests {
 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : correlation.rs
-# Chemin relatif : market/correlation.rs
+# Chemin relatif : market\correlation.rs
 ################################################################################
 
 //! Construit la matrice de corrélation des rendements journaliers,
@@ -1280,9 +1286,9 @@ pub fn compute_correlation_matrices(
 }
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : mod.rs
-# Chemin relatif : market/mod.rs
+# Chemin relatif : market\mod.rs
 ################################################################################
 
 pub mod prices;
@@ -1292,9 +1298,9 @@ pub mod correlation;
 mod cache; 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : prices.rs
-# Chemin relatif : market/prices.rs
+# Chemin relatif : market\prices.rs
 ################################################################################
 
 //! src/market/prices.rs — récupération de prix (Yahoo/Binance) et
@@ -1767,9 +1773,9 @@ mod tests {
 
 
 ################################################################################
-# Dossier : src/market
+# Dossier : src\market
 # Fichier : tickers.rs
-# Chemin relatif : market/tickers.rs
+# Chemin relatif : market\tickers.rs
 ################################################################################
 
 //! Portage de src/market/tickers.py -- résolution du ticker externe
@@ -1960,9 +1966,9 @@ pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : binance.rs
-# Chemin relatif : parse/binance.rs
+# Chemin relatif : parse\binance.rs
 ################################################################################
 
 //! Portage de src/parse/binance.py.
@@ -2247,9 +2253,9 @@ pub fn parse_binance_sources(accounts_path:PathBuf) -> Vec<Transaction> {
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : manual.rs
-# Chemin relatif : parse/manual.rs
+# Chemin relatif : parse\manual.rs
 ################################################################################
 
 //! Portage de src/parse/manual.py -- comble les trous non couverts par les
@@ -2330,9 +2336,9 @@ pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : mod.rs
-# Chemin relatif : parse/mod.rs
+# Chemin relatif : parse\mod.rs
 ################################################################################
 
 pub mod binance;
@@ -2341,9 +2347,9 @@ pub mod manual;
 
 
 ################################################################################
-# Dossier : src/parse
+# Dossier : src\parse
 # Fichier : xtb.rs
-# Chemin relatif : parse/xtb.rs
+# Chemin relatif : parse\xtb.rs
 ################################################################################
 
 //! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
@@ -2945,25 +2951,65 @@ pub struct DashboardData {
     pub total_value_eur: f64,
     pub total_cost_basis_eur: f64,
     pub total_pnl_eur: f64,
-    pub realized_pnl_eur: f64,          // <-- nouveau
+    pub realized_pnl_eur: f64,
+    pub trades: Vec<DashboardTrade>,
+    pub trade_frequency: TradeFrequency,          // <-- nouveau
     pub assets: Vec<DashboardAsset>,
     pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
 }
 
 
+#[derive(serde::Serialize)]
+pub struct DashboardTrade {
+    pub time: String,          // RFC3339 UTC
+    pub symbol: String,
+    pub kind: String,          // "Buy" | "Sell"
+    pub platform: String,
+    pub quantity: f64,
+    pub unit_price_eur: f64,
+    pub value_eur: f64,
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct PeriodCount {
+    pub period: String,        // "YYYY-MM" (mois) ou "YYYY-MM-DD" (dimanche de fin de semaine)
+    pub trades: u32,
+    pub buys: u32,
+    pub sells: u32,
+    pub volume_eur: f64,
+}
+
+impl PeriodCount {
+    pub fn new(period: String) -> Self {
+        Self { period, ..Default::default() }
+    }
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct TradeFrequency {
+    pub total_trades: u32,
+    pub avg_per_month: f64,
+    pub avg_per_week: f64,
+    pub by_month: Vec<PeriodCount>,
+    pub by_week: Vec<PeriodCount>,
+}
+
+
+
+
 ################################################################################
-# Dossier : src/store
+# Dossier : src\store
 # Fichier : mod.rs
-# Chemin relatif : store/mod.rs
+# Chemin relatif : store\mod.rs
 ################################################################################
 
 pub mod serialize;
 
 
 ################################################################################
-# Dossier : src/store
+# Dossier : src\store
 # Fichier : serialize.rs
-# Chemin relatif : store/serialize.rs
+# Chemin relatif : store\serialize.rs
 ################################################################################
 
 //! Portage de src/store/serialize.py : TxStore (conteneur en mémoire) +
@@ -3132,3 +3178,141 @@ pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
     fs::write(path, json).with_context(|| format!("écriture de {:?}", path))?;
     Ok(())
 }
+
+################################################################################
+# Dossier : src
+# Fichier : trades.rs
+# Chemin relatif : trades.rs
+################################################################################
+
+//! Trades passés (Buy/Sell) et leur fréquence par mois / semaine, pour
+//! dashboard.json.
+//!
+//! Un "trade" = une transaction Buy ou Sell sur un actif non-Cash.
+//! Sont donc exclus : Deposit/Withdraw (transferts, jambes cash XTB,
+//! dividendes...) et Fee.
+//!
+//! Attention : un Convert Binance produit deux transactions (Sell + Buy)
+//! et compte donc pour 2 trades -- `buys` / `sells` dans chaque période
+//! permettent de le voir.
+//!
+//! Les semaines sont identifiées par leur dimanche de fin (même clé que
+//! history.json, pratique pour joindre les deux), les mois par "YYYY-MM".
+//! Les périodes sans trade sont incluses (compteurs à 0) entre le premier
+//! trade et aujourd'hui, pour que les creux soient visibles dans un graphe.
+
+use std::collections::BTreeMap;
+
+use chrono::{Datelike, Duration, NaiveDate, SecondsFormat, Utc};
+
+use crate::history::week_end;
+use crate::schema::{
+    AssetKind, DashboardTrade, PeriodCount, TradeFrequency, Transaction, TransactionKind,
+};
+use crate::store::serialize::TxStore;
+
+fn trade_txs(tx_store: &TxStore) -> impl Iterator<Item = &Transaction> {
+    tx_store.transactions.iter().filter(|tx| {
+        matches!(tx.kind, TransactionKind::Buy | TransactionKind::Sell)
+            && tx.asset.kind != AssetKind::Cash
+    })
+}
+
+/// Liste chronologique (plus ancien -> plus récent) des trades.
+pub fn build_trades(tx_store: &TxStore) -> Vec<DashboardTrade> {
+    let mut trades: Vec<DashboardTrade> = trade_txs(tx_store)
+        .map(|tx| DashboardTrade {
+            time: tx.time.to_rfc3339_opts(SecondsFormat::Secs, true),
+            symbol: tx.asset.symbol.clone(),
+            kind: tx.kind.as_str().to_string(),
+            platform: tx.platform.as_str().to_string(),
+            quantity: tx.quantity,
+            // Dérivé de value_eur (autoritaire) : `price` peut être en
+            // devise locale (cf. cost_basis.rs).
+            unit_price_eur: if tx.quantity > 0.0 { tx.value_eur / tx.quantity } else { 0.0 },
+            value_eur: tx.value_eur,
+        })
+        .collect();
+
+    // RFC3339 UTC ("...Z", secondes) : l'ordre lexicographique = chronologique.
+    trades.sort_by(|a, b| a.time.cmp(&b.time));
+    trades
+}
+
+fn add_to_period(pc: &mut PeriodCount, is_buy: bool, value_eur: f64) {
+    pc.trades += 1;
+    if is_buy {
+        pc.buys += 1;
+    } else {
+        pc.sells += 1;
+    }
+    pc.volume_eur += value_eur;
+}
+
+/// Nombre de trades par mois et par semaine (périodes vides incluses).
+pub fn build_trade_frequency(tx_store: &TxStore) -> TradeFrequency {
+    let mut by_month: BTreeMap<(i32, u32), PeriodCount> = BTreeMap::new();
+    let mut by_week: BTreeMap<NaiveDate, PeriodCount> = BTreeMap::new();
+    let mut total_trades = 0u32;
+    let mut first: Option<NaiveDate> = None;
+
+    for tx in trade_txs(tx_store) {
+        let date = tx.time.date_naive();
+        first = Some(first.map_or(date, |f| f.min(date)));
+        let is_buy = tx.kind == TransactionKind::Buy;
+
+        let month = by_month
+            .entry((date.year(), date.month()))
+            .or_insert_with(|| PeriodCount::new(format!("{:04}-{:02}", date.year(), date.month())));
+        add_to_period(month, is_buy, tx.value_eur);
+
+        let we = week_end(date);
+        let week = by_week
+            .entry(we)
+            .or_insert_with(|| PeriodCount::new(we.format("%Y-%m-%d").to_string()));
+        add_to_period(week, is_buy, tx.value_eur);
+
+        total_trades += 1;
+    }
+
+    let Some(first) = first else {
+        return TradeFrequency::default(); // aucun trade
+    };
+    let today = Utc::now().date_naive();
+
+    // Mois vides entre le premier trade et le mois courant.
+    let (mut y, mut m) = (first.year(), first.month());
+    while (y, m) <= (today.year(), today.month()) {
+        by_month
+            .entry((y, m))
+            .or_insert_with(|| PeriodCount::new(format!("{y:04}-{m:02}")));
+        if m == 12 {
+            y += 1;
+            m = 1;
+        } else {
+            m += 1;
+        }
+    }
+
+    // Semaines vides entre la première semaine et la semaine courante.
+    let mut cursor = week_end(first);
+    let last_week = week_end(today);
+    while cursor <= last_week {
+        by_week
+            .entry(cursor)
+            .or_insert_with(|| PeriodCount::new(cursor.format("%Y-%m-%d").to_string()));
+        cursor += Duration::weeks(1);
+    }
+
+    let by_month: Vec<PeriodCount> = by_month.into_values().collect();
+    let by_week: Vec<PeriodCount> = by_week.into_values().collect();
+
+    TradeFrequency {
+        total_trades,
+        avg_per_month: total_trades as f64 / by_month.len() as f64,
+        avg_per_week: total_trades as f64 / by_week.len() as f64,
+        by_month,
+        by_week,
+    }
+}
+
