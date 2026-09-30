@@ -84,6 +84,13 @@ FINANCIAL_SCHEMA: dict[str, str] = {
     "flottant_pct": "num",
     "pe_2026": "num",
     "pe_2027": "num",
+    "pe_ttm": "num",                            # P/E trailing (12 derniers mois)
+    "ev_ebitda_ttm": "num",
+    "ev_ebitda_2026": "num",
+    "ev_ebitda_2027": "num",
+    "fcf_ttm_md": "num",                        # free cash flow, dans devise_cours
+    "fcf_2026_md": "num",
+    "fcf_2027_md": "num",
     "ev_ca_2026": "num",
     "ev_ca_2027": "num",
     "ca_2026_md": "num",
@@ -437,6 +444,7 @@ import json
 import re
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from assets_data import (
@@ -510,27 +518,130 @@ def _thesis_for(a: Asset) -> tuple[dict | None, str | None]:
     return _load_thesis(a.analysis_path)
 
 
-def _render_thesis_json(thesis: dict) -> None:
-    donnees = {k: v for k, v in (thesis.get("donnees_financieres") or {}).items() if v is not None}
-    if donnees:
-        st.markdown("**Données financières**")
-        st.markdown(" · ".join(f"{k.replace('_', ' ')} : {v}" for k, v in donnees.items()))
+_EMPTY = "—"
 
-    avis = thesis.get("avis_analystes") or {}
-    if avis:
-        bits = []
-        if avis.get("recommandation"):
-            bits.append(f"**{avis['recommandation']}**")
-        if avis.get("nb_analystes"):
-            bits.append(f"{avis['nb_analystes']} analystes")
-        if avis.get("objectif_cours") is not None:
-            bit = f"objectif {avis['objectif_cours']:,.2f}"
-            if avis.get("potentiel_pct") is not None:
-                bit += f" ({avis['potentiel_pct']:+.1f} %)"
-            bits.append(bit)
-        if bits:
-            st.markdown("**Avis analystes**")
-            st.markdown(" · ".join(bits))
+
+def _num(v, dec: int = 1, suffix: str = "", signed: bool = False) -> str:
+    """Format français : 1 234,5 — et « — » si la valeur est absente."""
+    if v is None:
+        return _EMPTY
+    if isinstance(v, str):
+        return v
+    txt = f"{v:+,.{dec}f}" if signed else f"{v:,.{dec}f}"
+    return txt.replace(",", "\u202f").replace(".", ",") + suffix
+
+
+def _table(rows: list[dict], columns: list[str]) -> None:
+    """Affiche un tableau en ignorant les lignes entièrement vides."""
+    rows = [r for r in rows if any(r[c] != _EMPTY for c in columns[1:])]
+    if rows:
+        st.dataframe(pd.DataFrame(rows, columns=columns), hide_index=True, use_container_width=True)
+
+
+def _render_financial_data(d: dict) -> None:
+    dev = d.get("devise_cours") or ""
+    md = f" Md {dev}".rstrip()
+
+    if d.get("date_donnees"):
+        st.caption(f"Données au {d['date_donnees']}")
+
+    left, right = st.columns(2)
+
+    # --- Gauche : valorisation / rentabilité cash + comptes ------------------
+    with left:
+        st.markdown("**Valorisation & rentabilité cash**")
+        cols = ["Indicateur", "12 derniers mois", "2026 (prév.)", "2027 (prév.)"]
+        cap = d.get("capitalisation_md")
+
+        def _fcf_yield(fcf):
+            return fcf / cap * 100 if fcf is not None and cap else None
+
+        def _conversion(fcf, net):
+            return fcf / net * 100 if fcf is not None and net else None
+
+        fcf = {"ttm": d.get("fcf_ttm_md"), "2026": d.get("fcf_2026_md"), "2027": d.get("fcf_2027_md")}
+        val = [
+            ("P/E", d.get("pe_ttm"), d.get("pe_2026"), d.get("pe_2027"), 1, "x"),
+            ("EV / EBITDA", d.get("ev_ebitda_ttm"), d.get("ev_ebitda_2026"), d.get("ev_ebitda_2027"), 1, "x"),
+            ("EV / CA", None, d.get("ev_ca_2026"), d.get("ev_ca_2027"), 2, "x"),
+            ("Free cash flow", fcf["ttm"], fcf["2026"], fcf["2027"], 1, md),
+            ("Rendement FCF", _fcf_yield(fcf["ttm"]), _fcf_yield(fcf["2026"]), _fcf_yield(fcf["2027"]), 1, " %"),
+            ("FCF / résultat net", None,
+             _conversion(fcf["2026"], d.get("resultat_net_2026_md")),
+             _conversion(fcf["2027"], d.get("resultat_net_2027_md")), 0, " %"),
+        ]
+        _table(
+            [{"Indicateur": lbl, cols[1]: _num(t, dec, unit), cols[2]: _num(y1, dec, unit), cols[3]: _num(y2, dec, unit)}
+             for lbl, t, y1, y2, dec, unit in val],
+            cols,
+        )
+        st.caption("Rendement FCF = free cash flow / capitalisation. Conversion = free cash flow / résultat net.")
+
+        st.markdown("**Comptes**")
+        yearly = [
+            ("Résultat net", "resultat_net_{y}_md", 1, md),
+            ("Dette nette", "endettement_net_{y}_md", 1, md),
+        ]
+        years = ("2026", "2027")
+        _table(
+            [{"Indicateur": lbl, **{y: _num(d.get(k.format(y=y)), dec, unit) for y in years}}
+             for lbl, k, dec, unit in yearly],
+            ["Indicateur", *years],
+        )
+
+    # --- Droite : performance vs pairs + profil ----------------------------
+    with right:
+        st.markdown("**Performance**")
+        perf = []
+        for lbl, k in (("1 an", "perf_1an"), ("3 ans", "perf_3ans")):
+            a, p = d.get(f"{k}_pct"), d.get(f"{k}_moyenne_pairs_pct")
+            perf.append({
+                "Période": lbl,
+                "Actif": _num(a, 1, " %", signed=True),
+                "Moy. pairs": _num(p, 1, " %", signed=True),
+                "Écart": _num(a - p, 1, " pts", signed=True) if a is not None and p is not None else _EMPTY,
+            })
+        _table(perf, ["Période", "Actif", "Moy. pairs", "Écart"])
+
+        st.markdown("**Profil**")
+        prod = d.get("produit_principal")
+        profile = [
+            ("Valeur d'entreprise", _num(d.get("valeur_entreprise_md"), 1, md)),
+            ("Flottant", _num(d.get("flottant_pct"), 1, " %")),
+            ("Produit principal", prod or _EMPTY),
+            ("… part du CA", _num(d.get("part_produit_principal_ca_pct"), 1, " %")),
+            ("… croissance dernier trim.", _num(d.get("croissance_produit_principal_dernier_trimestre_cer_pct"), 1, " %", signed=True)),
+            ("Part USD du CA", _num(d.get("part_usd_ca_pct"), 1, " %")),
+            ("Croissance CA dernier trim.", _num(d.get("croissance_ca_dernier_trimestre_cer_pct"), 1, " %", signed=True)),
+            ("Croissance BNPA dernier trim.", _num(d.get("croissance_bnpa_dernier_trimestre_cer_pct"), 1, " %", signed=True)),
+            ("Guidance croissance 2026", d.get("guidance_croissance_2026") or _EMPTY),
+        ]
+        _table([{"Indicateur": a, "Valeur": b} for a, b in profile], ["Indicateur", "Valeur"])
+
+
+def _render_analysts(avis: dict) -> None:
+    if not any(v is not None for v in avis.values()):
+        return
+    st.markdown("**Avis analystes**")
+    cols = ["Recommandation", "Objectif de cours", "Potentiel", "Nb d'analystes"]
+    _table(
+        [{
+            cols[0]: avis.get("recommandation") or _EMPTY,
+            cols[1]: _num(avis.get("objectif_cours"), 2),
+            cols[2]: _num(avis.get("potentiel_pct"), 1, " %", signed=True),
+            cols[3]: _num(avis.get("nb_analystes"), 0),
+        }],
+        cols,
+    )
+
+
+def _render_thesis_json(thesis: dict) -> None:
+    donnees = thesis.get("donnees_financieres") or {}
+    if any(v is not None for v in donnees.values()):
+        st.markdown("**Données financières**")
+        _render_financial_data(donnees)
+
+    _render_analysts(thesis.get("avis_analystes") or {})
 
     if thesis.get("thesis"):
         st.markdown("**Thèse**")
@@ -1644,9 +1755,9 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 ################################################################################
-# Dossier : dashboard\pages
+# Dossier : dashboard/pages
 # Fichier : 2_💰_Cashflow.py
-# Chemin relatif : pages\2_💰_Cashflow.py
+# Chemin relatif : pages/2_💰_Cashflow.py
 ################################################################################
 
 """Page 2 : cashflow personnel (salaire, dépenses fixes et ponctuelles,
@@ -1870,9 +1981,9 @@ st.dataframe(
 )
 
 ################################################################################
-# Dossier : dashboard\pages
+# Dossier : dashboard/pages
 # Fichier : 3_💶_DCA.py
-# Chemin relatif : pages\3_💶_DCA.py
+# Chemin relatif : pages/3_💶_DCA.py
 ################################################################################
 
 ################################################################################

@@ -44,6 +44,27 @@ def render_allocation_and_pnl(df: pd.DataFrame) -> None:
         fig_pie.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
         st.plotly_chart(fig_pie, use_container_width=True)
 
+        # --- Export CSV : ticker + % d'allocation uniquement (pas de prix) ---
+        total_value = float(df["value_eur"].sum())
+        alloc_df = (
+            df[["symbol", "value_eur"]]
+            .assign(allocation_pct=lambda d: d["value_eur"] / total_value * 100 if total_value > 0 else 0.0)
+            .drop(columns="value_eur")
+            .rename(columns={"symbol": "ticker"})
+            .sort_values("allocation_pct", ascending=False)
+            .reset_index(drop=True)
+        )
+        # Arrondi pour éviter les bruits flottants
+        alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)
+
+        st.download_button(
+            label="📥 Télécharger l'allocation (CSV)",
+            data=alloc_df.to_csv(index=False).encode("utf-8"),
+            file_name="allocation.csv",
+            mime="text/csv",
+            help="Ticker et pourcentage d'allocation uniquement — aucune donnée de prix.",
+        )
+
     with col_right:
         st.subheader("📊 P&L par Actif (EUR)")
         fig_bar = px.bar(
@@ -56,7 +77,6 @@ def render_allocation_and_pnl(df: pd.DataFrame) -> None:
         )
         fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
         st.plotly_chart(fig_bar, use_container_width=True)
-
 
 def render_positions_table(df: pd.DataFrame) -> None:
     st.subheader("📋 Détail des positions")
