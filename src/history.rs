@@ -75,6 +75,9 @@ pub fn record_weekly_history(tx_store: &TxStore, path: &Path) -> Result<()> {
 
     let mut cursor = week_end(start_date);
     let mut computed = 0;
+    
+    // 🔧 NOUVEAU : Mémoire des derniers prix valides pour pallier les bugs de l'API Yahoo
+    let mut last_known_prices: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
     while cursor <= last_complete_week_end {
         let key = cursor.format("%Y-%m-%d").to_string();
@@ -83,8 +86,25 @@ pub fn record_weekly_history(tx_store: &TxStore, path: &Path) -> Result<()> {
             // 23:59:59 UTC le dimanche, pour inclure toutes les tx du jour.
             let at = Utc.from_utc_datetime(&cursor.and_hms_opt(23, 59, 59).unwrap());
 
-            let snapshot = portfolio_snapshot_at(tx_store, Some(at));
+            let mut snapshot = portfolio_snapshot_at(tx_store, Some(at));
             let cost_basis = compute_fifo(tx_store, Some(at))?;
+            
+            // 🔧 FIX LOCAL : Si Yahoo a bugué (prix à 0.0), on utilise le dernier prix valide connu
+            let mut patched_total_value = 0.0;
+            for asset in &mut snapshot.assets {
+                if asset.price_eur <= 0.0 {
+                    if let Some(&last_price) = last_known_prices.get(&asset.symbol) {
+                        asset.price_eur = last_price;
+                        asset.value_eur = asset.quantity * last_price;
+                    }
+                } else {
+                    // Mise à jour de la mémoire si le prix est valide
+                    last_known_prices.insert(asset.symbol.clone(), asset.price_eur);
+                }
+                patched_total_value += asset.value_eur;
+            }
+            snapshot.total_value_eur = patched_total_value;
+
             let total_cost_basis_eur: f64 =
                 snapshot.assets.iter().map(|a| cost_basis.open_cost_basis(&a.symbol)).sum();
 

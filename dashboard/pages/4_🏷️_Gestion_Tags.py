@@ -80,3 +80,10 @@ if st.button("💾 Sauvegarder les tags", type="primary"):
     save_assets_data(assets_data)
     st.success("Tags sauvegardés avec succès !")
     st.rerun()
+
+# 1. Multiselect avec les tags existants
+chosen_existing = st.multiselect(
+    "Tags actuels (désélectionner pour supprimer)",  # <-- Texte plus clair
+    options=all_tags, 
+    default=[t for t in current_tags if t in all_tags]
+)

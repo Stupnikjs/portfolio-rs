@@ -4,7 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from theme import apply_theme
-from data import load_data, build_assets_df, compute_kpis, yfinance_ticker_for  # <-- Ajout de yfinance_ticker_for
+from data import load_data, build_assets_df, compute_kpis, yfinance_ticker_for,CASH_KIND  # <-- Ajout de yfinance_ticker_for
 from charts import render_kpis, render_allocation_and_pnl, render_positions_table
 from correlation import render_correlation_section
 from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio  # <-- NOUVELLE LIGNE
@@ -13,6 +13,8 @@ apply_theme()  # doit être appelé avant tout autre st.* ou px.*
 
 data = load_data()
 df = build_assets_df(data)
+df = df[~((df["kind"] == CASH_KIND) & (df["symbol"] == "EUR"))].copy()
+
 # --- SYNCHRONISATION ET FUSION DES TAGS ---
 assets_data = load_assets_data()
 
@@ -37,7 +39,6 @@ def get_tags(row):
 
 df["tags"] = df.apply(get_tags, axis=1)
 
-df["tags"] = df.apply(get_tags, axis=1)
 
 # --- NOUVEAU : TABLEAU D'AGRÉGATION GLOBAL PAR TAG ---
 # On explode les tags : si un actif a 2 tags, il compte dans les 2 lignes du tableau
@@ -82,7 +83,7 @@ if all_tags:
     if selected_tags:
         df = df[df["tags"].apply(lambda x: any(t in x for t in selected_tags))].copy()
 
-kpis = compute_kpis(df, realized_pnl_eur=data.get("realized_pnl_eur", 0.0))
+kpis = compute_kpis(df)
 
 render_kpis(kpis)
 

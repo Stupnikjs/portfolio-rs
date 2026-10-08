@@ -12,21 +12,22 @@ from config import DATA_PATH
 
 CASH_KIND = "Cash"  # ajuste si besoin
 
-def compute_kpis(df: pd.DataFrame, realized_pnl_eur: float = 0.0, exclude_cash: bool = True) -> dict:
-    """Recalcule les totaux globaux à partir du df (cash exclu par défaut),
-    et ajoute le P&L réalisé (positions déjà clôturées, hors df puisque
-    ce ne sont plus des positions ouvertes)."""
+def compute_kpis(df: pd.DataFrame, exclude_cash: bool = True) -> dict:
+    """Recalcule les totaux globaux à partir du df filtré."""
     scope = df[df["kind"] != CASH_KIND] if exclude_cash else df
     total_value = float(scope["value_eur"].sum())
     total_cost = float(scope["cost_basis_eur"].sum())
     total_pnl_latent = float(scope["pnl_eur"].sum())
+    
+    # On récupère le P&L réalisé par actif (s'il existe dans le df)
+    total_pnl_realized = float(scope["realized_pnl_eur"].sum()) if "realized_pnl_eur" in scope.columns else 0.0
 
     return {
         "total_value_eur": total_value,
         "total_cost_basis_eur": total_cost,
         "total_pnl_latent_eur": total_pnl_latent,
-        "total_pnl_realized_eur": realized_pnl_eur,
-        "total_pnl_eur": total_pnl_latent + realized_pnl_eur,  # total global
+        "total_pnl_realized_eur": total_pnl_realized,
+        "total_pnl_eur": total_pnl_latent + total_pnl_realized,
     }
 
 def load_data(path: Path = DATA_PATH) -> dict:

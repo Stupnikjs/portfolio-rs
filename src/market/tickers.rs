@@ -36,7 +36,9 @@ fn manual_ticker_overrides() -> &'static [(&'static str, &'static str)] {
     &[
         ("MSTR.US", "MSTR"),
         ("PRIM.US", "PRIM"),
-        ("XFVT.DE", "XFVT.DE"), // plusieurs classes de parts homonymes -> ambigu pour la recherche Yahoo
+        ("XFVT.DE", "XFVT.DE"),
+        ("CNYA.DE", "CNYA.L"), 
+         // plusieurs classes de parts homonymes -> ambigu pour la recherche Yahoo
     ]
 }
 

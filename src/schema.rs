@@ -109,6 +109,7 @@ pub struct DashboardAsset {
     pub cost_basis_eur: f64,
     pub pnl_eur: f64,
     pub pnl_pct: f64,
+    pub realized_pnl_eur: f64, // <-- NOUVEAU CHAMP
 }
 
 #[derive(serde::Serialize)]
