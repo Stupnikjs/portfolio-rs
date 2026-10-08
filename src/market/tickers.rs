@@ -139,13 +139,28 @@ pub fn ticker_for_stock(symbol: &str) -> Option<String> {
     }
 
     let mut yahoo_symbol_guess = symbol.clone();
+    let mut suffix_applied = false;
     for (xtb_suf, yahoo_suf) in xtb_to_yahoo_suffix() {
         if symbol.ends_with(xtb_suf) {
             yahoo_symbol_guess = format!("{}{}", &symbol[..symbol.len() - xtb_suf.len()], yahoo_suf);
+            suffix_applied = true;
             break;
         }
     }
 
+    // --- NOUVEAU : COURT-CIRCUIT DE LA RECHERCHE ---
+    // Si un suffixe XTB a été reconnu et converti (ex: .DE, .PA, .US),
+    // on peut faire confiance au résultat sans interroger l'API Search de Yahoo.
+    // L'API Search filtre mal les ETF européens (souvent classés MUTUALFUND)
+    // et les rejette, bien que le ticker soit parfaitement valide pour l'API Chart.
+    if suffix_applied {
+        let result = Some(yahoo_symbol_guess);
+        STOCK_TICKER_CACHE.lock().unwrap().insert(symbol, result.clone());
+        return result;
+    }
+
+    // On ne fait la recherche Yahoo que si le symbole n'avait pas de suffixe
+    // (ex: un ticker US brut tapé à la main, ou un cas non prévu).
     let queries: Vec<&str> = if yahoo_symbol_guess != symbol {
         vec![yahoo_symbol_guess.as_str(), symbol.as_str()]
     } else {

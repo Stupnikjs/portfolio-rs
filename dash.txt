@@ -19,7 +19,42 @@ apply_theme()  # doit être appelé avant tout autre st.* ou px.*
 
 data = load_data()
 df = build_assets_df(data)
+# --- SYNCHRONISATION ET FUSION DES TAGS ---
+assets_data = load_assets_data()
+
+def resolver(symbol):
+    row = df[df["symbol"] == symbol]
+    if not row.empty:
+        return yfinance_ticker_for(row.iloc[0])
+    return symbol
+
+added = sync_watchlist_with_portfolio(assets_data, df, ticker_resolver=resolver)
+if added > 0:
+    save_assets_data(assets_data)
+
+tag_map = {a["ticker"]: a.get("tags", []) for a in assets_data["assets"]}
+
+def get_tags(row):
+    if row.get("ticker") in tag_map:
+        return tag_map[row["ticker"]]
+    elif row.get("symbol") in tag_map:
+        return tag_map[row["symbol"]]
+    return []
+
+df["tags"] = df.apply(get_tags, axis=1)
+
+# --- FILTRAGE PAR TAGS ---
+all_tags = sorted(set(tag for tags in df["tags"] for tag in tags))
+
+if all_tags:
+    st.sidebar.subheader("🏷️ Filtrer par Tag")
+    selected_tags = st.sidebar.multiselect("Sélectionner un ou plusieurs tags", all_tags)
+    
+    if selected_tags:
+        df = df[df["tags"].apply(lambda x: any(t in x for t in selected_tags))].copy()
+
 kpis = compute_kpis(df, realized_pnl_eur=data.get("realized_pnl_eur", 0.0))
+
 
 render_kpis(kpis)
 
@@ -159,14 +194,14 @@ class Asset:
     name: str
     ticker: str
     in_dca: bool
-    analysis_path: str = ""            # chemin vers la note d'analyse (markdown, etc.)
-    last_analysis_update: str = ""     # "YYYY-MM-DD"
-    quantite_dca_mensuelle: float = 0.0  # quantité achetée par mois -- n'a de sens que si in_dca=True
-    # --- Thèse d'investissement (saisie à la main ou importée) ---
+    analysis_path: str = ""            
+    last_analysis_update: str = ""     
+    quantite_dca_mensuelle: float = 0.0
     thesis: str = ""
     invalidation_scenario: str = ""
     donnees_financieres: dict = field(default_factory=lambda: empty_block(FINANCIAL_SCHEMA))
     avis_analystes: dict = field(default_factory=lambda: empty_block(ANALYST_SCHEMA))
+    tags: list = field(default_factory=list)  # <-- Ligne obligatoire
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -2002,75 +2037,272 @@ st.dataframe(
 
 ################################################################################
 # Dossier : dashboard/pages
-# Fichier : 3_💶_DCA.py
-# Chemin relatif : pages/3_💶_DCA.py
+# Fichier : 3_📊_Activite.py
+# Chemin relatif : pages/3_📊_Activite.py
 ################################################################################
 
-################################################################################
-# Dossier : dashboard/pages
-# Fichier : 3_💶_DCA.py
-# Chemin relatif : pages/3_💶_DCA.py
-################################################################################
+"""Page 4 : activité de trading -- fréquence des achats/ventes (par mois ou
+par semaine) et historique filtrable des trades.
 
-"""Page 3 : DCA actif et Watchlist -- persistant dans data/assets.json,
-totalement indépendant du pipeline Rust (dashboard.json) et de cash.json.
-
-Réutilise telle quelle la logique déjà écrite dans assets_data.py /
-assets_view.py (montants DCA modifiables, promotion/rétrogradation
-watchlist <-> DCA, ajout d'un nouvel actif), et propose en plus un
-préchargement en un clic des actifs détenus (dashboard.json, pipeline Rust)
-absents de la watchlist."""
+Lit uniquement `trades` et `trade_frequency` dans dashboard.json (pipeline
+Rust, lecture seule). Aucune persistance propre à cette page."""
 from __future__ import annotations
 
+import pandas as pd
+import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
 
-from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio
-from assets_view import render_assets_section
-from data import CASH_KIND, build_assets_df, load_data, yfinance_ticker_for
-from theme import BG_COLOR, TEXT_COLOR, GRID_COLOR
+from data import load_data
+from theme import BG_COLOR, TEXT_COLOR, GRID_COLOR, PASTEL_DARK_SEQUENCE
 
 # Applique uniquement le template Plotly (set_page_config est déjà géré par app.py)
 if "portfolio_dark" not in pio.templates:
     pio.templates["portfolio_dark"] = dict(
         layout=dict(
             paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-            xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR)
+            xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
         )
     )
 pio.templates.default = "portfolio_dark"
 
-st.title("💶 DCA & Watchlist")
+BUY_COLOR = PASTEL_DARK_SEQUENCE[0]   # bleu
+SELL_COLOR = PASTEL_DARK_SEQUENCE[2]  # orange
+WEEKS_DEFAULT = 52
 
-assets_data_ = load_assets_data()
+st.title("📊 Activité")
 
-# --- Préchargement des actifs détenus (portefeuille Rust) dans la watchlist ---
-with st.expander("🔄 Précharger les actifs du portefeuille dans la watchlist", expanded=False):
-    st.caption(
-        "Ajoute en watchlist tout actif détenu dans dashboard.json mais absent "
-        "de assets.json. N'écrase jamais un actif déjà présent (statut DCA, "
-        "montant, analyse restent inchangés)."
-    )
-    if st.button("Précharger maintenant"):
-        portfolio_data = load_data()
-        portfolio_df = build_assets_df(portfolio_data)
-        portfolio_df = portfolio_df[portfolio_df["kind"] != CASH_KIND]
+data = load_data()
+trades = data.get("trades") or []
+freq = data.get("trade_frequency") or {}
 
-        def _resolve(symbol: str) -> str:
-            row = portfolio_df.loc[portfolio_df["symbol"] == symbol].iloc[0]
-            return yfinance_ticker_for(row)
+if not trades:
+    st.info("Aucun trade dans dashboard.json.")
+    st.stop()
 
-        added = sync_watchlist_with_portfolio(assets_data_, portfolio_df, ticker_resolver=_resolve)
-        save_assets_data(assets_data_)
-        if added:
-            st.success(f"{added} actif(s) ajouté(s) à la watchlist.")
-        else:
-            st.info("Watchlist déjà à jour, rien à ajouter.")
-        st.rerun()
+df = pd.DataFrame(trades)
+df["time"] = pd.to_datetime(df["time"], utc=True)
+df = df.sort_values("time", ascending=False).reset_index(drop=True)
+df["date"] = df["time"].dt.date
+
+# --- KPIs ---------------------------------------------------------------------
+buys_eur = float(df.loc[df["kind"] == "Buy", "value_eur"].sum())
+sells_eur = float(df.loc[df["kind"] == "Sell", "value_eur"].sum())
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Trades", f"{freq.get('total_trades', len(df)):,}")
+c2.metric("Moyenne / mois", f"{freq.get('avg_per_month', 0.0):.1f}")
+c3.metric("Moyenne / semaine", f"{freq.get('avg_per_week', 0.0):.1f}")
+c4.metric("Total acheté", f"{buys_eur:,.0f} €")
+c5.metric("Total vendu", f"{sells_eur:,.0f} €")
 
 st.divider()
 
-render_assets_section(assets_data_)
+# --- Fréquence ----------------------------------------------------------------
+st.subheader("Fréquence")
+
+granularity = st.radio("Période", ["Mois", "Semaine"], horizontal=True, label_visibility="collapsed")
+rows = freq.get("by_month" if granularity == "Mois" else "by_week") or []
+periods = pd.DataFrame(rows)
+
+if periods.empty:
+    st.info("Pas de données de fréquence.")
+else:
+    if granularity == "Semaine":
+        show_all = st.checkbox("Afficher toute la période", value=False)
+        if not show_all:
+            periods = periods.tail(WEEKS_DEFAULT)
+            st.caption(f"{WEEKS_DEFAULT} dernières semaines (la période est la fin de semaine, dimanche).")
+
+    left, right = st.columns(2)
+
+    fig_count = go.Figure()
+    fig_count.add_bar(x=periods["period"], y=periods["buys"], name="Achats", marker_color=BUY_COLOR)
+    fig_count.add_bar(x=periods["period"], y=periods["sells"], name="Ventes", marker_color=SELL_COLOR)
+    fig_count.update_layout(
+        barmode="stack", title="Nombre de trades", height=360,
+        margin=dict(l=10, r=10, t=50, b=10), xaxis=dict(type="category"),
+        legend=dict(orientation="h", y=1.1, x=0),
+    )
+    left.plotly_chart(fig_count, use_container_width=True)
+
+    fig_vol = go.Figure()
+    fig_vol.add_bar(x=periods["period"], y=periods["volume_eur"], name="Volume", marker_color=BUY_COLOR)
+    fig_vol.update_layout(
+        title="Volume échangé (€)", height=360,
+        margin=dict(l=10, r=10, t=50, b=10), xaxis=dict(type="category"),
+        yaxis=dict(ticksuffix=" €"), showlegend=False,
+    )
+    right.plotly_chart(fig_vol, use_container_width=True)
+
+st.divider()
+
+# --- Historique filtrable -------------------------------------------------------
+st.subheader("Historique")
+
+f1, f2, f3, f4 = st.columns([2, 1, 1, 2])
+symbols = f1.multiselect("Actif", sorted(df["symbol"].unique()))
+kinds = f2.multiselect("Type", sorted(df["kind"].unique()))
+platforms = f3.multiselect("Plateforme", sorted(df["platform"].unique()))
+date_range = f4.date_input("Dates", value=(df["date"].min(), df["date"].max()))
+
+mask = pd.Series(True, index=df.index)
+if symbols:
+    mask &= df["symbol"].isin(symbols)
+if kinds:
+    mask &= df["kind"].isin(kinds)
+if platforms:
+    mask &= df["platform"].isin(platforms)
+# date_input renvoie un tuple d'un élément tant que la plage n'est pas complète
+if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+    mask &= (df["date"] >= date_range[0]) & (df["date"] <= date_range[1])
+
+view = df[mask]
+
+st.caption(
+    f"{len(view)} trades — achats {view.loc[view['kind'] == 'Buy', 'value_eur'].sum():,.0f} €, "
+    f"ventes {view.loc[view['kind'] == 'Sell', 'value_eur'].sum():,.0f} €"
+)
+
+st.dataframe(
+    view[["time", "symbol", "kind", "platform", "quantity", "unit_price_eur", "value_eur"]],
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "time": st.column_config.DatetimeColumn("Date", format="DD/MM/YYYY HH:mm"),
+        "symbol": "Actif",
+        "kind": "Type",
+        "platform": "Plateforme",
+        "quantity": st.column_config.NumberColumn("Quantité", format="%.4f"),
+        "unit_price_eur": st.column_config.NumberColumn("Prix unitaire", format="%.2f €"),
+        "value_eur": st.column_config.NumberColumn("Valeur", format="%.2f €"),
+    },
+)
+
+# --- Récap par actif (sur la sélection) ----------------------------------------
+if not view.empty:
+    st.subheader("Par actif")
+    recap = (
+        view.assign(
+            achete=view["value_eur"].where(view["kind"] == "Buy", 0.0),
+            vendu=view["value_eur"].where(view["kind"] == "Sell", 0.0),
+        )
+        .groupby("symbol")
+        .agg(trades=("symbol", "size"), achete=("achete", "sum"), vendu=("vendu", "sum"), dernier=("time", "max"))
+        .sort_values("trades", ascending=False)
+        .reset_index()
+    )
+    st.dataframe(
+        recap,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "symbol": "Actif",
+            "trades": "Trades",
+            "achete": st.column_config.NumberColumn("Acheté", format="%.0f €"),
+            "vendu": st.column_config.NumberColumn("Vendu", format="%.0f €"),
+            "dernier": st.column_config.DatetimeColumn("Dernier trade", format="DD/MM/YYYY"),
+        },
+    )
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : 4_🏷️_Gestion_Tags.py
+# Chemin relatif : pages/4_🏷️_Gestion_Tags.py
+################################################################################
+
+"""Page 4 : Gestion et assignation des Tags aux actifs du portefeuille."""
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from data import load_data, build_assets_df, yfinance_ticker_for
+from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio, update_asset
+
+st.title("🏷️ Gestion des Tags")
+
+# 1. Charger les données du portefeuille (dashboard.json)
+data = load_data()
+df_portfolio = build_assets_df(data)
+
+# 2. Charger les données des actifs (où sont stockés les tags)
+assets_data = load_assets_data()
+
+# 3. Synchroniser : ajouter automatiquement les nouveaux actifs achetés
+def resolver(symbol):
+    row = df_portfolio[df_portfolio["symbol"] == symbol]
+    if not row.empty:
+        return yfinance_ticker_for(row.iloc[0])
+    return symbol
+
+added = sync_watchlist_with_portfolio(assets_data, df_portfolio, ticker_resolver=resolver)
+if added > 0:
+    save_assets_data(assets_data)
+    st.toast(f"{added} nouvel(s) actif(s) ajouté(s) pour taggage.", icon="✅")
+
+# 4. Préparer le tableau éditable
+assets_list = assets_data["assets"]
+df_tags = pd.DataFrame(assets_list)
+
+# Récupérer la liste des actifs actuellement détenus (valeur > 0)
+current_tickers = set()
+for _, row in df_portfolio.iterrows():
+    if row["value_eur"] > 0:
+        tk = row.get("ticker") or row["symbol"]
+        current_tickers.add(tk)
+
+# Marquer les actifs actuellement détenus et les mettre en haut du tableau
+df_tags["Détenu"] = df_tags["ticker"].isin(current_tickers)
+df_tags = df_tags.sort_values(by=["Détenu", "name"], ascending=[False, True])
+
+# Convertir la liste de tags en chaîne de texte (ex: "Tech, Dividende")
+df_tags["tags_str"] = df_tags["tags"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
+
+# 5. Afficher l'éditeur de données
+st.subheader("Éditeur de tags")
+st.write("Modifie directement la colonne **Tags**. Sépare tes tags par des virgules. Ex : `Tech, PEA, Dividende`")
+
+edited_df = st.data_editor(
+    df_tags[["name", "ticker", "tags_str", "Détenu"]].rename(columns={
+        "name": "Nom",
+        "ticker": "Ticker",
+        "tags_str": "Tags (séparés par une virgule)",
+        "Détenu": "Détenu"
+    }),
+    num_rows="dynamic",
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "Détenu": st.column_config.CheckboxColumn("Détenu", default=False, disabled=True)
+    }
+)
+
+# 6. Bouton de sauvegarde
+if st.button("💾 Sauvegarder les tags", type="primary"):
+    updates = 0
+    for _, row in edited_df.iterrows():
+        ticker = row["Ticker"]
+        tags_str = row["Tags (séparés par une virgule)"]
+        
+        # Convertir le texte saisi en liste propre
+        new_tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+        
+        # Mettre à jour dans assets_data si changement
+        for asset in assets_data["assets"]:
+            if asset["ticker"] == ticker:
+                if asset.get("tags", []) != new_tags:
+                    update_asset(assets_data, ticker, tags=new_tags)
+                    updates += 1
+                break
+    
+    if updates > 0:
+        save_assets_data(assets_data)
+        st.success(f"{updates} actif(s) mis à jour avec succès !")
+        st.toast("Tags sauvegardés", icon="💾")
+        st.rerun()
+    else:
+        st.info("Aucune modification à enregistrer.")
 
 ################################################################################
 # Dossier : dashboard

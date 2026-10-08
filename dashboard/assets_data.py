@@ -117,14 +117,14 @@ class Asset:
     name: str
     ticker: str
     in_dca: bool
-    analysis_path: str = ""            # chemin vers la note d'analyse (markdown, etc.)
-    last_analysis_update: str = ""     # "YYYY-MM-DD"
-    quantite_dca_mensuelle: float = 0.0  # quantité achetée par mois -- n'a de sens que si in_dca=True
-    # --- Thèse d'investissement (saisie à la main ou importée) ---
+    analysis_path: str = ""            
+    last_analysis_update: str = ""     
+    quantite_dca_mensuelle: float = 0.0
     thesis: str = ""
     invalidation_scenario: str = ""
     donnees_financieres: dict = field(default_factory=lambda: empty_block(FINANCIAL_SCHEMA))
     avis_analystes: dict = field(default_factory=lambda: empty_block(ANALYST_SCHEMA))
+    tags: list = field(default_factory=list)  # <-- Ligne obligatoire
 
     def to_dict(self) -> dict:
         return asdict(self)
