@@ -31,6 +31,7 @@ impl Resolution {
 /// True si `aligned_ts` correspond au bucket courant pour `resolution` --
 /// sert à distinguer une requête "prix maintenant" d'une requête sur une
 /// date passée (immuable).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_live_bucket(aligned_ts: i64, resolution: Resolution) -> bool {
     aligned_ts == resolution.align(Utc::now().timestamp())
 }
@@ -52,12 +53,24 @@ impl PriceCache {
         std::fs::write(path, bincode::serialize(self).expect("bincode serialize"))
     }
 
-    /// Point connu le plus proche AVANT ou égal à `ts`, sans limite d'âge.
-    /// Correct pour une requête sur une date passée (immuable). À NE PAS
-    /// utiliser pour un prix "maintenant" (voir `get_exact`) : sinon une
-    /// vieille valeur en cache est resservie indéfiniment.
+    /// Point connu le plus proche AVANT ou égal à `ts`, SANS LIMITE D'ÂGE.
+    ///
+    /// ATTENTION : ne pas utiliser pour valoriser un actif à une date. Le
+    /// cache est creux (un point par requête passée) : le point "le plus
+    /// proche avant" peut dater de plusieurs semaines/mois, et il est
+    /// resservi à la place d'un vrai appel API -> prix figés dans
+    /// history.json et value_eur Binance faux. Utiliser `get_exact` (prix)
+    /// ou `get_within` (taux de change, avec une tolérance bornée).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn get_closest(&self, symbol: &str, ts: i64) -> Option<f64> {
         self.data.get(&symbol.to_uppercase())?.range(..=ts).next_back().map(|(_, &v)| v)
+    }
+
+    /// Point connu dans la fenêtre `[ts - max_age_secs, ts]` : comme
+    /// `get_closest` mais un point plus vieux que `max_age_secs` est ignoré.
+    fn get_within(&self, symbol: &str, ts: i64, max_age_secs: i64) -> Option<f64> {
+        let lower = ts.saturating_sub(max_age_secs.max(0));
+        self.data.get(&symbol.to_uppercase())?.range(lower..=ts).next_back().map(|(_, &v)| v)
     }
 
     /// Point connu exactement au bucket `ts`. Seul moyen sûr de savoir si
@@ -106,8 +119,13 @@ impl ResolutionCache {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get_closest(&self, symbol: &str, ts: i64) -> Option<f64> {
         self.cache.lock().unwrap().get_closest(symbol, self.resolution.align(ts))
+    }
+
+    pub(crate) fn get_within(&self, symbol: &str, ts: i64, max_age_secs: i64) -> Option<f64> {
+        self.cache.lock().unwrap().get_within(symbol, self.resolution.align(ts), max_age_secs)
     }
 
     pub(crate) fn get_exact(&self, symbol: &str, ts: i64) -> Option<f64> {
@@ -229,6 +247,42 @@ mod tests {
         cache.insert("BTC", 1_800, 200.0); // 30 min plus tard, même bucket
 
         assert_eq!(cache.get_exact("BTC", 0), Some(200.0));
+    }
+
+    // --- get_within : remplace get_closest pour valoriser à une date ---
+
+    #[test]
+    fn get_within_never_serves_a_point_older_than_max_age() {
+        // Régression du bug "prix figés" : un prix connu à la semaine 1 ne
+        // doit JAMAIS être resservi pour la semaine 2 (get_closest le faisait).
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        let week1 = days(10);
+        let week2 = week1 + days(7);
+        cache.insert("BTC", week1, 100.0);
+
+        assert_eq!(cache.get_closest("BTC", week2), Some(100.0)); // le piège
+        assert_eq!(cache.get_within("BTC", week2, hours(3)), None); // corrigé
+    }
+
+    #[test]
+    fn get_within_returns_a_recent_enough_point() {
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        cache.insert("USD", hours(100), 1.1);
+
+        assert_eq!(cache.get_within("USD", hours(102), hours(3)), Some(1.1));
+        assert_eq!(cache.get_within("USD", hours(103), hours(3)), Some(1.1)); // borne incluse
+        assert_eq!(cache.get_within("USD", hours(104), hours(3)), None);
+    }
+
+    #[test]
+    fn get_within_never_returns_a_future_point_and_zero_age_is_exact() {
+        let cache = ResolutionCache::empty(Resolution::Hour);
+        cache.insert("USD", hours(10), 1.1);
+
+        assert_eq!(cache.get_within("USD", hours(5), hours(100)), None);
+        assert_eq!(cache.get_within("USD", hours(10), 0), Some(1.1));
+        assert_eq!(cache.get_within("USD", hours(11), 0), None);
+        assert_eq!(cache.get_within("USD", hours(11), -5), None); // âge négatif toléré
     }
 
     // --- is_live_bucket ---

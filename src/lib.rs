@@ -5,3 +5,6 @@ pub mod market;
 pub mod parse;
 pub mod history;
 pub mod trades;
+
+#[cfg(test)]
+mod testutil;

@@ -284,7 +284,7 @@ fn main() -> Result<()> {
                 cost_basis_eur,
                 pnl_eur,
                 pnl_pct,
-                realized_pnl_eur, // <-- On l'ajoute ici
+                realized_pnl_eur
             }
         })
         .collect();

@@ -105,6 +105,28 @@ fn closest_at_or_before(points: &[(i64, f64)], ts: i64) -> Option<f64> {
     points.iter().filter(|(t, _)| *t <= ts).max_by_key(|(t, _)| *t).map(|(_, p)| *p)
 }
 
+/// Tolérance pour réutiliser un taux de change déjà en cache pour une date
+/// passée. Les taux sont stockés heure par heure (voir `eur_rate`) : au-delà
+/// de quelques heures le point en cache n'est plus représentatif.
+const FX_CACHE_TOLERANCE_SECS: i64 = 3 * 3_600;
+
+/// Taux en cache pour `currency`. "Maintenant" : bucket courant exact.
+/// Date passée : point connu au plus `FX_CACHE_TOLERANCE_SECS` avant.
+fn lookup_fx_rate(currency: &str, aligned_ts: i64, live: bool) -> Option<f64> {
+    if live {
+        CACHE_1H.get_exact(currency, aligned_ts)
+    } else {
+        CACHE_1H.get_within(currency, aligned_ts, FX_CACHE_TOLERANCE_SECS)
+    }
+}
+
+/// Prix en cache d'un actif à l'heure `aligned_ts` : bucket EXACT seulement.
+/// Jamais un point plus ancien (sinon le premier prix connu est resservi
+/// pour toutes les dates suivantes, cf. `ResolutionCache::get_closest`).
+fn lookup_asset_price(symbol: &str, aligned_ts: i64) -> Option<f64> {
+    CACHE_1H.get_exact(symbol, aligned_ts)
+}
+
 /// Taux EUR -> `currency`, avec cache 1h + repli statique. Point d'entrée
 /// UNIQUE pour toute conversion de devise.
 pub fn eur_rate(currency: &str, ts: i64) -> f64 {
@@ -116,20 +138,23 @@ pub fn eur_rate(currency: &str, ts: i64) -> f64 {
     let aligned_ts = Resolution::Hour.align(ts);
     let live = is_live_bucket(aligned_ts, Resolution::Hour);
 
-    let cached = if live {
-        CACHE_1H.get_exact(&currency, aligned_ts)
-    } else {
-        CACHE_1H.get_closest(&currency, aligned_ts)
-    };
-    if let Some(rate) = cached {
+    if let Some(rate) = lookup_fx_rate(&currency, aligned_ts, live) {
         return rate;
     }
 
     let pair = format!("EUR{currency}=X");
-    let period1 = Utc.timestamp_opt(aligned_ts, 0).unwrap() - chrono::Duration::days(3);
-    let period2 = Utc.timestamp_opt(aligned_ts, 0).unwrap() + chrono::Duration::days(1);
+    let base = Utc.timestamp_opt(aligned_ts, 0).unwrap();
+    let period1 = base - chrono::Duration::days(3);
+    // Fenêtre élargie vers l'avant : une seule requête peuple ~8 jours de
+    // points horaires, ce qui évite un appel par point lors d'une série daily.
+    let period2 = (base + chrono::Duration::days(7)).min(Utc::now() + chrono::Duration::hours(1));
 
     if let Ok(series) = fetch_yahoo(&pair, period1.timestamp(), period2.timestamp(), "1h") {
+        for &(t, r) in &series.points {
+            if r > 0.0 {
+                CACHE_1H.insert(&currency, t, r);
+            }
+        }
         if let Some(rate) = closest_at_or_before(&series.points, aligned_ts) {
             if rate > 0.0 {
                 CACHE_1H.insert(&currency, aligned_ts, rate);
@@ -270,7 +295,6 @@ pub fn binance_daily_closes(symbol: &str, days: i64) -> Result<Vec<(chrono::Naiv
 pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, ticker: Option<&str>) -> f64 {
     let symbol = symbol.to_uppercase();
     let aligned_ts = Resolution::Hour.align(time.timestamp());
-    let live = is_live_bucket(aligned_ts, Resolution::Hour);
 
     if kind == AssetKind::Cash {
         return match symbol.as_str() {
@@ -281,15 +305,10 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
         };
     }
 
-    // "Maintenant" -> il faut un point EXACTEMENT sur le bucket courant,
-    // sinon on resservirait indéfiniment une vieille valeur (bug initial).
-    // Date passée -> immuable, le point connu le plus proche avant suffit.
-    let cached = if live {
-        CACHE_1H.get_exact(&symbol, aligned_ts)
-    } else {
-        CACHE_1H.get_closest(&symbol, aligned_ts)
-    };
-    if let Some(price) = cached {
+    // Bucket EXACT uniquement, "maintenant" comme date passée : le cache est
+    // creux, un point plus ancien n'est pas le prix à cette date (il faisait
+    // figer tous les prix après le premier connu).
+    if let Some(price) = lookup_asset_price(&symbol, aligned_ts) {
         return price;
     }
 
@@ -328,6 +347,70 @@ pub fn historical_price_eur(symbol: &str, time: DateTime<Utc>, kind: AssetKind, 
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // --- Cache : régression "prix figés" (pas de réseau) ---
+
+    fn some_hour() -> i64 {
+        1_700_000_000 - (1_700_000_000 % 3_600)
+    }
+
+    #[test]
+    fn asset_price_lookup_never_serves_a_price_from_another_hour() {
+        let sym = "TEST_FROZEN_ASSET";
+        let t1 = some_hour();
+        CACHE_1H.insert(sym, t1, 100.0);
+
+        assert_eq!(lookup_asset_price(sym, t1), Some(100.0));
+        // Une semaine plus tard : AUCUN prix (=> appel API), pas les 100.0 de t1.
+        assert_eq!(lookup_asset_price(sym, t1 + 7 * 86_400), None);
+        assert_eq!(lookup_asset_price(sym, t1 + 3_600), None);
+    }
+
+    #[test]
+    fn fx_lookup_reuses_a_nearby_rate_but_not_a_stale_one() {
+        let ccy = "TEST_FX_STALE";
+        let t1 = some_hour();
+        CACHE_1H.insert(ccy, t1, 1.10);
+
+        assert_eq!(lookup_fx_rate(ccy, t1 + 2 * 3_600, false), Some(1.10));
+        assert_eq!(lookup_fx_rate(ccy, t1 + 7 * 86_400, false), None);
+        assert_eq!(lookup_fx_rate(ccy, t1 + 30 * 86_400, false), None);
+    }
+
+    #[test]
+    fn fx_lookup_for_live_requires_the_exact_bucket() {
+        let ccy = "TEST_FX_LIVE";
+        let now = Resolution::Hour.align(Utc::now().timestamp());
+        CACHE_1H.insert(ccy, now - 3_600, 1.10);
+
+        assert_eq!(lookup_fx_rate(ccy, now, true), None); // pas de taux "frais"
+        CACHE_1H.insert(ccy, now, 1.12);
+        assert_eq!(lookup_fx_rate(ccy, now, true), Some(1.12));
+    }
+
+    #[test]
+    fn historical_price_eur_serves_cash_without_cache_or_network() {
+        let t = Utc.timestamp_opt(some_hour(), 0).unwrap();
+        assert_eq!(historical_price_eur("EUR", t, AssetKind::Cash, None), 1.0);
+        assert_eq!(historical_price_eur("EURI", t, AssetKind::Cash, None), 1.0);
+    }
+
+    #[test]
+    fn historical_price_eur_returns_the_exact_cached_price_only() {
+        // Le prix à t1 est en cache : servi. À t1 + 1 semaine il ne l'est pas ;
+        // on ne teste pas la valeur (réseau), seulement que ce n'est PAS 100.0.
+        let sym = "TEST_FROZEN_EUR_PRICE";
+        let t1 = some_hour();
+        CACHE_1H.insert(sym, t1, 100.0);
+
+        let at1 = Utc.timestamp_opt(t1, 0).unwrap();
+        assert_eq!(historical_price_eur(sym, at1, AssetKind::Stock, None), 100.0);
+
+        // Stock sans ticker : retourne 0.0 sans réseau -> prouve qu'on ne
+        // retombe plus sur le point de la semaine précédente.
+        let later = Utc.timestamp_opt(t1 + 7 * 86_400, 0).unwrap();
+        assert_eq!(historical_price_eur(sym, later, AssetKind::Stock, None), 0.0);
+    }
 
     // --- Fonctions pures : pas de réseau, testables directement ---
 
