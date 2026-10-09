@@ -4,8 +4,8 @@
 //! Ré-exécutable sans risque : le tx_store est recréé from scratch à chaque run.
 //! Le cache des prix (price_cache.bin) persiste et bloque les appels API inutiles.
 
-
-use std::path::{PathBuf};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -23,7 +23,6 @@ use portfolio_rs::trades::{build_trade_frequency, build_trades};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
-
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
 }
@@ -32,7 +31,73 @@ fn accounts_path() -> PathBuf {
     data_dir().join("accounts")
 }
 
+// --- NOUVEAU : Génération automatique des fichiers pour le LLM ---
 
+fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, extension: &str) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, files, extension)?;
+        } else if path.extension().map_or(false, |ext| ext == extension) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn generate_concatenated_txt(root_dir: &str, extension: &str, output_file: &str) -> Result<()> {
+    let mut files = Vec::new();
+    let path = Path::new(root_dir);
+    
+    if !path.exists() {
+        println!("[Omis] Dossier introuvable pour la génération : {}", root_dir);
+        return Ok(());
+    }
+
+    collect_files(path, &mut files, extension)?;
+    files.sort();
+    
+    let mut output = String::new();
+    for file_path in &files {
+        let absolute_rel_path = file_path.to_string_lossy().replace("\\", "/");
+        
+        let (dossier, chemin_relatif) = if absolute_rel_path.starts_with(&format!("{}/", root_dir)) {
+            let rel = absolute_rel_path.trim_start_matches(&format!("{}/", root_dir));
+            let d = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            let full_d = if d.is_empty() { root_dir.to_string() } else { format!("{}/{}", root_dir, d) };
+            (full_d, rel.to_string())
+        } else {
+            (absolute_rel_path.clone(), absolute_rel_path.clone())
+        };
+        
+        let fichier = file_path.file_name().unwrap().to_string_lossy();
+        
+        output.push_str("################################################################################
+");
+        output.push_str(&format!("# Dossier : {}\n", dossier));
+        output.push_str(&format!("# Fichier : {}\n", fichier));
+        output.push_str(&format!("# Chemin relatif : {}\n", chemin_relatif));
+        output.push_str("################################################################################
+
+");
+        
+        let content = fs::read_to_string(file_path)?;
+        output.push_str(&content);
+        output.push_str("
+
+");
+    }
+    
+    fs::write(output_file, output)?;
+    println!("{} généré avec succès.", output_file);
+    Ok(())
+}
+
+// ---------------------------------------------------
 
 fn main() -> Result<()> {
     println!("=== CONSTRUCTION DU WALLET ===");
@@ -208,6 +273,7 @@ fn main() -> Result<()> {
             let cost_basis_eur = cost_basis.open_cost_basis(&a.symbol);
             let pnl_eur = a.value_eur - cost_basis_eur;
             let pnl_pct = if cost_basis_eur > 0.0 { pnl_eur / cost_basis_eur * 100.0 } else { 0.0 };
+            let realized_pnl_eur = cost_basis.total_realized_pnl(Some(&a.symbol));
             DashboardAsset {
                 symbol: a.symbol.clone(),
                 kind: a.kind.as_str().to_string(),
@@ -218,6 +284,7 @@ fn main() -> Result<()> {
                 cost_basis_eur,
                 pnl_eur,
                 pnl_pct,
+                realized_pnl_eur
             }
         })
         .collect();
@@ -227,7 +294,7 @@ fn main() -> Result<()> {
         total_value_eur: snapshot.total_value_eur,
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
-        realized_pnl_eur: total_realized_pnl_stocks,   // <-- nouveau
+        realized_pnl_eur: total_realized_pnl_stocks,
         trades: build_trades(&tx_store),
         trade_frequency: build_trade_frequency(&tx_store),
         assets: dashboard_assets,
@@ -236,13 +303,16 @@ fn main() -> Result<()> {
  
     let dashboard_path = PathBuf::from("./data/dashboard.json");
 
-
     std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
     println!("Dashboard écrit : {dashboard_path:?}");
 
     // Sauvegarde atomique et définitive du cache de prix
     save_price_caches(&cache_path);
     println!("Cache des prix 1h sauvegardé : {cache_path:?}");
+
+    // --- Génération des fichiers pour le LLM ---
+    generate_concatenated_txt("src", "rs", "forllm.txt")?;
+    generate_concatenated_txt("dashboard", "py", "forllmdashboard.txt")?;
 
     Ok(())
 }
