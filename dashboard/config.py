@@ -15,6 +15,7 @@ ROOT_DIR = DASHBOARD_DIR.parent
 
 # --- Chemins ---
 DATA_PATH = ROOT_DIR / "data" / "dashboard.json"
+HISTORY_PATH = ROOT_DIR / "data" / "history.json"
 
 # --- Fenêtres de corrélation ---
 # Mapping label de fenêtre (côté Rust) -> période acceptée par yfinance
