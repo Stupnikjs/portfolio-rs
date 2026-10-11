@@ -1,138 +1,164 @@
-//! Construit la matrice de corrélation des rendements journaliers,
-//! combinant les actifs détenus (au-dessus d'un seuil de valeur) et les
-//! indices/matières premières de référence (`benchmarks.rs`), sur une
-//! fenêtre glissante de `lookback_days`.
+//! Matrice de corrélation des rendements journaliers : actifs détenus
+//! (au-dessus d'un seuil de valeur) + benchmarks (`benchmarks.rs`), sur des
+//! fenêtres glissantes (`CORRELATION_WINDOWS`).
+//!
+//! Alignement calendaire. Les marchés n'ont pas le même calendrier (crypto
+//! 7j/7, actions 5j/7, fériés propres à chaque place). Calculer les
+//! rendements de chaque série sur SES propres clôtures consécutives puis les
+//! apparier par date compare, le lundi, le rendement vendredi->lundi (3 jours)
+//! du Nasdaq au rendement dimanche->lundi (1 jour) de l'ETH : le coefficient
+//! est biaisé vers le bas. Ici, pour CHAQUE PAIRE, on ne garde que les dates
+//! communes, puis on calcule les deux rendements entre les mêmes dates
+//! consécutives.
+//!
+//! Limite restante : les clôtures n'ont pas la même heure (Binance 00:00 UTC,
+//! Nasdaq ~21:00 UTC). Pour s'en affranchir, comparer aussi des rendements
+//! hebdomadaires.
+//!
+//! Prérequis : `yahoo_daily_closes_raw` dans prices.rs (voir notes).
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::NaiveDate;
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 
-use crate::market::benchmarks::BENCHMARKS;
-use crate::market::prices::{binance_daily_closes, yahoo_daily_closes};
+use crate::market::benchmarks::{Benchmark, BENCHMARKS};
+use crate::market::prices::{binance_daily_closes, yahoo_daily_closes, yahoo_daily_closes_raw};
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
 
-/// Fenêtres calculées à chaque run. Le label est celui utilisé comme clé
-/// dans le JSON de sortie (consommé tel quel par dashboard.py).
-pub const CORRELATION_WINDOWS: &[(&str, i64)] = &[
-    ("90d", 90),
-    ("6m", 182),
-    ("1y", 365),
-];
+/// Fenêtres calculées à chaque run. Le label est la clé dans le JSON de
+/// sortie (consommé tel quel par dashboard.py).
+pub const CORRELATION_WINDOWS: &[(&str, i64)] = &[("90d", 90), ("6m", 182), ("1y", 365)];
 
+/// Nombre minimal de rendements appariés pour qu'un coefficient ait un sens.
+const MIN_PAIRED_RETURNS: usize = 5;
 
-/// Restreint une série de rendements aux dates >= aujourd'hui - window_days.
-fn windowed(returns: &BTreeMap<NaiveDate, f64>, window_days: i64) -> BTreeMap<NaiveDate, f64> {
-    let cutoff = Utc::now().date_naive() - Duration::days(window_days);
-    returns.range(cutoff..).map(|(d, v)| (*d, *v)).collect()
+type PriceSeries = BTreeMap<NaiveDate, f64>;
+
+/// label -> label -> coefficient. `None` (sérialisé en `null`) veut dire
+/// « on ne sait pas », jamais « zéro » : ne pas le convertir en 0.0 en amont.
+pub type CorrelationMatrix = HashMap<String, HashMap<String, Option<f64>>>;
+pub type CorrelationMatrices = HashMap<String, CorrelationMatrix>;
+
+fn to_series(points: Vec<(NaiveDate, f64)>) -> Option<PriceSeries> {
+    (points.len() >= 2).then(|| points.into_iter().collect())
 }
 
-/// Récupère la série de clôtures pour un actif de portefeuille selon son
-/// type. Best-effort : renvoie None si la source ne répond pas plutôt que
-/// de faire échouer tout le calcul de corrélation pour un seul actif.
-fn closes_for_portfolio_asset(symbol: &str, kind: AssetKind, ticker: Option<&str>, lookback_days: i64) -> Option<BTreeMap<NaiveDate, f64>> {
-    let series = match kind {
+/// Best-effort : `None` si la source ne répond pas, plutôt que de faire
+/// échouer toute la matrice pour un seul actif.
+fn closes_for_portfolio_asset(
+    symbol: &str,
+    kind: AssetKind,
+    ticker: Option<&str>,
+    lookback_days: i64,
+) -> Option<PriceSeries> {
+    let points = match kind {
         AssetKind::Crypto => binance_daily_closes(symbol, lookback_days).ok()?,
         AssetKind::Stock => yahoo_daily_closes(ticker?, lookback_days).ok()?,
-        AssetKind::Cash => return None, // le cash n'a pas de rendement à corréler
+        AssetKind::Cash => return None, // pas de rendement à corréler
     };
-    if series.len() < 2 {
-        return None;
-    }
-    Some(series.into_iter().collect())
+    to_series(points)
 }
 
-fn closes_for_benchmark(ticker: &str, lookback_days: i64) -> Option<BTreeMap<NaiveDate, f64>> {
-    let series = yahoo_daily_closes(ticker, lookback_days).ok()?;
-    if series.len() < 2 {
-        return None;
+fn closes_for_benchmark(bench: &Benchmark, lookback_days: i64) -> Option<PriceSeries> {
+    let points = if bench.in_eur {
+        yahoo_daily_closes(bench.ticker, lookback_days)
+    } else {
+        yahoo_daily_closes_raw(bench.ticker, lookback_days)
     }
-    Some(series.into_iter().collect())
+    .ok()?;
+    to_series(points)
 }
 
-/// Transforme une série de prix en rendements journaliers simples
-/// (r_t = p_t / p_{t-1} - 1), clé par date de fin de période.
-fn to_returns(prices: &BTreeMap<NaiveDate, f64>) -> BTreeMap<NaiveDate, f64> {
-    let mut out = BTreeMap::new();
-    let mut prev: Option<f64> = None;
-    for (date, price) in prices {
-        if let Some(prev_price) = prev {
-            if prev_price > 0.0 {
-                out.insert(*date, price / prev_price - 1.0);
+/// Rendements appariés de `a` et `b` entre dates communes consécutives,
+/// à partir de `cutoff` (inclus).
+fn paired_returns(a: &PriceSeries, b: &PriceSeries, cutoff: NaiveDate) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let mut prev: Option<(f64, f64)> = None;
+
+    for (date, &pa) in a.range(cutoff..) {
+        let Some(&pb) = b.get(date) else { continue };
+        if let Some((qa, qb)) = prev {
+            if qa > 0.0 && qb > 0.0 {
+                out.push((pa / qa - 1.0, pb / qb - 1.0));
             }
         }
-        prev = Some(*price);
+        prev = Some((pa, pb));
     }
     out
 }
 
-/// Corrélation de Pearson entre deux séries de rendements, restreinte aux
-/// dates communes aux deux. `None` si moins de 5 points communs (pas
-/// assez de signal pour qu'un coefficient veuille dire quelque chose), ou
-/// si l'une des deux séries a une variance nulle sur la fenêtre (prix figé
-/// -- souvent un symptôme de données Yahoo/Binance dégradées plutôt qu'une
-/// vraie absence de mouvement).
-///
-/// `None` ici veut dire "on ne sait pas", pas "zéro" -- à ne JAMAIS
-/// convertir en 0.0 en amont : ça rendrait indiscernables une vraie
-/// décorrélation et un simple manque de données.
-fn pearson(label_a: &str, label_b: &str, a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option<f64> {
-    let common: Vec<(f64, f64)> = a.iter().filter_map(|(date, ra)| b.get(date).map(|rb| (*ra, *rb))).collect();
-    if common.len() < 5 {
-        eprintln!(
-            "  [DEBUG corrélation] {label_a} / {label_b} : seulement {} date(s) commune(s) (< 5), coefficient = null",
-            common.len()
-        );
+/// Corrélation de Pearson d'une série de couples. `None` si pas assez de
+/// points, ou si une des deux séries a une variance nulle (prix figé :
+/// souvent un symptôme de données dégradées, pas une vraie absence de mouvement).
+fn pearson(pairs: &[(f64, f64)]) -> Option<f64> {
+    if pairs.len() < MIN_PAIRED_RETURNS {
         return None;
     }
 
-    let n = common.len() as f64;
-    let mean_a = common.iter().map(|(x, _)| x).sum::<f64>() / n;
-    let mean_b = common.iter().map(|(_, y)| y).sum::<f64>() / n;
+    let n = pairs.len() as f64;
+    let (sum_a, sum_b) = pairs.iter().fold((0.0, 0.0), |(sa, sb), &(x, y)| (sa + x, sb + y));
+    let (mean_a, mean_b) = (sum_a / n, sum_b / n);
 
-    let mut cov = 0.0;
-    let mut var_a = 0.0;
-    let mut var_b = 0.0;
-    for (x, y) in &common {
-        let dx = x - mean_a;
-        let dy = y - mean_b;
+    let (mut cov, mut var_a, mut var_b) = (0.0, 0.0, 0.0);
+    for &(x, y) in pairs {
+        let (dx, dy) = (x - mean_a, y - mean_b);
         cov += dx * dy;
         var_a += dx * dx;
         var_b += dy * dy;
     }
 
     if var_a <= 0.0 || var_b <= 0.0 {
-        eprintln!(
-            "  [DEBUG corrélation] {label_a} / {label_b} : variance nulle (var_a={var_a:.6}, var_b={var_b:.6}) sur {} points, coefficient = null",
-            common.len()
-        );
         return None;
     }
     Some(cov / (var_a.sqrt() * var_b.sqrt()))
 }
 
-/// Calcule la matrice de corrélation complète : actifs détenus dont la
-/// valeur courante dépasse `min_value_eur`, plus les benchmarks fixes.
-/// Résultat au format dict-de-dicts (label -> label -> coefficient), avec
-/// `None` (sérialisé en `null`) pour les paires où le coefficient n'a pas
-/// pu être calculé -- à ne pas confondre avec une vraie corrélation nulle.
-/// Directement sérialisable pour dashboard.json et consommable tel quel
-/// par `pd.DataFrame(...)` côté Streamlit (les `null` deviennent `NaN`).
-///
-/// Calcule les matrices de corrélation pour toutes les fenêtres de
-/// `CORRELATION_WINDOWS`, en une seule passe de fetch de prix (sur la
-/// fenêtre la plus large) pour éviter de solliciter Yahoo/Binance une
-/// fois par fenêtre.
+/// Matrice complète pour une fenêtre. Symétrique : on ne calcule que le
+/// triangle supérieur.
+fn build_matrix(series: &[(String, PriceSeries)], cutoff: NaiveDate) -> CorrelationMatrix {
+    let n = series.len();
+    let mut coeffs: Vec<Vec<Option<f64>>> = vec![vec![None; n]; n];
+
+    for i in 0..n {
+        coeffs[i][i] = Some(1.0);
+        for j in (i + 1)..n {
+            let pairs = paired_returns(&series[i].1, &series[j].1, cutoff);
+            let coeff = pearson(&pairs);
+            if coeff.is_none() {
+                eprintln!(
+                    "  [DEBUG corrélation] {} / {} : {} rendement(s) apparié(s), coefficient indéterminé",
+                    series[i].0,
+                    series[j].0,
+                    pairs.len()
+                );
+            }
+            coeffs[i][j] = coeff;
+            coeffs[j][i] = coeff;
+        }
+    }
+
+    series
+        .iter()
+        .enumerate()
+        .map(|(i, (label_a, _))| {
+            let row: HashMap<String, Option<f64>> =
+                series.iter().enumerate().map(|(j, (label_b, _))| (label_b.clone(), coeffs[i][j])).collect();
+            (label_a.clone(), row)
+        })
+        .collect()
+}
+
+/// Matrices pour toutes les fenêtres de `CORRELATION_WINDOWS`, en une seule
+/// passe de fetch de prix (sur la fenêtre la plus large).
 pub fn compute_correlation_matrices(
     tx_store: &TxStore,
     holdings: &HashMap<String, f64>,
     prices_eur: &HashMap<String, f64>,
     min_value_eur: f64,
-) -> HashMap<String, HashMap<String, HashMap<String, Option<f64>>>> {
+) -> CorrelationMatrices {
     let max_lookback = CORRELATION_WINDOWS.iter().map(|(_, d)| *d).max().unwrap_or(365);
-
-    let mut series: Vec<(String, BTreeMap<NaiveDate, f64>)> = Vec::new();
+    let mut series: Vec<(String, PriceSeries)> = Vec::new();
 
     for (symbol, quantity) in holdings {
         if *quantity <= 0.0 {
@@ -146,48 +172,92 @@ pub fn compute_correlation_matrices(
         if value_eur < min_value_eur {
             continue;
         }
-        if let Some(prices) = closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), max_lookback) {
-            series.push((symbol.clone(), prices));
-        } else {
-            eprintln!("  [WARN corrélation] historique indisponible pour {symbol}, exclu de la matrice.");
+        match closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), max_lookback) {
+            Some(prices) => series.push((symbol.clone(), prices)),
+            None => eprintln!("  [WARN corrélation] historique indisponible pour {symbol}, exclu de la matrice."),
         }
     }
 
-    for (label, ticker) in BENCHMARKS {
-        if let Some(prices) = closes_for_benchmark(ticker, max_lookback) {
-            series.push((label.to_string(), prices));
-        } else {
-            eprintln!("  [WARN corrélation] historique indisponible pour le benchmark {label} ({ticker}), exclu.");
+    for bench in BENCHMARKS {
+        match closes_for_benchmark(bench, max_lookback) {
+            Some(prices) => series.push((bench.label.to_string(), prices)),
+            None => eprintln!(
+                "  [WARN corrélation] historique indisponible pour le benchmark {} ({}), exclu.",
+                bench.label, bench.ticker
+            ),
         }
     }
 
-    // Rendements calculés une seule fois sur l'historique complet.
-    let full_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> =
-        series.into_iter().map(|(label, prices)| (label, to_returns(&prices))).collect();
+    let today = Utc::now().date_naive();
+    CORRELATION_WINDOWS
+        .iter()
+        .map(|(label, days)| (label.to_string(), build_matrix(&series, today - Duration::days(*days))))
+        .collect()
+}
 
-    let mut result: HashMap<String, HashMap<String, HashMap<String, Option<f64>>>> = HashMap::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for (window_label, window_days) in CORRELATION_WINDOWS {
-        let windowed_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> = full_returns
-            .iter()
-            .map(|(label, r)| (label.clone(), windowed(r, *window_days)))
-            .collect();
-
-        let mut matrix: HashMap<String, HashMap<String, Option<f64>>> = HashMap::new();
-        for (label_a, returns_a) in &windowed_returns {
-            let mut row = HashMap::new();
-            for (label_b, returns_b) in &windowed_returns {
-                let coeff = if label_a == label_b {
-                    Some(1.0)
-                } else {
-                    pearson(label_a, label_b, returns_a, returns_b)
-                };
-                row.insert(label_b.clone(), coeff);
-            }
-            matrix.insert(label_a.clone(), row);
-        }
-        result.insert(window_label.to_string(), matrix);
+    /// Octobre 2026 : le 9 est un vendredi.
+    fn d(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
     }
 
-    result
+    fn series(points: &[(u32, f64)]) -> PriceSeries {
+        points.iter().map(|&(day, p)| (d(day), p)).collect()
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn paired_returns_span_the_same_interval_for_both_series() {
+        // Crypto : tous les jours. Action : vendredi puis lundi seulement.
+        let crypto = series(&[(9, 100.0), (10, 110.0), (11, 120.0), (12, 130.0)]);
+        let stock = series(&[(9, 10.0), (12, 13.0)]);
+
+        let pairs = paired_returns(&crypto, &stock, d(1));
+
+        // Un seul rendement apparié, vendredi -> lundi, pour les DEUX séries.
+        assert_eq!(pairs.len(), 1);
+        assert!(approx(pairs[0].0, 0.3));
+        assert!(approx(pairs[0].1, 0.3));
+    }
+
+    #[test]
+    fn paired_returns_ignore_dates_before_the_cutoff() {
+        let a = series(&[(1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0)]);
+        assert_eq!(paired_returns(&a, &a, d(3)).len(), 1); // 3 -> 4 seulement
+    }
+
+    #[test]
+    fn pearson_of_identical_series_is_one_and_of_opposite_series_is_minus_one() {
+        let same: Vec<(f64, f64)> = (1..=10).map(|i| (i as f64 * 0.01, i as f64 * 0.01)).collect();
+        let opposite: Vec<(f64, f64)> = (1..=10).map(|i| (i as f64 * 0.01, -(i as f64) * 0.01)).collect();
+
+        assert!(approx(pearson(&same).unwrap(), 1.0));
+        assert!(approx(pearson(&opposite).unwrap(), -1.0));
+    }
+
+    #[test]
+    fn pearson_is_unknown_with_too_few_points_or_zero_variance() {
+        assert_eq!(pearson(&[(0.01, 0.02); 3]), None);
+
+        let flat: Vec<(f64, f64)> = (1..=10).map(|i| (0.0, i as f64 * 0.01)).collect();
+        assert_eq!(pearson(&flat), None);
+    }
+
+    #[test]
+    fn build_matrix_is_symmetric_with_unit_diagonal() {
+        let a = series(&[(1, 1.0), (2, 1.1), (3, 1.0), (4, 1.2), (5, 1.1), (6, 1.3), (7, 1.2)]);
+        let b = series(&[(1, 5.0), (2, 5.4), (3, 5.1), (4, 5.9), (5, 5.3), (6, 6.4), (7, 5.8)]);
+        let m = build_matrix(&[("A".to_string(), a), ("B".to_string(), b)], d(1));
+
+        assert_eq!(m["A"]["A"], Some(1.0));
+        assert_eq!(m["B"]["B"], Some(1.0));
+        assert_eq!(m["A"]["B"], m["B"]["A"]);
+        assert!(m["A"]["B"].is_some());
+    }
 }
