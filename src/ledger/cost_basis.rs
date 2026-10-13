@@ -222,3 +222,5 @@ pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<Cos
 
     Ok(CostBasisResult { open_lots, realized_gains: realized, fees_eur_by_symbol: fees })
 }
+
+

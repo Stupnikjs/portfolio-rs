@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{Duration, NaiveDate, Utc};
 
 use crate::market::benchmarks::{Benchmark, BENCHMARKS};
-use crate::market::prices::{binance_daily_closes, yahoo_daily_closes, yahoo_daily_closes_raw};
+use crate::market::prices::{binance_daily_closes, yahoo_daily_closes};
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
 
@@ -64,7 +64,7 @@ fn closes_for_benchmark(bench: &Benchmark, lookback_days: i64) -> Option<PriceSe
     let points = if bench.in_eur {
         yahoo_daily_closes(bench.ticker, lookback_days)
     } else {
-        yahoo_daily_closes_raw(bench.ticker, lookback_days)
+        yahoo_daily_closes(bench.ticker, lookback_days)
     }
     .ok()?;
     to_series(points)
@@ -125,6 +125,7 @@ fn build_matrix(series: &[(String, PriceSeries)], cutoff: NaiveDate) -> Correlat
         for j in (i + 1)..n {
             let pairs = paired_returns(&series[i].1, &series[j].1, cutoff);
             let coeff = pearson(&pairs);
+            /*
             if coeff.is_none() {
                 eprintln!(
                     "  [DEBUG corrélation] {} / {} : {} rendement(s) apparié(s), coefficient indéterminé",
@@ -133,6 +134,7 @@ fn build_matrix(series: &[(String, PriceSeries)], cutoff: NaiveDate) -> Correlat
                     pairs.len()
                 );
             }
+            */
             coeffs[i][j] = coeff;
             coeffs[j][i] = coeff;
         }
@@ -261,3 +263,5 @@ mod tests {
         assert!(m["A"]["B"].is_some());
     }
 }
+
+

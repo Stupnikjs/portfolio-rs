@@ -54,3 +54,4 @@ pub fn store(txs: Vec<Transaction>) -> TxStore {
     s.add_transactions(txs);
     s
 }
+

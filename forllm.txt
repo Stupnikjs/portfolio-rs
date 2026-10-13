@@ -1,7 +1,272 @@
 ################################################################################
-# Dossier : src
+# Dossier : .
+# Fichier : Cargo.toml
+# Chemin relatif : Cargo.toml
+################################################################################
+
+[package]
+name = "portfolio_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+anyhow = "1"
+thiserror = "1"
+csv = "1"
+sha2 = "0.10"
+hex = "0.4"
+calamine = { version = "0.24", features = ["dates"] }
+regex = "1"
+once_cell = "1"
+url = "=2.5.0"
+idna = "=0.5.0"
+indexmap = "=2.2.6"
+encoding_rs = "=0.8.33"
+bincode = "1.3"
+
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : cost_basis.rs
+# Chemin relatif : ledger/cost_basis.rs
+################################################################################
+
+//! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
+//! revient) par méthode FIFO, et du P&L réalisé à la vente.
+//!
+//! FIFO plutôt que coût moyen pondéré : méthode retenue par défaut par
+//! l'administration fiscale française pour les cessions de valeurs
+//! mobilières.
+//!
+//! Le coût/produit de chaque transaction est dérivé de `value_eur` (champ
+//! immutable qui fait autorité) plutôt que de `quantity * price` : `price`
+//! est optionnel et parfois exprimé dans la devise locale de l'actif
+//! plutôt qu'en EUR (cas XTB).
+
+use std::collections::{HashMap, VecDeque};
+
+use anyhow::{anyhow, Result};
+use chrono::{DateTime, Utc};
+
+use crate::schema::TransactionKind;
+use crate::store::serialize::TxStore;
+
+const EPSILON: f64 = 1e-12;
+
+fn unit_value_eur(quantity: f64, value_eur: f64) -> Result<f64> {
+    if quantity <= 0.0 {
+        return Err(anyhow!("quantity doit être positive, reçu {quantity}"));
+    }
+    Ok(value_eur / quantity)
+}
+
+/// Un lot FIFO : une tranche de quantité acquise à un prix donné.
+#[derive(Debug, Clone)]
+pub struct Lot {
+    pub quantity: f64,
+    pub unit_cost_eur: f64,
+    pub acquired_at: DateTime<Utc>,
+    pub external_id: Option<String>,
+}
+
+/// Résultat d'une vente rapprochée avec un ou plusieurs lots FIFO.
+#[derive(Debug, Clone)]
+pub struct RealizedGain {
+    pub symbol: String,
+    pub sell_time: DateTime<Utc>,
+    pub quantity: f64,
+    pub proceeds_eur: f64,
+    pub cost_eur: f64,
+    pub pnl_eur: f64,
+    pub external_id: Option<String>,
+    pub lots_consumed: Vec<Lot>,
+    /// True si la vente dépasse les lots connus (transfert entrant non
+    /// tracé, données historiques incomplètes...).
+    pub incomplete: bool,
+}
+
+/// Sortie complète du calcul FIFO pour un wallet.
+#[derive(Debug, Default)]
+pub struct CostBasisResult {
+    pub open_lots: HashMap<String, Vec<Lot>>,
+    pub realized_gains: Vec<RealizedGain>,
+    pub fees_eur_by_symbol: HashMap<String, f64>,
+}
+
+impl CostBasisResult {
+    pub fn open_quantity(&self, symbol: &str) -> f64 {
+        self.open_lots.get(symbol).map(|lots| lots.iter().map(|l| l.quantity).sum()).unwrap_or(0.0)
+    }
+
+    /// Coût de revient total des lots encore ouverts pour `symbol`.
+    pub fn open_cost_basis(&self, symbol: &str) -> f64 {
+        self.open_lots
+            .get(symbol)
+            .map(|lots| lots.iter().map(|l| l.quantity * l.unit_cost_eur).sum())
+            .unwrap_or(0.0)
+    }
+
+    /// Prix de revient moyen par unité sur les lots ouverts (None si rien détenu).
+    pub fn average_cost(&self, symbol: &str) -> Option<f64> {
+        let qty = self.open_quantity(symbol);
+        if qty <= 0.0 {
+            return None;
+        }
+        Some(self.open_cost_basis(symbol) / qty)
+    }
+
+    pub fn total_realized_pnl(&self, symbol: Option<&str>) -> f64 {
+        self.realized_gains
+            .iter()
+            .filter(|g| symbol.map_or(true, |s| g.symbol == s))
+            .map(|g| g.pnl_eur)
+            .sum()
+    }
+
+    pub fn total_fees(&self, symbol: Option<&str>) -> f64 {
+        match symbol {
+            Some(s) => *self.fees_eur_by_symbol.get(s).unwrap_or(&0.0),
+            None => self.fees_eur_by_symbol.values().sum(),
+        }
+    }
+}
+
+/// Rejoue les transactions du wallet dans l'ordre chronologique et
+/// applique la méthode FIFO : chaque SELL/WITHDRAW consomme les lots
+/// BUY/DEPOSIT les plus anciens en premier.
+///
+/// `at = None` -- comme pour `holdings_at` -- rejoue toutes les
+/// transactions connues.
+///
+/// Les FEE ne sont pas rattachés à un lot précis : accumulés séparément
+/// par actif (`fees_eur_by_symbol`) -- à soustraire soi-même du P&L pour
+/// un résultat net de frais.
+///
+/// Si une vente dépasse la quantité connue en lots ouverts, le reliquat
+/// est valorisé à un coût de 0 et le `RealizedGain` correspondant est
+/// marqué `incomplete = true` -- son `pnl_eur` est donc surestimé d'autant.
+pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<CostBasisResult> {
+    let mut lots: HashMap<String, VecDeque<Lot>> = HashMap::new();
+    let mut realized: Vec<RealizedGain> = Vec::new();
+    let mut fees: HashMap<String, f64> = HashMap::new();
+
+    let mut transactions: Vec<&crate::schema::Transaction> = tx_store.transactions.iter().collect();
+    transactions.sort_by_key(|tx| tx.time);
+
+    for tx in transactions {
+        if let Some(at) = at {
+            if tx.time > at {
+                break;
+            }
+        }
+
+        let symbol = tx.asset.symbol.clone();
+
+        match tx.kind {
+            TransactionKind::Buy | TransactionKind::Deposit => {
+                let queue = lots.entry(symbol).or_default();
+                queue.push_back(Lot {
+                    quantity: tx.quantity,
+                    unit_cost_eur: unit_value_eur(tx.quantity, tx.value_eur)?,
+                    acquired_at: tx.time,
+                    external_id: tx.external_id.clone(),
+                });
+            }
+            TransactionKind::Sell | TransactionKind::Withdraw => {
+                let queue = lots.entry(symbol.clone()).or_default();
+                let mut remaining = tx.quantity;
+                let mut consumed: Vec<Lot> = Vec::new();
+                let mut cost_eur = 0.0;
+                let mut incomplete = false;
+
+                while remaining > EPSILON {
+                    let Some(lot) = queue.front_mut() else { break };
+                    let take = lot.quantity.min(remaining);
+
+                    cost_eur += take * lot.unit_cost_eur;
+                    consumed.push(Lot {
+                        quantity: take,
+                        unit_cost_eur: lot.unit_cost_eur,
+                        acquired_at: lot.acquired_at,
+                        external_id: lot.external_id.clone(),
+                    });
+
+                    lot.quantity -= take;
+                    remaining -= take;
+                    if lot.quantity <= EPSILON {
+                        queue.pop_front();
+                    }
+                }
+
+                if remaining > EPSILON {
+                    // Pas de lot connu pour couvrir le reliquat : coût
+                    // inconnu, traité comme 0 -- signalé via `incomplete`
+                    // plutôt que silencieusement absorbé dans le P&L.
+                    consumed.push(Lot {
+                        quantity: remaining,
+                        unit_cost_eur: 0.0,
+                        acquired_at: tx.time,
+                        external_id: None,
+                    });
+                    incomplete = true;
+                }
+
+                let proceeds_eur = tx.value_eur;
+                realized.push(RealizedGain {
+                    symbol,
+                    sell_time: tx.time,
+                    quantity: tx.quantity,
+                    proceeds_eur,
+                    cost_eur,
+                    pnl_eur: proceeds_eur - cost_eur,
+                    external_id: tx.external_id.clone(),
+                    lots_consumed: consumed,
+                    incomplete,
+                });
+            }
+            TransactionKind::Fee => {
+        let queue = lots.entry(symbol.clone()).or_default();
+        let mut remaining = tx.quantity;
+
+        while remaining > EPSILON {
+            let Some(lot) = queue.front_mut() else { break };
+            let take = lot.quantity.min(remaining);
+
+            lot.quantity -= take;
+            remaining -= take;
+            if lot.quantity <= EPSILON {
+                queue.pop_front();
+            }
+        }
+        // Reliquat non couvert par des lots connus (frais > solde tracé) :
+        // ignoré silencieusement, comme pour un Withdraw incomplet -- edge
+        // case qui ne devrait pas arriver en pratique.
+
+        *fees.entry(symbol).or_insert(0.0) += tx.value_eur;
+    }
+        }
+    }
+
+    let open_lots: HashMap<String, Vec<Lot>> = lots
+        .into_iter()
+        .filter(|(_, queue)| !queue.is_empty())
+        .map(|(symbol, queue)| (symbol, queue.into_iter().collect()))
+        .collect();
+
+    Ok(CostBasisResult { open_lots, realized_gains: realized, fees_eur_by_symbol: fees })
+}
+
+
+
+
+################################################################################
+# Dossier : src/ledger
 # Fichier : history.rs
-# Chemin relatif : history.rs
+# Chemin relatif : ledger/history.rs
 ################################################################################
 
 //! Historique de valorisation du portefeuille, hebdomadaire ou mensuel.
@@ -44,10 +309,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 
 use crate::ledger::cost_basis::compute_fifo;
+use crate::ledger::periods::{first_monday, is_first_monday, months_between, sundays_from};
 use crate::ledger::portfolio::{portfolio_snapshot_with, AssetSnapshot, PriceFn};
 use crate::market::prices::historical_price_eur;
 use crate::schema::AssetKind;
@@ -135,27 +401,6 @@ impl HistoryEntry {
     }
 }
 
-/// Dimanche de la semaine ISO contenant `date` (lundi = début de semaine).
-/// Conservée : utilisée par trades.rs pour la fréquence hebdomadaire.
-pub fn week_end(date: NaiveDate) -> NaiveDate {
-    let offset = (Weekday::Sun.num_days_from_monday() as i64
-        - date.weekday().num_days_from_monday() as i64
-        + 7)
-        % 7;
-    date + Duration::days(offset)
-}
-
-/// Premier lundi du mois `year`-`month`.
-pub fn first_monday(year: i32, month: u32) -> NaiveDate {
-    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("mois valide");
-    let offset = (7 - first.weekday().num_days_from_monday() as i64) % 7;
-    first + Duration::days(offset)
-}
-
-fn is_first_monday(date: NaiveDate) -> bool {
-    date.weekday() == Weekday::Mon && date.day() <= 7
-}
-
 /// Dates à snapshotter, de la première période contenant une transaction
 /// jusqu'à la dernière période TERMINÉE (date strictement avant `today`).
 pub fn target_dates(start: NaiveDate, today: NaiveDate, freq: Frequency) -> Vec<NaiveDate> {
@@ -167,35 +412,17 @@ pub fn target_dates(start: NaiveDate, today: NaiveDate, freq: Frequency) -> Vec<
 
 /// Dimanches de la semaine de `start` jusqu'à `today` (exclu).
 fn weekly_dates(start: NaiveDate, today: NaiveDate) -> Vec<NaiveDate> {
-    let mut out = Vec::new();
-    let mut cursor = week_end(start);
-    while cursor < today {
-        out.push(cursor);
-        cursor += Duration::weeks(1);
-    }
-    out
+    sundays_from(start).take_while(|d| *d < today).collect()
 }
 
 /// Premiers lundis : un par mois entre le mois de `start` et celui de
 /// `today`, en excluant ceux antérieurs à `start` (portefeuille vide) et
 /// ceux qui ne sont pas strictement passés (`>= today`).
 fn monthly_dates(start: NaiveDate, today: NaiveDate) -> Vec<NaiveDate> {
-    let mut out = Vec::new();
-    let (mut y, mut m) = (start.year(), start.month());
-
-    while (y, m) <= (today.year(), today.month()) {
-        let target = first_monday(y, m);
-        if target >= start && target < today {
-            out.push(target);
-        }
-        if m == 12 {
-            y += 1;
-            m = 1;
-        } else {
-            m += 1;
-        }
-    }
-    out
+    months_between(start, today)
+        .map(|(y, m)| first_monday(y, m))
+        .filter(|d| *d >= start && *d < today)
+        .collect()
 }
 
 /// Supprime les entrées dont la date n'est pas sur la grille de `freq` (ou
@@ -461,44 +688,6 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
-    }
-
-    // --- week_end (utilisée par trades.rs) ---
-
-    #[test]
-    fn week_end_maps_any_weekday_to_its_sunday() {
-        assert_eq!(week_end(d(2026, 10, 7)), d(2026, 10, 11)); // mercredi
-        assert_eq!(week_end(d(2026, 10, 5)), d(2026, 10, 11)); // lundi
-        assert_eq!(week_end(d(2026, 10, 11)), d(2026, 10, 11)); // dimanche
-    }
-
-    // --- first_monday ---
-
-    #[test]
-    fn first_monday_known_months() {
-        assert_eq!(first_monday(2026, 10), d(2026, 10, 5)); // 1er = jeudi
-        assert_eq!(first_monday(2024, 1), d(2024, 1, 1)); // 1er = lundi
-        assert_eq!(first_monday(2026, 2), d(2026, 2, 2)); // 1er = dimanche
-        assert_eq!(first_monday(2025, 12), d(2025, 12, 1)); // 1er = lundi
-    }
-
-    #[test]
-    fn first_monday_is_always_a_monday_within_the_first_seven_days() {
-        for year in 2020..=2035 {
-            for month in 1..=12 {
-                let fm = first_monday(year, month);
-                assert_eq!(fm.weekday(), Weekday::Mon, "{year}-{month}");
-                assert!(fm.day() <= 7, "{year}-{month}");
-                assert_eq!((fm.year(), fm.month()), (year, month));
-            }
-        }
-    }
-
-    #[test]
-    fn is_first_monday_distinguishes_mondays_and_other_days() {
-        assert!(is_first_monday(d(2026, 10, 5)));
-        assert!(!is_first_monday(d(2026, 10, 12))); // 2e lundi
-        assert!(!is_first_monday(d(2026, 10, 4))); // dimanche
     }
 
     // --- target_dates ---
@@ -1123,236 +1312,6 @@ mod tests {
     }
 }
 
-################################################################################
-# Dossier : src/ledger
-# Fichier : cost_basis.rs
-# Chemin relatif : ledger/cost_basis.rs
-################################################################################
-
-//! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
-//! revient) par méthode FIFO, et du P&L réalisé à la vente.
-//!
-//! FIFO plutôt que coût moyen pondéré : méthode retenue par défaut par
-//! l'administration fiscale française pour les cessions de valeurs
-//! mobilières.
-//!
-//! Le coût/produit de chaque transaction est dérivé de `value_eur` (champ
-//! immutable qui fait autorité) plutôt que de `quantity * price` : `price`
-//! est optionnel et parfois exprimé dans la devise locale de l'actif
-//! plutôt qu'en EUR (cas XTB).
-
-use std::collections::{HashMap, VecDeque};
-
-use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
-
-use crate::schema::TransactionKind;
-use crate::store::serialize::TxStore;
-
-const EPSILON: f64 = 1e-12;
-
-fn unit_value_eur(quantity: f64, value_eur: f64) -> Result<f64> {
-    if quantity <= 0.0 {
-        return Err(anyhow!("quantity doit être positive, reçu {quantity}"));
-    }
-    Ok(value_eur / quantity)
-}
-
-/// Un lot FIFO : une tranche de quantité acquise à un prix donné.
-#[derive(Debug, Clone)]
-pub struct Lot {
-    pub quantity: f64,
-    pub unit_cost_eur: f64,
-    pub acquired_at: DateTime<Utc>,
-    pub external_id: Option<String>,
-}
-
-/// Résultat d'une vente rapprochée avec un ou plusieurs lots FIFO.
-#[derive(Debug, Clone)]
-pub struct RealizedGain {
-    pub symbol: String,
-    pub sell_time: DateTime<Utc>,
-    pub quantity: f64,
-    pub proceeds_eur: f64,
-    pub cost_eur: f64,
-    pub pnl_eur: f64,
-    pub external_id: Option<String>,
-    pub lots_consumed: Vec<Lot>,
-    /// True si la vente dépasse les lots connus (transfert entrant non
-    /// tracé, données historiques incomplètes...).
-    pub incomplete: bool,
-}
-
-/// Sortie complète du calcul FIFO pour un wallet.
-#[derive(Debug, Default)]
-pub struct CostBasisResult {
-    pub open_lots: HashMap<String, Vec<Lot>>,
-    pub realized_gains: Vec<RealizedGain>,
-    pub fees_eur_by_symbol: HashMap<String, f64>,
-}
-
-impl CostBasisResult {
-    pub fn open_quantity(&self, symbol: &str) -> f64 {
-        self.open_lots.get(symbol).map(|lots| lots.iter().map(|l| l.quantity).sum()).unwrap_or(0.0)
-    }
-
-    /// Coût de revient total des lots encore ouverts pour `symbol`.
-    pub fn open_cost_basis(&self, symbol: &str) -> f64 {
-        self.open_lots
-            .get(symbol)
-            .map(|lots| lots.iter().map(|l| l.quantity * l.unit_cost_eur).sum())
-            .unwrap_or(0.0)
-    }
-
-    /// Prix de revient moyen par unité sur les lots ouverts (None si rien détenu).
-    pub fn average_cost(&self, symbol: &str) -> Option<f64> {
-        let qty = self.open_quantity(symbol);
-        if qty <= 0.0 {
-            return None;
-        }
-        Some(self.open_cost_basis(symbol) / qty)
-    }
-
-    pub fn total_realized_pnl(&self, symbol: Option<&str>) -> f64 {
-        self.realized_gains
-            .iter()
-            .filter(|g| symbol.map_or(true, |s| g.symbol == s))
-            .map(|g| g.pnl_eur)
-            .sum()
-    }
-
-    pub fn total_fees(&self, symbol: Option<&str>) -> f64 {
-        match symbol {
-            Some(s) => *self.fees_eur_by_symbol.get(s).unwrap_or(&0.0),
-            None => self.fees_eur_by_symbol.values().sum(),
-        }
-    }
-}
-
-/// Rejoue les transactions du wallet dans l'ordre chronologique et
-/// applique la méthode FIFO : chaque SELL/WITHDRAW consomme les lots
-/// BUY/DEPOSIT les plus anciens en premier.
-///
-/// `at = None` -- comme pour `holdings_at` -- rejoue toutes les
-/// transactions connues.
-///
-/// Les FEE ne sont pas rattachés à un lot précis : accumulés séparément
-/// par actif (`fees_eur_by_symbol`) -- à soustraire soi-même du P&L pour
-/// un résultat net de frais.
-///
-/// Si une vente dépasse la quantité connue en lots ouverts, le reliquat
-/// est valorisé à un coût de 0 et le `RealizedGain` correspondant est
-/// marqué `incomplete = true` -- son `pnl_eur` est donc surestimé d'autant.
-pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<CostBasisResult> {
-    let mut lots: HashMap<String, VecDeque<Lot>> = HashMap::new();
-    let mut realized: Vec<RealizedGain> = Vec::new();
-    let mut fees: HashMap<String, f64> = HashMap::new();
-
-    let mut transactions: Vec<&crate::schema::Transaction> = tx_store.transactions.iter().collect();
-    transactions.sort_by_key(|tx| tx.time);
-
-    for tx in transactions {
-        if let Some(at) = at {
-            if tx.time > at {
-                break;
-            }
-        }
-
-        let symbol = tx.asset.symbol.clone();
-
-        match tx.kind {
-            TransactionKind::Buy | TransactionKind::Deposit => {
-                let queue = lots.entry(symbol).or_default();
-                queue.push_back(Lot {
-                    quantity: tx.quantity,
-                    unit_cost_eur: unit_value_eur(tx.quantity, tx.value_eur)?,
-                    acquired_at: tx.time,
-                    external_id: tx.external_id.clone(),
-                });
-            }
-            TransactionKind::Sell | TransactionKind::Withdraw => {
-                let queue = lots.entry(symbol.clone()).or_default();
-                let mut remaining = tx.quantity;
-                let mut consumed: Vec<Lot> = Vec::new();
-                let mut cost_eur = 0.0;
-                let mut incomplete = false;
-
-                while remaining > EPSILON {
-                    let Some(lot) = queue.front_mut() else { break };
-                    let take = lot.quantity.min(remaining);
-
-                    cost_eur += take * lot.unit_cost_eur;
-                    consumed.push(Lot {
-                        quantity: take,
-                        unit_cost_eur: lot.unit_cost_eur,
-                        acquired_at: lot.acquired_at,
-                        external_id: lot.external_id.clone(),
-                    });
-
-                    lot.quantity -= take;
-                    remaining -= take;
-                    if lot.quantity <= EPSILON {
-                        queue.pop_front();
-                    }
-                }
-
-                if remaining > EPSILON {
-                    // Pas de lot connu pour couvrir le reliquat : coût
-                    // inconnu, traité comme 0 -- signalé via `incomplete`
-                    // plutôt que silencieusement absorbé dans le P&L.
-                    consumed.push(Lot {
-                        quantity: remaining,
-                        unit_cost_eur: 0.0,
-                        acquired_at: tx.time,
-                        external_id: None,
-                    });
-                    incomplete = true;
-                }
-
-                let proceeds_eur = tx.value_eur;
-                realized.push(RealizedGain {
-                    symbol,
-                    sell_time: tx.time,
-                    quantity: tx.quantity,
-                    proceeds_eur,
-                    cost_eur,
-                    pnl_eur: proceeds_eur - cost_eur,
-                    external_id: tx.external_id.clone(),
-                    lots_consumed: consumed,
-                    incomplete,
-                });
-            }
-            TransactionKind::Fee => {
-        let queue = lots.entry(symbol.clone()).or_default();
-        let mut remaining = tx.quantity;
-
-        while remaining > EPSILON {
-            let Some(lot) = queue.front_mut() else { break };
-            let take = lot.quantity.min(remaining);
-
-            lot.quantity -= take;
-            remaining -= take;
-            if lot.quantity <= EPSILON {
-                queue.pop_front();
-            }
-        }
-        // Reliquat non couvert par des lots connus (frais > solde tracé) :
-        // ignoré silencieusement, comme pour un Withdraw incomplet -- edge
-        // case qui ne devrait pas arriver en pratique.
-
-        *fees.entry(symbol).or_insert(0.0) += tx.value_eur;
-    }
-        }
-    }
-
-    let open_lots: HashMap<String, Vec<Lot>> = lots
-        .into_iter()
-        .filter(|(_, queue)| !queue.is_empty())
-        .map(|(symbol, queue)| (symbol, queue.into_iter().collect()))
-        .collect();
-
-    Ok(CostBasisResult { open_lots, realized_gains: realized, fees_eur_by_symbol: fees })
-}
 
 
 ################################################################################
@@ -1361,9 +1320,143 @@ pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<Cos
 # Chemin relatif : ledger/mod.rs
 ################################################################################
 
-pub mod positions;
+//! Calculs à partir des transactions du wallet.
+
 pub mod cost_basis;
+pub mod history;
+pub mod periods;
 pub mod portfolio;
+pub mod positions;
+pub mod realized;
+pub mod trades;
+
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : periods.rs
+# Chemin relatif : ledger/periods.rs
+################################################################################
+
+//! Arithmétique de calendrier partagée (historique, fréquence des trades).
+//!
+//! Évite que `trades.rs` dépende de `history.rs` juste pour `week_end`, et
+//! remplace les boucles « mois par mois » / « semaine par semaine » qui
+//! étaient dupliquées dans `history.rs` et `trades.rs`.
+
+use chrono::{Datelike, Duration, NaiveDate, Weekday};
+
+/// Dimanche de la semaine ISO contenant `date` (lundi = début de semaine).
+pub fn week_end(date: NaiveDate) -> NaiveDate {
+    let offset = (Weekday::Sun.num_days_from_monday() as i64
+        - date.weekday().num_days_from_monday() as i64
+        + 7)
+        % 7;
+    date + Duration::days(offset)
+}
+
+/// Premier lundi du mois `year`-`month`.
+pub fn first_monday(year: i32, month: u32) -> NaiveDate {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("mois valide");
+    let offset = (7 - first.weekday().num_days_from_monday() as i64) % 7;
+    first + Duration::days(offset)
+}
+
+pub fn is_first_monday(date: NaiveDate) -> bool {
+    date.weekday() == Weekday::Mon && date.day() <= 7
+}
+
+/// Couples (année, mois) du mois de `start` à celui de `end`, bornes incluses.
+/// Vide si `start` est dans un mois postérieur à `end`.
+pub fn months_between(start: NaiveDate, end: NaiveDate) -> impl Iterator<Item = (i32, u32)> {
+    let last = (end.year(), end.month());
+    let first = (start.year(), start.month());
+    std::iter::successors((first <= last).then_some(first), move |&(y, m)| {
+        let next = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+        (next <= last).then_some(next)
+    })
+}
+
+/// Dimanches de fin de semaine, de la semaine de `start` à l'infini
+/// (à borner avec `take_while`).
+pub fn sundays_from(start: NaiveDate) -> impl Iterator<Item = NaiveDate> {
+    std::iter::successors(Some(week_end(start)), |d| Some(*d + Duration::weeks(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn week_end_maps_any_weekday_to_its_sunday() {
+        assert_eq!(week_end(d(2026, 10, 7)), d(2026, 10, 11)); // mercredi
+        assert_eq!(week_end(d(2026, 10, 5)), d(2026, 10, 11)); // lundi
+        assert_eq!(week_end(d(2026, 10, 11)), d(2026, 10, 11)); // dimanche
+        assert_eq!(week_end(d(2026, 12, 31)), d(2027, 1, 3)); // passage d'année
+    }
+
+    #[test]
+    fn first_monday_known_months() {
+        assert_eq!(first_monday(2026, 10), d(2026, 10, 5)); // 1er = jeudi
+        assert_eq!(first_monday(2024, 1), d(2024, 1, 1)); // 1er = lundi
+        assert_eq!(first_monday(2026, 2), d(2026, 2, 2)); // 1er = dimanche
+        assert_eq!(first_monday(2025, 12), d(2025, 12, 1)); // 1er = lundi
+    }
+
+    #[test]
+    fn first_monday_is_always_a_monday_within_the_first_seven_days() {
+        for year in 2020..=2035 {
+            for month in 1..=12 {
+                let fm = first_monday(year, month);
+                assert_eq!(fm.weekday(), Weekday::Mon, "{year}-{month}");
+                assert!(fm.day() <= 7, "{year}-{month}");
+                assert_eq!((fm.year(), fm.month()), (year, month));
+            }
+        }
+    }
+
+    #[test]
+    fn is_first_monday_distinguishes_mondays_and_other_days() {
+        assert!(is_first_monday(d(2026, 10, 5)));
+        assert!(!is_first_monday(d(2026, 10, 12))); // 2e lundi
+        assert!(!is_first_monday(d(2026, 10, 4))); // dimanche
+    }
+
+    #[test]
+    fn months_between_is_inclusive_and_crosses_years() {
+        let months: Vec<_> = months_between(d(2025, 11, 20), d(2026, 2, 3)).collect();
+        assert_eq!(months, vec![(2025, 11), (2025, 12), (2026, 1), (2026, 2)]);
+    }
+
+    #[test]
+    fn months_between_same_month_is_one_and_reversed_is_empty() {
+        assert_eq!(months_between(d(2026, 3, 1), d(2026, 3, 31)).collect::<Vec<_>>(), vec![(2026, 3)]);
+        assert_eq!(months_between(d(2026, 4, 1), d(2026, 3, 31)).count(), 0);
+    }
+
+    #[test]
+    fn sundays_from_starts_with_the_sunday_of_the_start_week() {
+        let sundays: Vec<_> = sundays_from(d(2026, 10, 7)).take(3).collect(); // mercredi
+        assert_eq!(sundays, vec![d(2026, 10, 11), d(2026, 10, 18), d(2026, 10, 25)]);
+        assert_eq!(sundays_from(d(2026, 10, 11)).next(), Some(d(2026, 10, 11))); // déjà dimanche
+    }
+
+    #[test]
+    fn sundays_from_matches_the_historical_week_by_week_loop() {
+        let (start, today) = (d(2025, 12, 17), d(2026, 2, 20));
+        let mut expected = Vec::new();
+        let mut cursor = week_end(start);
+        while cursor <= week_end(today) {
+            expected.push(cursor);
+            cursor += Duration::weeks(1);
+        }
+        let got: Vec<_> = sundays_from(start).take_while(|d| *d <= week_end(today)).collect();
+        assert_eq!(got, expected);
+    }
+}
 
 
 ################################################################################
@@ -1506,6 +1599,8 @@ mod tests {
     }
 }
 
+
+
 ################################################################################
 # Dossier : src/ledger
 # Fichier : positions.rs
@@ -1578,19 +1673,568 @@ pub fn non_zero_holdings_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Ha
 }
 
 
+
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : realized.rs
+# Chemin relatif : ledger/realized.rs
+################################################################################
+
+//! Plus-values réalisées par compte fiscal (CTO, PEA, Binance).
+//!
+//! `compute_fifo` rejoue TOUTES les transactions et indexe les lots par
+//! symbole : un titre détenu à la fois sur le CTO et sur le PEA partagerait
+//! ses lots entre les deux comptes, et le P&L réalisé global mélange PEA,
+//! CTO et crypto. Ici on isole d'abord les transactions d'un seul compte,
+//! puis on refait le FIFO sur ce périmètre.
+//!
+//! Périmètre actuel : les TITRES (`AssetKind::Stock`). Les cessions crypto
+//! (Binance) sont calculées à part : leurs WITHDRAW (transferts) sont vus
+//! comme des ventes FIFO et fausseraient le résultat.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::Result;
+use chrono::Datelike;
+
+use crate::ledger::cost_basis::compute_fifo;
+use crate::schema::{AssetKind, Platform, Transaction};
+use crate::store::serialize::TxStore;
+
+/// Compte fiscal d'une transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaxAccount {
+    /// Compte-titres ordinaire (XTB, export principal `account.xlsx`).
+    Cto,
+    /// PEA (XTB, export `account_pea.xlsx`) : le fichier porte « pea » dans son nom.
+    Pea,
+    Binance,
+    /// Saisies manuelles (crypto) : rattachées à aucun compte-titres.
+    Other,
+}
+
+/// Compte d'une transaction : plateforme, puis nom du fichier source pour XTB
+/// (les deux exports ont le même `account_label`, seul le fichier les distingue).
+pub fn tax_account(tx: &Transaction) -> TaxAccount {
+    match tx.platform {
+        Platform::Binance => TaxAccount::Binance,
+        Platform::Manual => TaxAccount::Other,
+        Platform::Xtb => {
+            let file = Path::new(&tx.source_file)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            // « pea » comme mot entier : account_pea.xlsx, pea.xlsx... mais pas « speaker.xlsx ».
+            if file.split(|c: char| !c.is_alphanumeric()).any(|word| word == "pea") {
+                TaxAccount::Pea
+            } else {
+                TaxAccount::Cto
+            }
+        }
+    }
+}
+
+/// Plus-values réalisées d'un compte (en EUR).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RealizedSummary {
+    /// Somme des cessions en plus-value (≥ 0).
+    pub gains_eur: f64,
+    /// Somme des cessions en moins-value (≤ 0).
+    pub losses_eur: f64,
+    /// Plus-value nette = gains + moins-values.
+    pub net_eur: f64,
+    /// Nombre de cessions (ventes) prises en compte.
+    pub disposals: usize,
+    /// Cessions dépassant les lots connus : coût inconnu traité à 0, donc plus-value surestimée.
+    pub incomplete: usize,
+    /// Plus-value nette par année de cession.
+    pub net_by_year: BTreeMap<i32, f64>,
+}
+
+impl RealizedSummary {
+    /// Texte à afficher dans le terminal.
+    pub fn report(&self, title: &str) -> String {
+        let mut out = format!("=== {title} ===\n");
+        out.push_str(&format!(
+            "Plus-value nette réalisée : {:>+.2} EUR  ({} cession{})\n",
+            self.net_eur,
+            self.disposals,
+            if self.disposals > 1 { "s" } else { "" }
+        ));
+        out.push_str(&format!("  Plus-values  : {:>+12.2} EUR\n", self.gains_eur));
+        out.push_str(&format!("  Moins-values : {:>+12.2} EUR\n", self.losses_eur));
+        if !self.net_by_year.is_empty() {
+            out.push_str("  Par année de cession :\n");
+            for (year, net) in &self.net_by_year {
+                out.push_str(&format!("    {year} : {net:>+12.2} EUR\n"));
+            }
+        }
+        if self.incomplete > 0 {
+            out.push_str(&format!(
+                "  ⚠ {} cession(s) dépassent les lots connus (coût traité à 0) : plus-value surestimée\n",
+                self.incomplete
+            ));
+        }
+        out
+    }
+}
+
+/// Plus-values réalisées sur les titres d'un compte, FIFO appliqué aux seules
+/// transactions de ce compte.
+pub fn realized_summary(tx_store: &TxStore, account: TaxAccount) -> Result<RealizedSummary> {
+    let mut scoped = TxStore::new();
+    scoped.add_transactions(
+        tx_store.transactions.iter().filter(|tx| tax_account(tx) == account).cloned().collect(),
+    );
+    let fifo = compute_fifo(&scoped, None)?;
+
+    let mut summary = RealizedSummary::default();
+    for gain in &fifo.realized_gains {
+        // Pas de cash (conversions, retraits) ni de crypto : titres uniquement.
+        if scoped.assets.get(&gain.symbol).map(|a| a.kind) != Some(AssetKind::Stock) {
+            continue;
+        }
+        if gain.pnl_eur >= 0.0 {
+            summary.gains_eur += gain.pnl_eur;
+        } else {
+            summary.losses_eur += gain.pnl_eur;
+        }
+        summary.disposals += 1;
+        if gain.incomplete {
+            summary.incomplete += 1;
+        }
+        *summary.net_by_year.entry(gain.sell_time.year()).or_insert(0.0) += gain.pnl_eur;
+    }
+    summary.net_eur = summary.gains_eur + summary.losses_eur;
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::TransactionKind::{Buy, Deposit, Sell, Withdraw};
+    use crate::testutil::{store, tx};
+
+    const CTO_FILE: &str = "./data/raw/accounts/account.xlsx";
+    const PEA_FILE: &str = "./data/raw/accounts/account_pea.xlsx";
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// Transaction de titre XTB sur le fichier donné.
+    fn stock(file: &str, kind: crate::schema::TransactionKind, symbol: &str, qty: f64, value: f64, time: &str, id: &str) -> Transaction {
+        let mut t = tx(kind, symbol, AssetKind::Stock, qty, value, time, id);
+        t.platform = Platform::Xtb;
+        t.account_label = "XTB".to_string();
+        t.source_file = file.to_string();
+        t
+    }
+
+    fn on(platform: Platform, file: &str) -> Transaction {
+        let mut t = tx(Buy, "X", AssetKind::Stock, 1.0, 1.0, "2026-01-01T10:00:00Z", "x");
+        t.platform = platform;
+        t.source_file = file.to_string();
+        t
+    }
+
+    // --- tax_account ---
+
+    #[test]
+    fn xtb_main_export_is_the_cto_and_the_pea_export_is_the_pea() {
+        assert_eq!(tax_account(&on(Platform::Xtb, CTO_FILE)), TaxAccount::Cto);
+        assert_eq!(tax_account(&on(Platform::Xtb, PEA_FILE)), TaxAccount::Pea);
+    }
+
+    #[test]
+    fn pea_detection_is_case_insensitive_and_whole_word() {
+        assert_eq!(tax_account(&on(Platform::Xtb, "C:\\data\\Account_PEA.xlsx")), TaxAccount::Pea);
+        assert_eq!(tax_account(&on(Platform::Xtb, "./data/pea.xlsx")), TaxAccount::Pea);
+        assert_eq!(tax_account(&on(Platform::Xtb, "./data/speaker.xlsx")), TaxAccount::Cto);
+        // Seul le nom du fichier compte, pas le dossier.
+        assert_eq!(tax_account(&on(Platform::Xtb, "./pea/account.xlsx")), TaxAccount::Cto);
+    }
+
+    #[test]
+    fn binance_and_manual_are_never_the_cto() {
+        assert_eq!(tax_account(&on(Platform::Binance, CTO_FILE)), TaxAccount::Binance);
+        assert_eq!(tax_account(&on(Platform::Manual, CTO_FILE)), TaxAccount::Other);
+    }
+
+    // --- realized_summary ---
+
+    #[test]
+    fn net_is_gains_minus_losses_over_the_cto_sales() {
+        let s = store(vec![
+            stock(CTO_FILE, Buy, "AIR", 10.0, 1_000.0, "2025-01-10T10:00:00Z", "a1"),
+            stock(CTO_FILE, Sell, "AIR", 10.0, 1_200.0, "2025-03-10T10:00:00Z", "a2"), // +200
+            stock(CTO_FILE, Buy, "SAN", 5.0, 500.0, "2025-02-10T10:00:00Z", "s1"),
+            stock(CTO_FILE, Sell, "SAN", 5.0, 400.0, "2025-04-10T10:00:00Z", "s2"), // -100
+        ]);
+        let r = realized_summary(&s, TaxAccount::Cto).unwrap();
+
+        assert!(approx(r.gains_eur, 200.0));
+        assert!(approx(r.losses_eur, -100.0));
+        assert!(approx(r.net_eur, 100.0));
+        assert_eq!(r.disposals, 2);
+        assert_eq!(r.incomplete, 0);
+    }
+
+    #[test]
+    fn pea_and_binance_sales_are_excluded_from_the_cto() {
+        let mut btc_buy = tx(Buy, "BTC", AssetKind::Crypto, 1.0, 20_000.0, "2025-01-01T10:00:00Z", "b1");
+        let mut btc_sell = tx(Sell, "BTC", AssetKind::Crypto, 1.0, 50_000.0, "2025-06-01T10:00:00Z", "b2");
+        btc_buy.platform = Platform::Binance;
+        btc_sell.platform = Platform::Binance;
+
+        let s = store(vec![
+            stock(CTO_FILE, Buy, "AIR", 10.0, 1_000.0, "2025-01-10T10:00:00Z", "a1"),
+            stock(CTO_FILE, Sell, "AIR", 10.0, 1_200.0, "2025-03-10T10:00:00Z", "a2"), // +200
+            stock(PEA_FILE, Buy, "SAN", 10.0, 500.0, "2025-01-10T10:00:00Z", "p1"),
+            stock(PEA_FILE, Sell, "SAN", 10.0, 5_000.0, "2025-03-10T10:00:00Z", "p2"), // +4500 (PEA)
+            btc_buy,
+            btc_sell, // +30000 (Binance)
+        ]);
+
+        assert!(approx(realized_summary(&s, TaxAccount::Cto).unwrap().net_eur, 200.0));
+        assert!(approx(realized_summary(&s, TaxAccount::Pea).unwrap().net_eur, 4_500.0));
+    }
+
+    #[test]
+    fn a_ticker_held_on_both_accounts_does_not_share_its_lots() {
+        // Même titre sur PEA (acheté 100, plus ancien) et CTO (acheté 1000).
+        // FIFO global : la vente CTO consommerait le lot PEA -> +1000 faux.
+        let s = store(vec![
+            stock(PEA_FILE, Buy, "AIR", 10.0, 100.0, "2024-01-01T10:00:00Z", "p1"),
+            stock(CTO_FILE, Buy, "AIR", 10.0, 1_000.0, "2025-01-01T10:00:00Z", "c1"),
+            stock(CTO_FILE, Sell, "AIR", 10.0, 1_100.0, "2025-06-01T10:00:00Z", "c2"),
+        ]);
+        let r = realized_summary(&s, TaxAccount::Cto).unwrap();
+
+        assert!(approx(r.net_eur, 100.0), "net CTO = {}", r.net_eur);
+    }
+
+    #[test]
+    fn fifo_consumes_the_oldest_cto_lots_first() {
+        let s = store(vec![
+            stock(CTO_FILE, Buy, "AIR", 10.0, 1_000.0, "2025-01-01T10:00:00Z", "a1"), // 100 / part
+            stock(CTO_FILE, Buy, "AIR", 10.0, 2_000.0, "2025-02-01T10:00:00Z", "a2"), // 200 / part
+            stock(CTO_FILE, Sell, "AIR", 15.0, 3_000.0, "2025-03-01T10:00:00Z", "a3"), // coût 1000 + 1000
+        ]);
+        let r = realized_summary(&s, TaxAccount::Cto).unwrap();
+
+        assert!(approx(r.net_eur, 1_000.0));
+        assert_eq!(r.disposals, 1);
+    }
+
+    #[test]
+    fn net_is_split_by_year_of_sale() {
+        let s = store(vec![
+            stock(CTO_FILE, Buy, "AIR", 20.0, 2_000.0, "2024-01-01T10:00:00Z", "a1"),
+            stock(CTO_FILE, Sell, "AIR", 10.0, 1_500.0, "2025-12-31T23:00:00Z", "a2"), // 2025 : +500
+            stock(CTO_FILE, Sell, "AIR", 10.0, 800.0, "2026-01-02T10:00:00Z", "a3"),   // 2026 : -200
+        ]);
+        let r = realized_summary(&s, TaxAccount::Cto).unwrap();
+
+        assert_eq!(r.net_by_year.len(), 2);
+        assert!(approx(r.net_by_year[&2025], 500.0));
+        assert!(approx(r.net_by_year[&2026], -200.0));
+        assert!(approx(r.net_eur, 300.0));
+    }
+
+    #[test]
+    fn a_sale_beyond_known_lots_is_flagged_incomplete() {
+        let s = store(vec![
+            stock(CTO_FILE, Buy, "AIR", 5.0, 500.0, "2025-01-01T10:00:00Z", "a1"),
+            stock(CTO_FILE, Sell, "AIR", 10.0, 1_200.0, "2025-02-01T10:00:00Z", "a2"),
+        ]);
+        let r = realized_summary(&s, TaxAccount::Cto).unwrap();
+
+        assert_eq!(r.incomplete, 1);
+        assert!(approx(r.net_eur, 700.0)); // reliquat de 5 titres compté à coût 0
+        assert!(r.report("T").contains("⚠ 1 cession(s)"));
+    }
+
+    #[test]
+    fn cash_movements_never_count_as_realized_gains() {
+        let mut dep = tx(Deposit, "EUR", AssetKind::Cash, 1_000.0, 1_000.0, "2025-01-01T09:00:00Z", "d1");
+        let mut wd = tx(Withdraw, "EUR", AssetKind::Cash, 400.0, 400.0, "2025-02-01T09:00:00Z", "d2");
+        dep.platform = Platform::Xtb;
+        dep.source_file = CTO_FILE.to_string();
+        wd.platform = Platform::Xtb;
+        wd.source_file = CTO_FILE.to_string();
+        let r = realized_summary(&store(vec![dep, wd]), TaxAccount::Cto).unwrap();
+
+        assert_eq!(r, RealizedSummary::default());
+    }
+
+    #[test]
+    fn no_sale_gives_an_empty_summary() {
+        let s = store(vec![stock(CTO_FILE, Buy, "AIR", 10.0, 1_000.0, "2025-01-01T10:00:00Z", "a1")]);
+        let r = realized_summary(&s, TaxAccount::Cto).unwrap();
+
+        assert_eq!(r, RealizedSummary::default());
+        assert!(r.report("T").contains("0 cession"));
+        assert!(!r.report("T").contains("⚠"));
+    }
+
+    #[test]
+    fn report_shows_signed_amounts_years_in_order_and_plural() {
+        let s = store(vec![
+            stock(CTO_FILE, Buy, "AIR", 30.0, 3_000.0, "2024-01-01T10:00:00Z", "a1"),
+            stock(CTO_FILE, Sell, "AIR", 10.0, 1_500.0, "2026-03-01T10:00:00Z", "a2"),
+            stock(CTO_FILE, Sell, "AIR", 10.0, 800.0, "2025-03-01T10:00:00Z", "a3"),
+        ]);
+        let text = realized_summary(&s, TaxAccount::Cto).unwrap().report("CTO TEST");
+
+        assert!(text.starts_with("=== CTO TEST ===\n"));
+        assert!(text.contains("Plus-value nette réalisée : +300.00 EUR  (2 cessions)"));
+        assert!(text.contains("Plus-values  :"));
+        assert!(text.contains("-200.00 EUR")); // moins-value 2025
+        assert!(text.find("2025 :").unwrap() < text.find("2026 :").unwrap());
+    }
+}
+
+
+################################################################################
+# Dossier : src/ledger
+# Fichier : trades.rs
+# Chemin relatif : ledger/trades.rs
+################################################################################
+
+//! Trades passés (Buy/Sell) et leur fréquence par mois / semaine, pour
+//! dashboard.json.
+//!
+//! Un "trade" = une transaction Buy ou Sell sur un actif non-Cash.
+//! Sont donc exclus : Deposit/Withdraw (transferts, jambes cash XTB,
+//! dividendes...) et Fee.
+//!
+//! Attention : un Convert Binance produit deux transactions (Sell + Buy)
+//! et compte donc pour 2 trades -- `buys` / `sells` dans chaque période
+//! permettent de le voir.
+//!
+//! Les semaines sont identifiées par leur dimanche de fin (même clé que
+//! history.json, pratique pour joindre les deux), les mois par "YYYY-MM".
+//! Les périodes sans trade sont incluses (compteurs à 0) entre le premier
+//! trade et aujourd'hui, pour que les creux soient visibles dans un graphe.
+
+use std::collections::BTreeMap;
+
+use chrono::{Datelike, NaiveDate, SecondsFormat, Utc};
+
+use crate::ledger::periods::{months_between, sundays_from, week_end};
+use crate::schema::{
+    AssetKind, DashboardTrade, PeriodCount, TradeFrequency, Transaction, TransactionKind,
+};
+use crate::store::serialize::TxStore;
+
+fn trade_txs(tx_store: &TxStore) -> impl Iterator<Item = &Transaction> {
+    tx_store.transactions.iter().filter(|tx| {
+        matches!(tx.kind, TransactionKind::Buy | TransactionKind::Sell)
+            && tx.asset.kind != AssetKind::Cash
+    })
+}
+
+/// Liste chronologique (plus ancien -> plus récent) des trades.
+pub fn build_trades(tx_store: &TxStore) -> Vec<DashboardTrade> {
+    let mut trades: Vec<DashboardTrade> = trade_txs(tx_store)
+        .map(|tx| DashboardTrade {
+            time: tx.time.to_rfc3339_opts(SecondsFormat::Secs, true),
+            symbol: tx.asset.symbol.clone(),
+            kind: tx.kind.as_str().to_string(),
+            platform: tx.platform.as_str().to_string(),
+            quantity: tx.quantity,
+            // Dérivé de value_eur (autoritaire) : `price` peut être en
+            // devise locale (cf. cost_basis.rs).
+            unit_price_eur: if tx.quantity > 0.0 { tx.value_eur / tx.quantity } else { 0.0 },
+            value_eur: tx.value_eur,
+        })
+        .collect();
+
+    // RFC3339 UTC ("...Z", secondes) : l'ordre lexicographique = chronologique.
+    trades.sort_by(|a, b| a.time.cmp(&b.time));
+    trades
+}
+
+fn add_to_period(pc: &mut PeriodCount, is_buy: bool, value_eur: f64) {
+    pc.trades += 1;
+    if is_buy {
+        pc.buys += 1;
+    } else {
+        pc.sells += 1;
+    }
+    pc.volume_eur += value_eur;
+}
+
+/// Nombre de trades par mois et par semaine (périodes vides incluses jusqu'à aujourd'hui).
+pub fn build_trade_frequency(tx_store: &TxStore) -> TradeFrequency {
+    build_trade_frequency_at(tx_store, Utc::now().date_naive())
+}
+
+/// Comme `build_trade_frequency`, avec la date du jour fournie (testable).
+pub fn build_trade_frequency_at(tx_store: &TxStore, today: NaiveDate) -> TradeFrequency {
+    let mut by_month: BTreeMap<(i32, u32), PeriodCount> = BTreeMap::new();
+    let mut by_week: BTreeMap<NaiveDate, PeriodCount> = BTreeMap::new();
+    let mut total_trades = 0u32;
+    let mut first: Option<NaiveDate> = None;
+
+    for tx in trade_txs(tx_store) {
+        let date = tx.time.date_naive();
+        first = Some(first.map_or(date, |f| f.min(date)));
+        let is_buy = tx.kind == TransactionKind::Buy;
+
+        let month = by_month
+            .entry((date.year(), date.month()))
+            .or_insert_with(|| PeriodCount::new(format!("{:04}-{:02}", date.year(), date.month())));
+        add_to_period(month, is_buy, tx.value_eur);
+
+        let we = week_end(date);
+        let week = by_week
+            .entry(we)
+            .or_insert_with(|| PeriodCount::new(we.format("%Y-%m-%d").to_string()));
+        add_to_period(week, is_buy, tx.value_eur);
+
+        total_trades += 1;
+    }
+
+    let Some(first) = first else {
+        return TradeFrequency::default(); // aucun trade
+    };
+
+    // Mois vides entre le premier trade et le mois courant.
+    for (y, m) in months_between(first, today) {
+        by_month
+            .entry((y, m))
+            .or_insert_with(|| PeriodCount::new(format!("{y:04}-{m:02}")));
+    }
+
+    // Semaines vides entre la première semaine et la semaine courante.
+    let last_week = week_end(today);
+    for cursor in sundays_from(first).take_while(|d| *d <= last_week) {
+        by_week
+            .entry(cursor)
+            .or_insert_with(|| PeriodCount::new(cursor.format("%Y-%m-%d").to_string()));
+    }
+
+    let by_month: Vec<PeriodCount> = by_month.into_values().collect();
+    let by_week: Vec<PeriodCount> = by_week.into_values().collect();
+
+    TradeFrequency {
+        total_trades,
+        avg_per_month: total_trades as f64 / by_month.len() as f64,
+        avg_per_week: total_trades as f64 / by_week.len() as f64,
+        by_month,
+        by_week,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{store, tx};
+    use TransactionKind::{Buy, Deposit, Fee, Sell};
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn fixture() -> TxStore {
+        store(vec![
+            tx(Buy, "AIR", AssetKind::Stock, 10.0, 1_000.0, "2026-01-07T10:00:00Z", "t1"), // mercredi
+            tx(Sell, "AIR", AssetKind::Stock, 4.0, 600.0, "2026-03-20T10:00:00Z", "t2"),   // vendredi
+            tx(Buy, "BTC", AssetKind::Crypto, 0.5, 20_000.0, "2026-01-09T09:00:00Z", "t3"),
+            // Pas des trades : cash, dépôt, frais.
+            tx(Buy, "EUR", AssetKind::Cash, 500.0, 500.0, "2026-02-01T09:00:00Z", "c1"),
+            tx(Deposit, "AIR", AssetKind::Stock, 1.0, 100.0, "2026-02-02T09:00:00Z", "c2"),
+            tx(Fee, "AIR", AssetKind::Stock, 1.0, 2.0, "2026-02-03T09:00:00Z", "c3"),
+        ])
+    }
+
+    #[test]
+    fn trades_are_chronological_buys_and_sells_of_non_cash_assets_only() {
+        let trades = build_trades(&fixture());
+
+        let seen: Vec<(&str, &str)> = trades.iter().map(|t| (t.symbol.as_str(), t.kind.as_str())).collect();
+        assert_eq!(seen, vec![("AIR", "Buy"), ("BTC", "Buy"), ("AIR", "Sell")]);
+        assert_eq!(trades[2].unit_price_eur, 150.0); // 600 / 4
+    }
+
+    #[test]
+    fn frequency_of_an_empty_store_is_default() {
+        let f = build_trade_frequency_at(&store(vec![]), d(2026, 4, 1));
+        assert_eq!(f.total_trades, 0);
+        assert!(f.by_month.is_empty() && f.by_week.is_empty());
+    }
+
+    #[test]
+    fn frequency_fills_empty_months_and_counts_buys_and_sells() {
+        let f = build_trade_frequency_at(&fixture(), d(2026, 4, 15));
+
+        assert_eq!(f.total_trades, 3);
+        let months: Vec<&str> = f.by_month.iter().map(|p| p.period.as_str()).collect();
+        assert_eq!(months, vec!["2026-01", "2026-02", "2026-03", "2026-04"]);
+        assert_eq!((f.by_month[0].buys, f.by_month[0].sells, f.by_month[0].trades), (2, 0, 2));
+        assert_eq!(f.by_month[1].trades, 0); // février : creux visible
+        assert_eq!((f.by_month[2].buys, f.by_month[2].sells), (0, 1));
+        assert_eq!(f.by_month[0].volume_eur, 21_000.0);
+        assert!((f.avg_per_month - 0.75).abs() < 1e-9); // 3 trades / 4 mois
+    }
+
+    #[test]
+    fn frequency_weeks_are_consecutive_sundays_up_to_the_current_week() {
+        let today = d(2026, 4, 15); // mercredi -> semaine du dimanche 19/04
+        let f = build_trade_frequency_at(&fixture(), today);
+
+        assert_eq!(f.by_week.first().unwrap().period, "2026-01-11"); // semaine du 07/01
+        assert_eq!(f.by_week.last().unwrap().period, "2026-04-19");
+        let dates: Vec<NaiveDate> = f
+            .by_week
+            .iter()
+            .map(|p| NaiveDate::parse_from_str(&p.period, "%Y-%m-%d").unwrap())
+            .collect();
+        assert!(dates.windows(2).all(|w| (w[1] - w[0]).num_days() == 7));
+        let in_week: u32 = f.by_week.iter().filter(|p| p.period == "2026-01-11").map(|p| p.trades).sum();
+        assert_eq!(in_week, 2); // les deux achats du 07 et du 09/01
+        assert_eq!(f.by_week.iter().map(|p| p.trades).sum::<u32>(), 3);
+    }
+
+    #[test]
+    fn frequency_months_and_weeks_use_the_same_trades_total() {
+        let f = build_trade_frequency_at(&fixture(), d(2026, 12, 31));
+
+        assert_eq!(f.by_month.iter().map(|p| p.trades).sum::<u32>(), f.total_trades);
+        assert_eq!(f.by_week.iter().map(|p| p.trades).sum::<u32>(), f.total_trades);
+        assert_eq!(f.by_month.len(), 12);
+    }
+}
+
+
 ################################################################################
 # Dossier : src
 # Fichier : lib.rs
 # Chemin relatif : lib.rs
 ################################################################################
 
-pub mod schema;
-pub mod store;
+//! Pipeline portefeuille : parse des exports (Binance, XTB, manuel), calculs
+//! (cost basis FIFO, valorisation, historique, plus-values) et export vers le dashboard.
+//!
+//! Organisation de `src/` : seuls `main.rs`, `lib.rs` et `testutil.rs` sont à la racine ;
+//! tout le reste vit dans un dossier par responsabilité :
+//!
+//! - `schema`  : types partagés (transactions, actifs, structures de dashboard.json)
+//! - `parse`   : lecture des exports (Binance, XTB, saisies manuelles)
+//! - `store`   : wallet en mémoire (`TxStore`) et sa sérialisation
+//! - `ledger`  : tout ce qui se calcule à partir des transactions (cost basis, positions,
+//!               valorisation, historique, trades, plus-values réalisées)
+//! - `market`  : prix, tickers, corrélations (réseau + cache)
+
 pub mod ledger;
 pub mod market;
 pub mod parse;
-pub mod history;
-pub mod trades;
+pub mod schema;
+pub mod store;
 
 #[cfg(test)]
 mod testutil;
@@ -1617,13 +2261,14 @@ use portfolio_rs::ledger::cost_basis::compute_fifo;
 use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::market::correlation::compute_correlation_matrices;
-use portfolio_rs::history::record_weekly_history;
+use portfolio_rs::ledger::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
 use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
-use portfolio_rs::trades::{build_trade_frequency, build_trades};
+use portfolio_rs::ledger::realized::{realized_summary, TaxAccount};
+use portfolio_rs::ledger::trades::{build_trade_frequency, build_trades};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -1653,33 +2298,52 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, extension: &str) -> Resul
     Ok(())
 }
 
-fn generate_concatenated_txt(root_dir: &str, extension: &str, output_file: &str) -> Result<()> {
+fn generate_concatenated_txt(
+    root_dir: &str,
+    extension: &str,
+    output_file: &str,
+    prepend_files: &[&str],
+) -> Result<()> {
     let mut files = Vec::new();
-    let path = Path::new(root_dir);
-    
-    if !path.exists() {
-        println!("[Omis] Dossier introuvable pour la génération : {}", root_dir);
-        return Ok(());
+
+    // Fichiers isolés à inclure en tête (Cargo.toml, README.md...).
+    // Ils ne sont pas triés : l'ordre du slice est respecté.
+    for prepend in prepend_files {
+        let p = Path::new(prepend);
+        if p.exists() {
+            files.push(p.to_path_buf());
+        } else {
+            println!("[Omis] Fichier à inclure introuvable : {}", prepend);
+        }
     }
 
-    collect_files(path, &mut files, extension)?;
+    // Fichiers source du dossier racine, collectés puis triés.
+    // "Cargo.toml" < "src/..." lexicographiquement : il reste en tête
+    // même après le sort, ce qui donne le bon contexte au LLM.
+    let path = Path::new(root_dir);
+    if path.exists() {
+        collect_files(path, &mut files, extension)?;
+    } else {
+        println!("[Omis] Dossier introuvable pour la génération : {}", root_dir);
+    }
     files.sort();
-    
+
     let mut output = String::new();
     for file_path in &files {
         let absolute_rel_path = file_path.to_string_lossy().replace("\\", "/");
-        
+
         let (dossier, chemin_relatif) = if absolute_rel_path.starts_with(&format!("{}/", root_dir)) {
             let rel = absolute_rel_path.trim_start_matches(&format!("{}/", root_dir));
             let d = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
             let full_d = if d.is_empty() { root_dir.to_string() } else { format!("{}/{}", root_dir, d) };
             (full_d, rel.to_string())
         } else {
-            (absolute_rel_path.clone(), absolute_rel_path.clone())
+            // Fichier à la racine du projet (Cargo.toml, etc.)
+            (".".to_string(), absolute_rel_path.clone())
         };
-        
+
         let fichier = file_path.file_name().unwrap().to_string_lossy();
-        
+
         output.push_str("################################################################################
 ");
         output.push_str(&format!("# Dossier : {}\n", dossier));
@@ -1688,19 +2352,18 @@ fn generate_concatenated_txt(root_dir: &str, extension: &str, output_file: &str)
         output.push_str("################################################################################
 
 ");
-        
+
         let content = fs::read_to_string(file_path)?;
         output.push_str(&content);
         output.push_str("
 
 ");
     }
-    
+
     fs::write(output_file, output)?;
     println!("{} généré avec succès.", output_file);
     Ok(())
 }
-
 // ---------------------------------------------------
 
 fn main() -> Result<()> {
@@ -1864,6 +2527,15 @@ fn main() -> Result<()> {
         );
     }
 
+    // Plus-values réalisées sur le compte-titres seul : XTB hors PEA, FIFO refait sur
+    // ce compte (voir realized.rs). La crypto (Binance) est calculée à part.
+    println!();
+    print!(
+        "{}",
+        realized_summary(&tx_store, TaxAccount::Cto)?
+            .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
+    );
+
     println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
     let holdings = non_zero_holdings_at(&tx_store, None);
     let prices_eur: std::collections::HashMap<String, f64> =
@@ -1915,11 +2587,13 @@ fn main() -> Result<()> {
     println!("Cache des prix 1h sauvegardé : {cache_path:?}");
 
     // --- Génération des fichiers pour le LLM ---
-    generate_concatenated_txt("src", "rs", "forllm.txt")?;
-    generate_concatenated_txt("dashboard", "py", "forllmdashboard.txt")?;
+    generate_concatenated_txt("src", "rs", "forllm.txt", &["Cargo.toml"])?;
+    generate_concatenated_txt("dashboard", "py", "forllmdashboard.txt", &[])?;
 
     Ok(())
 }
+
+
 
 ################################################################################
 # Dossier : src/market
@@ -1932,21 +2606,42 @@ fn main() -> Result<()> {
 //! portefeuille -- servent de référence pour juger la diversification
 //! réelle des positions.
 
-/// (label affiché, ticker Yahoo Finance). Le label est ce qui apparaît
-/// comme nom de ligne/colonne dans dashboard.json -- à garder synchronisé
-/// avec la liste `BENCHMARK_LABELS` côté dashboard.py si tu changes les
-/// noms ici.
-pub const BENCHMARKS: &[(&str, &str)] = &[
-    ("MSCI China", "MCHI"),
-    ("CAC 40", "^FCHI"),
-    ("S&P 500", "^GSPC"),
-    ("Or", "GC=F"),
-    ("Argent", "SI=F"),
-    ("NVIDIA", "NVDA"),
-    ("Indice Dollar", "DX-Y.NYB"),
-    ("NASDAQ", "^NDX"),
-    ("SU.FR", "SU.PA"),
+/// Un benchmark suivi dans la matrice de corrélation.
+pub struct Benchmark {
+    /// Nom affiché comme ligne/colonne dans dashboard.json -- à garder
+    /// synchronisé avec `BENCHMARK_LABELS` côté dashboard.py.
+    pub label: &'static str,
+    /// Ticker Yahoo Finance.
+    pub ticker: &'static str,
+    /// `true` : la série est convertie en EUR (point de vue d'un investisseur
+    /// en euros, comme les actifs détenus). `false` : série brute, pour les
+    /// indices qui ne sont pas un prix d'actif -- convertir l'indice dollar
+    /// (DX-Y.NYB) en euros n'a aucun sens et brouille ses rendements.
+    pub in_eur: bool,
+}
+
+const fn eur(label: &'static str, ticker: &'static str) -> Benchmark {
+    Benchmark { label, ticker, in_eur: true }
+}
+
+const fn raw(label: &'static str, ticker: &'static str) -> Benchmark {
+    Benchmark { label, ticker, in_eur: false }
+}
+
+pub const BENCHMARKS: &[Benchmark] = &[
+    eur("MSCI China", "MCHI"),
+    eur("CAC 40", "^FCHI"),
+    eur("S&P 500", "^GSPC"),
+    eur("Or", "GC=F"),
+    eur("Argent", "SI=F"),
+    eur("NVIDIA", "NVDA"),
+    raw("Indice Dollar", "DX-Y.NYB"),
+    eur("NASDAQ", "^NDX"),
+    eur("SU.FR", "SU.PA"),
 ];
+
+
+
 
 ################################################################################
 # Dossier : src/market
@@ -2290,147 +2985,177 @@ mod tests {
     }
 }
 
+
+
 ################################################################################
 # Dossier : src/market
 # Fichier : correlation.rs
 # Chemin relatif : market/correlation.rs
 ################################################################################
 
-//! Construit la matrice de corrélation des rendements journaliers,
-//! combinant les actifs détenus (au-dessus d'un seuil de valeur) et les
-//! indices/matières premières de référence (`benchmarks.rs`), sur une
-//! fenêtre glissante de `lookback_days`.
+//! Matrice de corrélation des rendements journaliers : actifs détenus
+//! (au-dessus d'un seuil de valeur) + benchmarks (`benchmarks.rs`), sur des
+//! fenêtres glissantes (`CORRELATION_WINDOWS`).
+//!
+//! Alignement calendaire. Les marchés n'ont pas le même calendrier (crypto
+//! 7j/7, actions 5j/7, fériés propres à chaque place). Calculer les
+//! rendements de chaque série sur SES propres clôtures consécutives puis les
+//! apparier par date compare, le lundi, le rendement vendredi->lundi (3 jours)
+//! du Nasdaq au rendement dimanche->lundi (1 jour) de l'ETH : le coefficient
+//! est biaisé vers le bas. Ici, pour CHAQUE PAIRE, on ne garde que les dates
+//! communes, puis on calcule les deux rendements entre les mêmes dates
+//! consécutives.
+//!
+//! Limite restante : les clôtures n'ont pas la même heure (Binance 00:00 UTC,
+//! Nasdaq ~21:00 UTC). Pour s'en affranchir, comparer aussi des rendements
+//! hebdomadaires.
+//!
+//! Prérequis : `yahoo_daily_closes_raw` dans prices.rs (voir notes).
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::NaiveDate;
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 
-use crate::market::benchmarks::BENCHMARKS;
+use crate::market::benchmarks::{Benchmark, BENCHMARKS};
 use crate::market::prices::{binance_daily_closes, yahoo_daily_closes};
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
 
-/// Fenêtres calculées à chaque run. Le label est celui utilisé comme clé
-/// dans le JSON de sortie (consommé tel quel par dashboard.py).
-pub const CORRELATION_WINDOWS: &[(&str, i64)] = &[
-    ("90d", 90),
-    ("6m", 182),
-    ("1y", 365),
-];
+/// Fenêtres calculées à chaque run. Le label est la clé dans le JSON de
+/// sortie (consommé tel quel par dashboard.py).
+pub const CORRELATION_WINDOWS: &[(&str, i64)] = &[("90d", 90), ("6m", 182), ("1y", 365)];
 
+/// Nombre minimal de rendements appariés pour qu'un coefficient ait un sens.
+const MIN_PAIRED_RETURNS: usize = 5;
 
-/// Restreint une série de rendements aux dates >= aujourd'hui - window_days.
-fn windowed(returns: &BTreeMap<NaiveDate, f64>, window_days: i64) -> BTreeMap<NaiveDate, f64> {
-    let cutoff = Utc::now().date_naive() - Duration::days(window_days);
-    returns.range(cutoff..).map(|(d, v)| (*d, *v)).collect()
+type PriceSeries = BTreeMap<NaiveDate, f64>;
+
+/// label -> label -> coefficient. `None` (sérialisé en `null`) veut dire
+/// « on ne sait pas », jamais « zéro » : ne pas le convertir en 0.0 en amont.
+pub type CorrelationMatrix = HashMap<String, HashMap<String, Option<f64>>>;
+pub type CorrelationMatrices = HashMap<String, CorrelationMatrix>;
+
+fn to_series(points: Vec<(NaiveDate, f64)>) -> Option<PriceSeries> {
+    (points.len() >= 2).then(|| points.into_iter().collect())
 }
 
-/// Récupère la série de clôtures pour un actif de portefeuille selon son
-/// type. Best-effort : renvoie None si la source ne répond pas plutôt que
-/// de faire échouer tout le calcul de corrélation pour un seul actif.
-fn closes_for_portfolio_asset(symbol: &str, kind: AssetKind, ticker: Option<&str>, lookback_days: i64) -> Option<BTreeMap<NaiveDate, f64>> {
-    let series = match kind {
+/// Best-effort : `None` si la source ne répond pas, plutôt que de faire
+/// échouer toute la matrice pour un seul actif.
+fn closes_for_portfolio_asset(
+    symbol: &str,
+    kind: AssetKind,
+    ticker: Option<&str>,
+    lookback_days: i64,
+) -> Option<PriceSeries> {
+    let points = match kind {
         AssetKind::Crypto => binance_daily_closes(symbol, lookback_days).ok()?,
         AssetKind::Stock => yahoo_daily_closes(ticker?, lookback_days).ok()?,
-        AssetKind::Cash => return None, // le cash n'a pas de rendement à corréler
+        AssetKind::Cash => return None, // pas de rendement à corréler
     };
-    if series.len() < 2 {
-        return None;
-    }
-    Some(series.into_iter().collect())
+    to_series(points)
 }
 
-fn closes_for_benchmark(ticker: &str, lookback_days: i64) -> Option<BTreeMap<NaiveDate, f64>> {
-    let series = yahoo_daily_closes(ticker, lookback_days).ok()?;
-    if series.len() < 2 {
-        return None;
+fn closes_for_benchmark(bench: &Benchmark, lookback_days: i64) -> Option<PriceSeries> {
+    let points = if bench.in_eur {
+        yahoo_daily_closes(bench.ticker, lookback_days)
+    } else {
+        yahoo_daily_closes(bench.ticker, lookback_days)
     }
-    Some(series.into_iter().collect())
+    .ok()?;
+    to_series(points)
 }
 
-/// Transforme une série de prix en rendements journaliers simples
-/// (r_t = p_t / p_{t-1} - 1), clé par date de fin de période.
-fn to_returns(prices: &BTreeMap<NaiveDate, f64>) -> BTreeMap<NaiveDate, f64> {
-    let mut out = BTreeMap::new();
-    let mut prev: Option<f64> = None;
-    for (date, price) in prices {
-        if let Some(prev_price) = prev {
-            if prev_price > 0.0 {
-                out.insert(*date, price / prev_price - 1.0);
+/// Rendements appariés de `a` et `b` entre dates communes consécutives,
+/// à partir de `cutoff` (inclus).
+fn paired_returns(a: &PriceSeries, b: &PriceSeries, cutoff: NaiveDate) -> Vec<(f64, f64)> {
+    let mut out = Vec::new();
+    let mut prev: Option<(f64, f64)> = None;
+
+    for (date, &pa) in a.range(cutoff..) {
+        let Some(&pb) = b.get(date) else { continue };
+        if let Some((qa, qb)) = prev {
+            if qa > 0.0 && qb > 0.0 {
+                out.push((pa / qa - 1.0, pb / qb - 1.0));
             }
         }
-        prev = Some(*price);
+        prev = Some((pa, pb));
     }
     out
 }
 
-/// Corrélation de Pearson entre deux séries de rendements, restreinte aux
-/// dates communes aux deux. `None` si moins de 5 points communs (pas
-/// assez de signal pour qu'un coefficient veuille dire quelque chose), ou
-/// si l'une des deux séries a une variance nulle sur la fenêtre (prix figé
-/// -- souvent un symptôme de données Yahoo/Binance dégradées plutôt qu'une
-/// vraie absence de mouvement).
-///
-/// `None` ici veut dire "on ne sait pas", pas "zéro" -- à ne JAMAIS
-/// convertir en 0.0 en amont : ça rendrait indiscernables une vraie
-/// décorrélation et un simple manque de données.
-fn pearson(label_a: &str, label_b: &str, a: &BTreeMap<NaiveDate, f64>, b: &BTreeMap<NaiveDate, f64>) -> Option<f64> {
-    let common: Vec<(f64, f64)> = a.iter().filter_map(|(date, ra)| b.get(date).map(|rb| (*ra, *rb))).collect();
-    if common.len() < 5 {
-        eprintln!(
-            "  [DEBUG corrélation] {label_a} / {label_b} : seulement {} date(s) commune(s) (< 5), coefficient = null",
-            common.len()
-        );
+/// Corrélation de Pearson d'une série de couples. `None` si pas assez de
+/// points, ou si une des deux séries a une variance nulle (prix figé :
+/// souvent un symptôme de données dégradées, pas une vraie absence de mouvement).
+fn pearson(pairs: &[(f64, f64)]) -> Option<f64> {
+    if pairs.len() < MIN_PAIRED_RETURNS {
         return None;
     }
 
-    let n = common.len() as f64;
-    let mean_a = common.iter().map(|(x, _)| x).sum::<f64>() / n;
-    let mean_b = common.iter().map(|(_, y)| y).sum::<f64>() / n;
+    let n = pairs.len() as f64;
+    let (sum_a, sum_b) = pairs.iter().fold((0.0, 0.0), |(sa, sb), &(x, y)| (sa + x, sb + y));
+    let (mean_a, mean_b) = (sum_a / n, sum_b / n);
 
-    let mut cov = 0.0;
-    let mut var_a = 0.0;
-    let mut var_b = 0.0;
-    for (x, y) in &common {
-        let dx = x - mean_a;
-        let dy = y - mean_b;
+    let (mut cov, mut var_a, mut var_b) = (0.0, 0.0, 0.0);
+    for &(x, y) in pairs {
+        let (dx, dy) = (x - mean_a, y - mean_b);
         cov += dx * dy;
         var_a += dx * dx;
         var_b += dy * dy;
     }
 
     if var_a <= 0.0 || var_b <= 0.0 {
-        eprintln!(
-            "  [DEBUG corrélation] {label_a} / {label_b} : variance nulle (var_a={var_a:.6}, var_b={var_b:.6}) sur {} points, coefficient = null",
-            common.len()
-        );
         return None;
     }
     Some(cov / (var_a.sqrt() * var_b.sqrt()))
 }
 
-/// Calcule la matrice de corrélation complète : actifs détenus dont la
-/// valeur courante dépasse `min_value_eur`, plus les benchmarks fixes.
-/// Résultat au format dict-de-dicts (label -> label -> coefficient), avec
-/// `None` (sérialisé en `null`) pour les paires où le coefficient n'a pas
-/// pu être calculé -- à ne pas confondre avec une vraie corrélation nulle.
-/// Directement sérialisable pour dashboard.json et consommable tel quel
-/// par `pd.DataFrame(...)` côté Streamlit (les `null` deviennent `NaN`).
-///
-/// Calcule les matrices de corrélation pour toutes les fenêtres de
-/// `CORRELATION_WINDOWS`, en une seule passe de fetch de prix (sur la
-/// fenêtre la plus large) pour éviter de solliciter Yahoo/Binance une
-/// fois par fenêtre.
+/// Matrice complète pour une fenêtre. Symétrique : on ne calcule que le
+/// triangle supérieur.
+fn build_matrix(series: &[(String, PriceSeries)], cutoff: NaiveDate) -> CorrelationMatrix {
+    let n = series.len();
+    let mut coeffs: Vec<Vec<Option<f64>>> = vec![vec![None; n]; n];
+
+    for i in 0..n {
+        coeffs[i][i] = Some(1.0);
+        for j in (i + 1)..n {
+            let pairs = paired_returns(&series[i].1, &series[j].1, cutoff);
+            let coeff = pearson(&pairs);
+            /*
+            if coeff.is_none() {
+                eprintln!(
+                    "  [DEBUG corrélation] {} / {} : {} rendement(s) apparié(s), coefficient indéterminé",
+                    series[i].0,
+                    series[j].0,
+                    pairs.len()
+                );
+            }
+            */
+            coeffs[i][j] = coeff;
+            coeffs[j][i] = coeff;
+        }
+    }
+
+    series
+        .iter()
+        .enumerate()
+        .map(|(i, (label_a, _))| {
+            let row: HashMap<String, Option<f64>> =
+                series.iter().enumerate().map(|(j, (label_b, _))| (label_b.clone(), coeffs[i][j])).collect();
+            (label_a.clone(), row)
+        })
+        .collect()
+}
+
+/// Matrices pour toutes les fenêtres de `CORRELATION_WINDOWS`, en une seule
+/// passe de fetch de prix (sur la fenêtre la plus large).
 pub fn compute_correlation_matrices(
     tx_store: &TxStore,
     holdings: &HashMap<String, f64>,
     prices_eur: &HashMap<String, f64>,
     min_value_eur: f64,
-) -> HashMap<String, HashMap<String, HashMap<String, Option<f64>>>> {
+) -> CorrelationMatrices {
     let max_lookback = CORRELATION_WINDOWS.iter().map(|(_, d)| *d).max().unwrap_or(365);
-
-    let mut series: Vec<(String, BTreeMap<NaiveDate, f64>)> = Vec::new();
+    let mut series: Vec<(String, PriceSeries)> = Vec::new();
 
     for (symbol, quantity) in holdings {
         if *quantity <= 0.0 {
@@ -2444,51 +3169,98 @@ pub fn compute_correlation_matrices(
         if value_eur < min_value_eur {
             continue;
         }
-        if let Some(prices) = closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), max_lookback) {
-            series.push((symbol.clone(), prices));
-        } else {
-            eprintln!("  [WARN corrélation] historique indisponible pour {symbol}, exclu de la matrice.");
+        match closes_for_portfolio_asset(symbol, asset.kind, asset.identifiers.ticker.as_deref(), max_lookback) {
+            Some(prices) => series.push((symbol.clone(), prices)),
+            None => eprintln!("  [WARN corrélation] historique indisponible pour {symbol}, exclu de la matrice."),
         }
     }
 
-    for (label, ticker) in BENCHMARKS {
-        if let Some(prices) = closes_for_benchmark(ticker, max_lookback) {
-            series.push((label.to_string(), prices));
-        } else {
-            eprintln!("  [WARN corrélation] historique indisponible pour le benchmark {label} ({ticker}), exclu.");
+    for bench in BENCHMARKS {
+        match closes_for_benchmark(bench, max_lookback) {
+            Some(prices) => series.push((bench.label.to_string(), prices)),
+            None => eprintln!(
+                "  [WARN corrélation] historique indisponible pour le benchmark {} ({}), exclu.",
+                bench.label, bench.ticker
+            ),
         }
     }
 
-    // Rendements calculés une seule fois sur l'historique complet.
-    let full_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> =
-        series.into_iter().map(|(label, prices)| (label, to_returns(&prices))).collect();
-
-    let mut result: HashMap<String, HashMap<String, HashMap<String, Option<f64>>>> = HashMap::new();
-
-    for (window_label, window_days) in CORRELATION_WINDOWS {
-        let windowed_returns: Vec<(String, BTreeMap<NaiveDate, f64>)> = full_returns
-            .iter()
-            .map(|(label, r)| (label.clone(), windowed(r, *window_days)))
-            .collect();
-
-        let mut matrix: HashMap<String, HashMap<String, Option<f64>>> = HashMap::new();
-        for (label_a, returns_a) in &windowed_returns {
-            let mut row = HashMap::new();
-            for (label_b, returns_b) in &windowed_returns {
-                let coeff = if label_a == label_b {
-                    Some(1.0)
-                } else {
-                    pearson(label_a, label_b, returns_a, returns_b)
-                };
-                row.insert(label_b.clone(), coeff);
-            }
-            matrix.insert(label_a.clone(), row);
-        }
-        result.insert(window_label.to_string(), matrix);
-    }
-
-    result
+    let today = Utc::now().date_naive();
+    CORRELATION_WINDOWS
+        .iter()
+        .map(|(label, days)| (label.to_string(), build_matrix(&series, today - Duration::days(*days))))
+        .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Octobre 2026 : le 9 est un vendredi.
+    fn d(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
+    }
+
+    fn series(points: &[(u32, f64)]) -> PriceSeries {
+        points.iter().map(|&(day, p)| (d(day), p)).collect()
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn paired_returns_span_the_same_interval_for_both_series() {
+        // Crypto : tous les jours. Action : vendredi puis lundi seulement.
+        let crypto = series(&[(9, 100.0), (10, 110.0), (11, 120.0), (12, 130.0)]);
+        let stock = series(&[(9, 10.0), (12, 13.0)]);
+
+        let pairs = paired_returns(&crypto, &stock, d(1));
+
+        // Un seul rendement apparié, vendredi -> lundi, pour les DEUX séries.
+        assert_eq!(pairs.len(), 1);
+        assert!(approx(pairs[0].0, 0.3));
+        assert!(approx(pairs[0].1, 0.3));
+    }
+
+    #[test]
+    fn paired_returns_ignore_dates_before_the_cutoff() {
+        let a = series(&[(1, 1.0), (2, 2.0), (3, 3.0), (4, 4.0)]);
+        assert_eq!(paired_returns(&a, &a, d(3)).len(), 1); // 3 -> 4 seulement
+    }
+
+    #[test]
+    fn pearson_of_identical_series_is_one_and_of_opposite_series_is_minus_one() {
+        let same: Vec<(f64, f64)> = (1..=10).map(|i| (i as f64 * 0.01, i as f64 * 0.01)).collect();
+        let opposite: Vec<(f64, f64)> = (1..=10).map(|i| (i as f64 * 0.01, -(i as f64) * 0.01)).collect();
+
+        assert!(approx(pearson(&same).unwrap(), 1.0));
+        assert!(approx(pearson(&opposite).unwrap(), -1.0));
+    }
+
+    #[test]
+    fn pearson_is_unknown_with_too_few_points_or_zero_variance() {
+        assert_eq!(pearson(&[(0.01, 0.02); 3]), None);
+
+        let flat: Vec<(f64, f64)> = (1..=10).map(|i| (0.0, i as f64 * 0.01)).collect();
+        assert_eq!(pearson(&flat), None);
+    }
+
+    #[test]
+    fn build_matrix_is_symmetric_with_unit_diagonal() {
+        let a = series(&[(1, 1.0), (2, 1.1), (3, 1.0), (4, 1.2), (5, 1.1), (6, 1.3), (7, 1.2)]);
+        let b = series(&[(1, 5.0), (2, 5.4), (3, 5.1), (4, 5.9), (5, 5.3), (6, 6.4), (7, 5.8)]);
+        let m = build_matrix(&[("A".to_string(), a), ("B".to_string(), b)], d(1));
+
+        assert_eq!(m["A"]["A"], Some(1.0));
+        assert_eq!(m["B"]["B"], Some(1.0));
+        assert_eq!(m["A"]["B"], m["B"]["A"]);
+        assert!(m["A"]["B"].is_some());
+    }
+}
+
+
+
 
 ################################################################################
 # Dossier : src/market
@@ -2501,6 +3273,8 @@ pub mod tickers;
 pub mod benchmarks;
 pub mod correlation;
 mod cache; 
+
+
 
 ################################################################################
 # Dossier : src/market
@@ -3059,6 +3833,8 @@ mod tests {
     }
 }
 
+
+
 ################################################################################
 # Dossier : src/market
 # Fichier : tickers.rs
@@ -3268,6 +4044,8 @@ pub fn resolve_ticker(symbol: &str, kind: AssetKind) -> Option<String> {
         AssetKind::Cash => None,
     }
 }
+
+
 
 
 ################################################################################
@@ -3557,6 +4335,8 @@ pub fn parse_binance_sources(accounts_path:PathBuf) -> Vec<Transaction> {
 }
 
 
+
+
 ################################################################################
 # Dossier : src/parse
 # Fichier : manual.rs
@@ -3640,6 +4420,8 @@ pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
 }
 
 
+
+
 ################################################################################
 # Dossier : src/parse
 # Fichier : mod.rs
@@ -3649,6 +4431,8 @@ pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
 pub mod binance;
 pub mod xtb;
 pub mod manual;
+
+
 
 
 ################################################################################
@@ -4132,13 +4916,108 @@ pub fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
 }
 
 
+
+
 ################################################################################
-# Dossier : src
-# Fichier : schema.rs
-# Chemin relatif : schema.rs
+# Dossier : src/schema
+# Fichier : dashboard.rs
+# Chemin relatif : schema/dashboard.rs
 ################################################################################
 
-//! Types de base, portage direct de src/schema.py.
+//! Structures sérialisées dans dashboard.json (lues par le dashboard Python).
+//! Lecture seule côté Python : tout changement de champ ici doit être répercuté
+//! dans le dashboard (dossier `dashboard/`).
+
+#[derive(serde::Serialize)]
+pub struct DashboardAsset {
+    pub symbol: String,
+    pub kind: String,
+    pub ticker: Option<String>,
+    pub quantity: f64,
+    pub price_eur: f64,
+    pub value_eur: f64,
+    pub cost_basis_eur: f64,
+    pub pnl_eur: f64,
+    pub pnl_pct: f64,
+    pub realized_pnl_eur: f64, // <-- NOUVEAU CHAMP
+}
+
+#[derive(serde::Serialize)]
+pub struct DashboardData {
+    pub total_value_eur: f64,
+    pub total_cost_basis_eur: f64,
+    pub total_pnl_eur: f64,
+    pub realized_pnl_eur: f64,
+    pub trades: Vec<DashboardTrade>,
+    pub trade_frequency: TradeFrequency,          // <-- nouveau
+    pub assets: Vec<DashboardAsset>,
+    pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
+}
+
+
+#[derive(serde::Serialize)]
+pub struct DashboardTrade {
+    pub time: String,          // RFC3339 UTC
+    pub symbol: String,
+    pub kind: String,          // "Buy" | "Sell"
+    pub platform: String,
+    pub quantity: f64,
+    pub unit_price_eur: f64,
+    pub value_eur: f64,
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct PeriodCount {
+    pub period: String,        // "YYYY-MM" (mois) ou "YYYY-MM-DD" (dimanche de fin de semaine)
+    pub trades: u32,
+    pub buys: u32,
+    pub sells: u32,
+    pub volume_eur: f64,
+}
+
+impl PeriodCount {
+    pub fn new(period: String) -> Self {
+        Self { period, ..Default::default() }
+    }
+}
+
+#[derive(serde::Serialize, Default)]
+pub struct TradeFrequency {
+    pub total_trades: u32,
+    pub avg_per_month: f64,
+    pub avg_per_week: f64,
+    pub by_month: Vec<PeriodCount>,
+    pub by_week: Vec<PeriodCount>,
+}
+
+
+################################################################################
+# Dossier : src/schema
+# Fichier : mod.rs
+# Chemin relatif : schema/mod.rs
+################################################################################
+
+//! Types partagés par tout le crate.
+//!
+//! - `types`     : plateformes, transactions, actifs (modèle du wallet)
+//! - `dashboard` : structures écrites dans dashboard.json
+//!
+//! Tout est ré-exporté à plat : `crate::schema::Transaction`, `crate::schema::DashboardData`...
+
+pub mod dashboard;
+pub mod types;
+
+pub use dashboard::*;
+pub use types::*;
+
+
+################################################################################
+# Dossier : src/schema
+# Fichier : types.rs
+# Chemin relatif : schema/types.rs
+################################################################################
+
+//! Types de base (portage direct de src/schema.py) : plateformes, transactions, actifs.
 //! Equivalent du crate pf-core évoqué dans le Python d'origine.
 
 use chrono::{DateTime, Utc};
@@ -4237,72 +5116,6 @@ pub struct Transaction {
 }
 
 
-
-#[derive(serde::Serialize)]
-pub struct DashboardAsset {
-    pub symbol: String,
-    pub kind: String,
-    pub ticker: Option<String>,
-    pub quantity: f64,
-    pub price_eur: f64,
-    pub value_eur: f64,
-    pub cost_basis_eur: f64,
-    pub pnl_eur: f64,
-    pub pnl_pct: f64,
-    pub realized_pnl_eur: f64, // <-- NOUVEAU CHAMP
-}
-
-#[derive(serde::Serialize)]
-pub struct DashboardData {
-    pub total_value_eur: f64,
-    pub total_cost_basis_eur: f64,
-    pub total_pnl_eur: f64,
-    pub realized_pnl_eur: f64,
-    pub trades: Vec<DashboardTrade>,
-    pub trade_frequency: TradeFrequency,          // <-- nouveau
-    pub assets: Vec<DashboardAsset>,
-    pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
-}
-
-
-#[derive(serde::Serialize)]
-pub struct DashboardTrade {
-    pub time: String,          // RFC3339 UTC
-    pub symbol: String,
-    pub kind: String,          // "Buy" | "Sell"
-    pub platform: String,
-    pub quantity: f64,
-    pub unit_price_eur: f64,
-    pub value_eur: f64,
-}
-
-#[derive(serde::Serialize, Default)]
-pub struct PeriodCount {
-    pub period: String,        // "YYYY-MM" (mois) ou "YYYY-MM-DD" (dimanche de fin de semaine)
-    pub trades: u32,
-    pub buys: u32,
-    pub sells: u32,
-    pub volume_eur: f64,
-}
-
-impl PeriodCount {
-    pub fn new(period: String) -> Self {
-        Self { period, ..Default::default() }
-    }
-}
-
-#[derive(serde::Serialize, Default)]
-pub struct TradeFrequency {
-    pub total_trades: u32,
-    pub avg_per_month: f64,
-    pub avg_per_week: f64,
-    pub by_month: Vec<PeriodCount>,
-    pub by_week: Vec<PeriodCount>,
-}
-
-
-
-
 ################################################################################
 # Dossier : src/store
 # Fichier : mod.rs
@@ -4310,6 +5123,8 @@ pub struct TradeFrequency {
 ################################################################################
 
 pub mod serialize;
+
+
 
 
 ################################################################################
@@ -4485,6 +5300,8 @@ pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
     Ok(())
 }
 
+
+
 ################################################################################
 # Dossier : src
 # Fichier : testutil.rs
@@ -4548,141 +5365,5 @@ pub fn store(txs: Vec<Transaction>) -> TxStore {
     s
 }
 
-################################################################################
-# Dossier : src
-# Fichier : trades.rs
-# Chemin relatif : trades.rs
-################################################################################
-
-//! Trades passés (Buy/Sell) et leur fréquence par mois / semaine, pour
-//! dashboard.json.
-//!
-//! Un "trade" = une transaction Buy ou Sell sur un actif non-Cash.
-//! Sont donc exclus : Deposit/Withdraw (transferts, jambes cash XTB,
-//! dividendes...) et Fee.
-//!
-//! Attention : un Convert Binance produit deux transactions (Sell + Buy)
-//! et compte donc pour 2 trades -- `buys` / `sells` dans chaque période
-//! permettent de le voir.
-//!
-//! Les semaines sont identifiées par leur dimanche de fin (même clé que
-//! history.json, pratique pour joindre les deux), les mois par "YYYY-MM".
-//! Les périodes sans trade sont incluses (compteurs à 0) entre le premier
-//! trade et aujourd'hui, pour que les creux soient visibles dans un graphe.
-
-use std::collections::BTreeMap;
-
-use chrono::{Datelike, Duration, NaiveDate, SecondsFormat, Utc};
-
-use crate::history::week_end;
-use crate::schema::{
-    AssetKind, DashboardTrade, PeriodCount, TradeFrequency, Transaction, TransactionKind,
-};
-use crate::store::serialize::TxStore;
-
-fn trade_txs(tx_store: &TxStore) -> impl Iterator<Item = &Transaction> {
-    tx_store.transactions.iter().filter(|tx| {
-        matches!(tx.kind, TransactionKind::Buy | TransactionKind::Sell)
-            && tx.asset.kind != AssetKind::Cash
-    })
-}
-
-/// Liste chronologique (plus ancien -> plus récent) des trades.
-pub fn build_trades(tx_store: &TxStore) -> Vec<DashboardTrade> {
-    let mut trades: Vec<DashboardTrade> = trade_txs(tx_store)
-        .map(|tx| DashboardTrade {
-            time: tx.time.to_rfc3339_opts(SecondsFormat::Secs, true),
-            symbol: tx.asset.symbol.clone(),
-            kind: tx.kind.as_str().to_string(),
-            platform: tx.platform.as_str().to_string(),
-            quantity: tx.quantity,
-            // Dérivé de value_eur (autoritaire) : `price` peut être en
-            // devise locale (cf. cost_basis.rs).
-            unit_price_eur: if tx.quantity > 0.0 { tx.value_eur / tx.quantity } else { 0.0 },
-            value_eur: tx.value_eur,
-        })
-        .collect();
-
-    // RFC3339 UTC ("...Z", secondes) : l'ordre lexicographique = chronologique.
-    trades.sort_by(|a, b| a.time.cmp(&b.time));
-    trades
-}
-
-fn add_to_period(pc: &mut PeriodCount, is_buy: bool, value_eur: f64) {
-    pc.trades += 1;
-    if is_buy {
-        pc.buys += 1;
-    } else {
-        pc.sells += 1;
-    }
-    pc.volume_eur += value_eur;
-}
-
-/// Nombre de trades par mois et par semaine (périodes vides incluses).
-pub fn build_trade_frequency(tx_store: &TxStore) -> TradeFrequency {
-    let mut by_month: BTreeMap<(i32, u32), PeriodCount> = BTreeMap::new();
-    let mut by_week: BTreeMap<NaiveDate, PeriodCount> = BTreeMap::new();
-    let mut total_trades = 0u32;
-    let mut first: Option<NaiveDate> = None;
-
-    for tx in trade_txs(tx_store) {
-        let date = tx.time.date_naive();
-        first = Some(first.map_or(date, |f| f.min(date)));
-        let is_buy = tx.kind == TransactionKind::Buy;
-
-        let month = by_month
-            .entry((date.year(), date.month()))
-            .or_insert_with(|| PeriodCount::new(format!("{:04}-{:02}", date.year(), date.month())));
-        add_to_period(month, is_buy, tx.value_eur);
-
-        let we = week_end(date);
-        let week = by_week
-            .entry(we)
-            .or_insert_with(|| PeriodCount::new(we.format("%Y-%m-%d").to_string()));
-        add_to_period(week, is_buy, tx.value_eur);
-
-        total_trades += 1;
-    }
-
-    let Some(first) = first else {
-        return TradeFrequency::default(); // aucun trade
-    };
-    let today = Utc::now().date_naive();
-
-    // Mois vides entre le premier trade et le mois courant.
-    let (mut y, mut m) = (first.year(), first.month());
-    while (y, m) <= (today.year(), today.month()) {
-        by_month
-            .entry((y, m))
-            .or_insert_with(|| PeriodCount::new(format!("{y:04}-{m:02}")));
-        if m == 12 {
-            y += 1;
-            m = 1;
-        } else {
-            m += 1;
-        }
-    }
-
-    // Semaines vides entre la première semaine et la semaine courante.
-    let mut cursor = week_end(first);
-    let last_week = week_end(today);
-    while cursor <= last_week {
-        by_week
-            .entry(cursor)
-            .or_insert_with(|| PeriodCount::new(cursor.format("%Y-%m-%d").to_string()));
-        cursor += Duration::weeks(1);
-    }
-
-    let by_month: Vec<PeriodCount> = by_month.into_values().collect();
-    let by_week: Vec<PeriodCount> = by_week.into_values().collect();
-
-    TradeFrequency {
-        total_trades,
-        avg_per_month: total_trades as f64 / by_month.len() as f64,
-        avg_per_week: total_trades as f64 / by_week.len() as f64,
-        by_month,
-        by_week,
-    }
-}
 
 

@@ -38,10 +38,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 
 use crate::ledger::cost_basis::compute_fifo;
+use crate::ledger::periods::{first_monday, is_first_monday, months_between, sundays_from};
 use crate::ledger::portfolio::{portfolio_snapshot_with, AssetSnapshot, PriceFn};
 use crate::market::prices::historical_price_eur;
 use crate::schema::AssetKind;
@@ -129,27 +130,6 @@ impl HistoryEntry {
     }
 }
 
-/// Dimanche de la semaine ISO contenant `date` (lundi = début de semaine).
-/// Conservée : utilisée par trades.rs pour la fréquence hebdomadaire.
-pub fn week_end(date: NaiveDate) -> NaiveDate {
-    let offset = (Weekday::Sun.num_days_from_monday() as i64
-        - date.weekday().num_days_from_monday() as i64
-        + 7)
-        % 7;
-    date + Duration::days(offset)
-}
-
-/// Premier lundi du mois `year`-`month`.
-pub fn first_monday(year: i32, month: u32) -> NaiveDate {
-    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("mois valide");
-    let offset = (7 - first.weekday().num_days_from_monday() as i64) % 7;
-    first + Duration::days(offset)
-}
-
-fn is_first_monday(date: NaiveDate) -> bool {
-    date.weekday() == Weekday::Mon && date.day() <= 7
-}
-
 /// Dates à snapshotter, de la première période contenant une transaction
 /// jusqu'à la dernière période TERMINÉE (date strictement avant `today`).
 pub fn target_dates(start: NaiveDate, today: NaiveDate, freq: Frequency) -> Vec<NaiveDate> {
@@ -161,35 +141,17 @@ pub fn target_dates(start: NaiveDate, today: NaiveDate, freq: Frequency) -> Vec<
 
 /// Dimanches de la semaine de `start` jusqu'à `today` (exclu).
 fn weekly_dates(start: NaiveDate, today: NaiveDate) -> Vec<NaiveDate> {
-    let mut out = Vec::new();
-    let mut cursor = week_end(start);
-    while cursor < today {
-        out.push(cursor);
-        cursor += Duration::weeks(1);
-    }
-    out
+    sundays_from(start).take_while(|d| *d < today).collect()
 }
 
 /// Premiers lundis : un par mois entre le mois de `start` et celui de
 /// `today`, en excluant ceux antérieurs à `start` (portefeuille vide) et
 /// ceux qui ne sont pas strictement passés (`>= today`).
 fn monthly_dates(start: NaiveDate, today: NaiveDate) -> Vec<NaiveDate> {
-    let mut out = Vec::new();
-    let (mut y, mut m) = (start.year(), start.month());
-
-    while (y, m) <= (today.year(), today.month()) {
-        let target = first_monday(y, m);
-        if target >= start && target < today {
-            out.push(target);
-        }
-        if m == 12 {
-            y += 1;
-            m = 1;
-        } else {
-            m += 1;
-        }
-    }
-    out
+    months_between(start, today)
+        .map(|(y, m)| first_monday(y, m))
+        .filter(|d| *d >= start && *d < today)
+        .collect()
 }
 
 /// Supprime les entrées dont la date n'est pas sur la grille de `freq` (ou
@@ -455,44 +417,6 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
-    }
-
-    // --- week_end (utilisée par trades.rs) ---
-
-    #[test]
-    fn week_end_maps_any_weekday_to_its_sunday() {
-        assert_eq!(week_end(d(2026, 10, 7)), d(2026, 10, 11)); // mercredi
-        assert_eq!(week_end(d(2026, 10, 5)), d(2026, 10, 11)); // lundi
-        assert_eq!(week_end(d(2026, 10, 11)), d(2026, 10, 11)); // dimanche
-    }
-
-    // --- first_monday ---
-
-    #[test]
-    fn first_monday_known_months() {
-        assert_eq!(first_monday(2026, 10), d(2026, 10, 5)); // 1er = jeudi
-        assert_eq!(first_monday(2024, 1), d(2024, 1, 1)); // 1er = lundi
-        assert_eq!(first_monday(2026, 2), d(2026, 2, 2)); // 1er = dimanche
-        assert_eq!(first_monday(2025, 12), d(2025, 12, 1)); // 1er = lundi
-    }
-
-    #[test]
-    fn first_monday_is_always_a_monday_within_the_first_seven_days() {
-        for year in 2020..=2035 {
-            for month in 1..=12 {
-                let fm = first_monday(year, month);
-                assert_eq!(fm.weekday(), Weekday::Mon, "{year}-{month}");
-                assert!(fm.day() <= 7, "{year}-{month}");
-                assert_eq!((fm.year(), fm.month()), (year, month));
-            }
-        }
-    }
-
-    #[test]
-    fn is_first_monday_distinguishes_mondays_and_other_days() {
-        assert!(is_first_monday(d(2026, 10, 5)));
-        assert!(!is_first_monday(d(2026, 10, 12))); // 2e lundi
-        assert!(!is_first_monday(d(2026, 10, 4))); // dimanche
     }
 
     // --- target_dates ---
@@ -1116,3 +1040,4 @@ mod tests {
         assert!(entry_at(&read(&tmp.file()), "2026-03-01").complete);
     }
 }
+

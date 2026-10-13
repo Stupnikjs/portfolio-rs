@@ -13,13 +13,14 @@ use portfolio_rs::ledger::cost_basis::compute_fifo;
 use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::market::correlation::compute_correlation_matrices;
-use portfolio_rs::history::record_weekly_history;
+use portfolio_rs::ledger::history::record_weekly_history;
 use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{TxStore, save_wallet};
 use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
-use portfolio_rs::trades::{build_trade_frequency, build_trades};
+use portfolio_rs::ledger::realized::{realized_summary, TaxAccount};
+use portfolio_rs::ledger::trades::{build_trade_frequency, build_trades};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -49,33 +50,52 @@ fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, extension: &str) -> Resul
     Ok(())
 }
 
-fn generate_concatenated_txt(root_dir: &str, extension: &str, output_file: &str) -> Result<()> {
+fn generate_concatenated_txt(
+    root_dir: &str,
+    extension: &str,
+    output_file: &str,
+    prepend_files: &[&str],
+) -> Result<()> {
     let mut files = Vec::new();
-    let path = Path::new(root_dir);
-    
-    if !path.exists() {
-        println!("[Omis] Dossier introuvable pour la génération : {}", root_dir);
-        return Ok(());
+
+    // Fichiers isolés à inclure en tête (Cargo.toml, README.md...).
+    // Ils ne sont pas triés : l'ordre du slice est respecté.
+    for prepend in prepend_files {
+        let p = Path::new(prepend);
+        if p.exists() {
+            files.push(p.to_path_buf());
+        } else {
+            println!("[Omis] Fichier à inclure introuvable : {}", prepend);
+        }
     }
 
-    collect_files(path, &mut files, extension)?;
+    // Fichiers source du dossier racine, collectés puis triés.
+    // "Cargo.toml" < "src/..." lexicographiquement : il reste en tête
+    // même après le sort, ce qui donne le bon contexte au LLM.
+    let path = Path::new(root_dir);
+    if path.exists() {
+        collect_files(path, &mut files, extension)?;
+    } else {
+        println!("[Omis] Dossier introuvable pour la génération : {}", root_dir);
+    }
     files.sort();
-    
+
     let mut output = String::new();
     for file_path in &files {
         let absolute_rel_path = file_path.to_string_lossy().replace("\\", "/");
-        
+
         let (dossier, chemin_relatif) = if absolute_rel_path.starts_with(&format!("{}/", root_dir)) {
             let rel = absolute_rel_path.trim_start_matches(&format!("{}/", root_dir));
             let d = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
             let full_d = if d.is_empty() { root_dir.to_string() } else { format!("{}/{}", root_dir, d) };
             (full_d, rel.to_string())
         } else {
-            (absolute_rel_path.clone(), absolute_rel_path.clone())
+            // Fichier à la racine du projet (Cargo.toml, etc.)
+            (".".to_string(), absolute_rel_path.clone())
         };
-        
+
         let fichier = file_path.file_name().unwrap().to_string_lossy();
-        
+
         output.push_str("################################################################################
 ");
         output.push_str(&format!("# Dossier : {}\n", dossier));
@@ -84,19 +104,18 @@ fn generate_concatenated_txt(root_dir: &str, extension: &str, output_file: &str)
         output.push_str("################################################################################
 
 ");
-        
+
         let content = fs::read_to_string(file_path)?;
         output.push_str(&content);
         output.push_str("
 
 ");
     }
-    
+
     fs::write(output_file, output)?;
     println!("{} généré avec succès.", output_file);
     Ok(())
 }
-
 // ---------------------------------------------------
 
 fn main() -> Result<()> {
@@ -260,6 +279,15 @@ fn main() -> Result<()> {
         );
     }
 
+    // Plus-values réalisées sur le compte-titres seul : XTB hors PEA, FIFO refait sur
+    // ce compte (voir realized.rs). La crypto (Binance) est calculée à part.
+    println!();
+    print!(
+        "{}",
+        realized_summary(&tx_store, TaxAccount::Cto)?
+            .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
+    );
+
     println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
     let holdings = non_zero_holdings_at(&tx_store, None);
     let prices_eur: std::collections::HashMap<String, f64> =
@@ -311,8 +339,9 @@ fn main() -> Result<()> {
     println!("Cache des prix 1h sauvegardé : {cache_path:?}");
 
     // --- Génération des fichiers pour le LLM ---
-    generate_concatenated_txt("src", "rs", "forllm.txt")?;
-    generate_concatenated_txt("dashboard", "py", "forllmdashboard.txt")?;
+    generate_concatenated_txt("src", "rs", "forllm.txt", &["Cargo.toml"])?;
+    generate_concatenated_txt("dashboard", "py", "forllmdashboard.txt", &[])?;
 
     Ok(())
 }
+
