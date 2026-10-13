@@ -3,26 +3,36 @@
 //!
 //! Ré-exécutable sans risque : le tx_store est recréé from scratch à chaque run.
 //! Le cache des prix (price_cache.bin) persiste et bloque les appels API inutiles.
+//!
+//! `main` ne fait qu'enchaîner des étapes ; chacune vit dans sa fonction :
+//! construction du wallet -> tickers -> persistance -> valorisation
+//! (affichage) -> corrélations -> dashboard.json.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::Serialize;
 
-use portfolio_rs::ledger::cost_basis::compute_fifo;
-use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
-use portfolio_rs::ledger::positions::non_zero_holdings_at;
-use portfolio_rs::market::correlation::compute_correlation_matrices;
+use portfolio_rs::devtools;
+use portfolio_rs::ledger::cost_basis::{compute_fifo, CostBasisResult, RealizedGain};
 use portfolio_rs::ledger::history::record_weekly_history;
-use portfolio_rs::market::tickers::resolve_ticker;
-use portfolio_rs::parse::{binance, manual, xtb};
-use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
-use portfolio_rs::store::serialize::{TxStore, save_wallet};
-use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
+use portfolio_rs::ledger::portfolio::{portfolio_snapshot_at, AssetSnapshot, PortfolioSnapshot};
+use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::ledger::realized::{realized_summary, TaxAccount};
 use portfolio_rs::ledger::trades::{build_trade_frequency, build_trades};
+use portfolio_rs::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
+use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
+use portfolio_rs::market::tickers::resolve_ticker;
+use portfolio_rs::parse::{binance, manual, xtb};
+use portfolio_rs::schema::{AssetKind, DashboardAsset, DashboardData, TransactionKind};
+use portfolio_rs::store::serialize::{save_wallet, TxStore};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
+
+/// Symboles masqués dans le tableau de valorisation (poussière / hors suivi).
+const HIDDEN_SYMBOLS: &[&str] = &["USDC", "SOL", "ALGO"];
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -32,113 +42,68 @@ fn accounts_path() -> PathBuf {
     data_dir().join("accounts")
 }
 
-// --- NOUVEAU : Génération automatique des fichiers pour le LLM ---
-
-fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, extension: &str) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, files, extension)?;
-        } else if path.extension().map_or(false, |ext| ext == extension) {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn generate_concatenated_txt(
-    root_dir: &str,
-    extension: &str,
-    output_file: &str,
-    prepend_files: &[&str],
-) -> Result<()> {
-    let mut files = Vec::new();
-
-    // Fichiers isolés à inclure en tête (Cargo.toml, README.md...).
-    // Ils ne sont pas triés : l'ordre du slice est respecté.
-    for prepend in prepend_files {
-        let p = Path::new(prepend);
-        if p.exists() {
-            files.push(p.to_path_buf());
-        } else {
-            println!("[Omis] Fichier à inclure introuvable : {}", prepend);
-        }
-    }
-
-    // Fichiers source du dossier racine, collectés puis triés.
-    // "Cargo.toml" < "src/..." lexicographiquement : il reste en tête
-    // même après le sort, ce qui donne le bon contexte au LLM.
-    let path = Path::new(root_dir);
-    if path.exists() {
-        collect_files(path, &mut files, extension)?;
-    } else {
-        println!("[Omis] Dossier introuvable pour la génération : {}", root_dir);
-    }
-    files.sort();
-
-    let mut output = String::new();
-    for file_path in &files {
-        let absolute_rel_path = file_path.to_string_lossy().replace("\\", "/");
-
-        let (dossier, chemin_relatif) = if absolute_rel_path.starts_with(&format!("{}/", root_dir)) {
-            let rel = absolute_rel_path.trim_start_matches(&format!("{}/", root_dir));
-            let d = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-            let full_d = if d.is_empty() { root_dir.to_string() } else { format!("{}/{}", root_dir, d) };
-            (full_d, rel.to_string())
-        } else {
-            // Fichier à la racine du projet (Cargo.toml, etc.)
-            (".".to_string(), absolute_rel_path.clone())
-        };
-
-        let fichier = file_path.file_name().unwrap().to_string_lossy();
-
-        output.push_str("################################################################################
-");
-        output.push_str(&format!("# Dossier : {}\n", dossier));
-        output.push_str(&format!("# Fichier : {}\n", fichier));
-        output.push_str(&format!("# Chemin relatif : {}\n", chemin_relatif));
-        output.push_str("################################################################################
-
-");
-
-        let content = fs::read_to_string(file_path)?;
-        output.push_str(&content);
-        output.push_str("
-
-");
-    }
-
-    fs::write(output_file, output)?;
-    println!("{} généré avec succès.", output_file);
-    Ok(())
-}
-// ---------------------------------------------------
-
 fn main() -> Result<()> {
-    println!("=== CONSTRUCTION DU WALLET ===");
-    let cache_path = PathBuf::from("./data/cache");
-    init_price_caches(&cache_path);
+    let cache_dir = PathBuf::from("./data/cache");
+    init_price_caches(&cache_dir);
 
-    // Le wallet repart de zéro à chaque exécution
+    let mut tx_store = build_wallet()?;
+    warn_on_invalid_quantities(&tx_store);
+    resolve_missing_tickers(&mut tx_store);
+
+    save_wallet(&tx_store, Path::new("./data/tx_store.json"))?;
+    println!("tx_store.json regénéré.");
+
+    record_weekly_history(&tx_store, Path::new("./data/history.json"))?;
+
+    let snapshot = portfolio_snapshot_at(&tx_store, None);
+    let cost_basis = compute_fifo(&tx_store, None)?;
+
+    let latent_pnl = print_valuation(&snapshot, &cost_basis);
+    let realized_pnl = cost_basis.total_realized_pnl_stocks(&tx_store);
+    print_performance(latent_pnl, realized_pnl);
+    print_realized_by_stock(&cost_basis, &tx_store);
+
+    // Compte-titres seul : XTB hors PEA, FIFO refait sur ce compte (voir realized.rs).
+    println!();
+    print!(
+        "{}",
+        realized_summary(&tx_store, TaxAccount::Cto)?
+            .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
+    );
+
+    let correlations = compute_correlations(&tx_store, &snapshot);
+    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations);
+    let dashboard_path = PathBuf::from("./data/dashboard.json");
+    write_json(&dashboard_path, &dashboard)?;
+    println!("Dashboard écrit : {dashboard_path:?}");
+
+    save_price_caches(&cache_dir);
+    println!("Cache des prix 1h sauvegardé : {cache_dir:?}");
+
+    devtools::dump_for_llm()
+}
+
+// ---------------------------------------------------------------------
+// Construction du wallet
+// ---------------------------------------------------------------------
+
+/// Parse toutes les sources (Binance, XTB CTO + PEA, saisies manuelles).
+fn build_wallet() -> Result<TxStore> {
+    println!("=== CONSTRUCTION DU WALLET ===");
+    let accounts = accounts_path();
     let mut tx_store = TxStore::new();
 
-    let new_transactions = binance::parse_binance_sources(accounts_path());
-    let mut xtb_tx = Vec::new();
-    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account.xlsx")));
-    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
+    tx_store.add_transactions(binance::parse_binance_sources(accounts.clone()));
+    for file in ["account.xlsx", "account_pea.xlsx"] {
+        tx_store.add_transactions(xtb::parse_xtb_file(&accounts.join(file)));
+    }
+    tx_store.add_transactions(manual::parse_manual(&data_dir().join("manual_tx.json"))?);
 
-    // L'ajout des transactions va automatiquement "nourrir" le cache des prix
-    // au cas où le cache binaire aurait une trouée.
-    tx_store.add_transactions(new_transactions);
-    tx_store.add_transactions(xtb_tx);
+    Ok(tx_store)
+}
 
-    let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
-    tx_store.add_transactions(manual_tx);
-
+/// Un BUY/DEPOSIT à quantité <= 0 fait échouer le FIFO : on le signale ici.
+fn warn_on_invalid_quantities(tx_store: &TxStore) {
     println!("\n=== DIAGNOSTIC : BUY/DEPOSIT à quantité négative ===");
     for tx in &tx_store.transactions {
         if matches!(tx.kind, TransactionKind::Buy | TransactionKind::Deposit) && tx.quantity <= 0.0 {
@@ -148,29 +113,30 @@ fn main() -> Result<()> {
             );
         }
     }
+}
 
-    // --- RÉSOLUTION DES TICKERS MANQUANTS ---
+/// Renseigne `identifiers.ticker` des actifs qui n'en ont pas (hors cash).
+fn resolve_missing_tickers(tx_store: &mut TxStore) {
     println!("\n=== RÉSOLUTION DES TICKERS ===");
-    let mut resolved = 0;
-    let mut skipped = 0;
-    let mut failed = 0;
+    let (mut resolved, mut skipped, mut failed) = (0, 0, 0);
 
-    let symbols: Vec<String> = tx_store.assets.keys().cloned().collect();
-    for symbol in symbols {
-        let (kind, has_ticker) = {
-            let asset = tx_store.assets.get(&symbol).unwrap();
-            (asset.kind, asset.identifiers.ticker.is_some())
-        };
+    let candidates: Vec<(String, AssetKind, bool)> = tx_store
+        .assets
+        .iter()
+        .map(|(symbol, asset)| (symbol.clone(), asset.kind, asset.identifiers.ticker.is_some()))
+        .collect();
 
+    for (symbol, kind, has_ticker) in candidates {
         if kind == AssetKind::Cash || has_ticker {
             skipped += 1;
             continue;
         }
-
         match resolve_ticker(&symbol, kind) {
             Some(ticker) => {
                 println!("  ✓ {symbol:<12} -> {ticker}");
-                tx_store.assets.get_mut(&symbol).unwrap().identifiers.ticker = Some(ticker);
+                if let Some(asset) = tx_store.assets.get_mut(&symbol) {
+                    asset.identifiers.ticker = Some(ticker);
+                }
                 resolved += 1;
             }
             None => {
@@ -180,18 +146,30 @@ fn main() -> Result<()> {
         }
     }
     println!("({resolved} résolus, {skipped} ignorés, {failed} échoués)");
+}
 
-    // On écrase systématiquement tx_store.json (fichier jetable)
-    let tx_store_path = PathBuf::from("./data/tx_store.json");
-    save_wallet(&tx_store, &tx_store_path)?;
-    println!("tx_store.json regénéré.");
+// ---------------------------------------------------------------------
+// Affichage terminal
+// ---------------------------------------------------------------------
 
-    record_weekly_history(&tx_store, &PathBuf::from("./data/history.json"))?;
-    
+fn is_displayed(asset: &AssetSnapshot) -> bool {
+    asset.value_eur > 0.01 && asset.kind != AssetKind::Cash && !HIDDEN_SYMBOLS.contains(&asset.symbol.as_str())
+}
+
+/// Colonnes (cost basis, P&L, P&L %) d'une ligne, et le P&L à cumuler.
+fn pnl_columns(asset: &AssetSnapshot, cost_basis: &CostBasisResult) -> (String, String, String, f64) {
+    if cost_basis.average_cost(&asset.symbol).is_none() {
+        return (format!("{:>11}", "—"), format!("{:>11}", "—"), format!("{:>8}", "—"), 0.0);
+    }
+    let cb_total = cost_basis.open_cost_basis(&asset.symbol);
+    let pnl_eur = asset.value_eur - cb_total;
+    let pnl_pct = if cb_total > 0.0 { pnl_eur / cb_total * 100.0 } else { 0.0 };
+    (format!("{cb_total:>11.2}"), format!("{pnl_eur:>+11.2}"), format!("{pnl_pct:>+7.2}%"), pnl_eur)
+}
+
+/// Tableau de valorisation. Renvoie le P&L latent total affiché.
+fn print_valuation(snapshot: &PortfolioSnapshot, cost_basis: &CostBasisResult) -> f64 {
     println!("\n=== VALORISATION ACTUELLE ===");
-    let snapshot = portfolio_snapshot_at(&tx_store, None);
-    let cost_basis = compute_fifo(&tx_store, None)?;
-
     println!("Date: {}", snapshot.date);
     println!("Valeur totale: {:.2} EUR", snapshot.total_value_eur);
     println!("Détail par actif:");
@@ -201,147 +179,102 @@ fn main() -> Result<()> {
     );
 
     let mut total_pnl = 0.0;
-    for asset in &snapshot.assets {
-        if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") || asset.kind == AssetKind::Cash {
-            continue; 
-        }
-
-        let avg_cost = cost_basis.average_cost(&asset.symbol);
-        let cb_total = cost_basis.open_cost_basis(&asset.symbol);
-
-        let (cb_str, pnl_eur_str, pnl_pct_str) = match avg_cost {
-            Some(_) => {
-                let pnl_eur = asset.value_eur - cb_total;
-                let pnl_pct = if cb_total > 0.0 { pnl_eur / cb_total * 100.0 } else { 0.0 };
-                total_pnl += pnl_eur;
-                (format!("{cb_total:>11.2}"), format!("{pnl_eur:>+11.2}"), format!("{pnl_pct:>+7.2}%"))
-            }
-            None => (format!("{:>11}", "—"), format!("{:>11}", "—"), format!("{:>8}", "—")),
-        };
-
+    for asset in snapshot.assets.iter().filter(|a| is_displayed(a)) {
+        let (cb, pnl, pct, pnl_eur) = pnl_columns(asset, cost_basis);
+        total_pnl += pnl_eur;
         println!(
             "  {:<10} {:>10.4} {:>10.2} {:>12.2} {} {} {}",
-            asset.symbol, asset.quantity, asset.price_eur, asset.value_eur, cb_str, pnl_eur_str, pnl_pct_str
+            asset.symbol, asset.quantity, asset.price_eur, asset.value_eur, cb, pnl, pct
         );
     }
 
     println!("\nP&L latent total : {total_pnl:>+.2} EUR");
+    total_pnl
+}
 
-        
-    // On ignore la crypto : les WITHDRAW (transferts entre wallets/exchanges)
-    // sont comptés comme des "ventes" FIFO, ce qui gonfle artificiellement le
-    // P&L réalisé alors qu'aucune vente réelle n'a eu lieu côté crypto.
-    let stock_symbols: std::collections::HashSet<&str> = tx_store
-        .assets
-        .values()
-        .filter(|a| a.kind == AssetKind::Stock)
-        .map(|a| a.symbol.as_str())
-        .collect();
-
-    let total_realized_pnl_stocks: f64 = cost_basis
-        .realized_gains
-        .iter()
-        .filter(|g| stock_symbols.contains(g.symbol.as_str()))
-        .map(|g| g.pnl_eur)
-        .sum();
-
-    let overall_pnl = total_pnl + total_realized_pnl_stocks;
-
-    println!("P&L réalisé total (actions uniquement) : {total_realized_pnl_stocks:>+.2} EUR");
+fn print_performance(latent_pnl: f64, realized_pnl: f64) {
+    println!("P&L réalisé total (actions uniquement) : {realized_pnl:>+.2} EUR");
     println!("\n=== PERFORMANCE GLOBALE (latent + réalisé actions) ===");
-    println!("Overall P&L : {overall_pnl:>+.2} EUR  (latent {total_pnl:>+.2} + réalisé {total_realized_pnl_stocks:>+.2})");
+    println!(
+        "Overall P&L : {:>+.2} EUR  (latent {latent_pnl:>+.2} + réalisé {realized_pnl:>+.2})",
+        latent_pnl + realized_pnl
+    );
+}
 
-
+fn print_realized_by_stock(cost_basis: &CostBasisResult, tx_store: &TxStore) {
     println!("\nDétail P&L réalisé par action :");
     println!("  {:<10} {:>10} {:>12} {:>12} {:>12}", "Symbole", "Qty", "Produit", "Coût", "P&L");
 
-    let mut realized_by_stock: std::collections::HashMap<&str, Vec<&portfolio_rs::ledger::cost_basis::RealizedGain>> =
-        std::collections::HashMap::new();
-    for g in cost_basis.realized_gains.iter().filter(|g| stock_symbols.contains(g.symbol.as_str())) {
-        realized_by_stock.entry(g.symbol.as_str()).or_default().push(g);
+    // BTreeMap : symboles déjà triés.
+    let mut by_symbol: BTreeMap<&str, Vec<&RealizedGain>> = BTreeMap::new();
+    for gain in cost_basis.stock_realized_gains(tx_store) {
+        by_symbol.entry(gain.symbol.as_str()).or_default().push(gain);
     }
 
-    let mut symbols_sorted: Vec<&&str> = realized_by_stock.keys().collect();
-    symbols_sorted.sort();
-
-    for symbol in symbols_sorted {
-        let gains = &realized_by_stock[symbol];
+    for (symbol, gains) in by_symbol {
         let qty: f64 = gains.iter().map(|g| g.quantity).sum();
         let proceeds: f64 = gains.iter().map(|g| g.proceeds_eur).sum();
         let cost: f64 = gains.iter().map(|g| g.cost_eur).sum();
         let pnl: f64 = gains.iter().map(|g| g.pnl_eur).sum();
-        let has_incomplete = gains.iter().any(|g| g.incomplete);
+        let flag = if gains.iter().any(|g| g.incomplete) { "  ⚠ incomplet" } else { "" };
 
-        println!(
-            "  {:<10} {:>10.4} {:>12.2} {:>12.2} {:>+12.2}{}",
-            symbol, qty, proceeds, cost, pnl,
-            if has_incomplete { "  ⚠ incomplet" } else { "" }
-        );
+        println!("  {symbol:<10} {qty:>10.4} {proceeds:>12.2} {cost:>12.2} {pnl:>+12.2}{flag}");
     }
+}
 
-    // Plus-values réalisées sur le compte-titres seul : XTB hors PEA, FIFO refait sur
-    // ce compte (voir realized.rs). La crypto (Binance) est calculée à part.
-    println!();
-    print!(
-        "{}",
-        realized_summary(&tx_store, TaxAccount::Cto)?
-            .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
-    );
+// ---------------------------------------------------------------------
+// Corrélations et dashboard.json
+// ---------------------------------------------------------------------
 
+fn compute_correlations(tx_store: &TxStore, snapshot: &PortfolioSnapshot) -> CorrelationMatrices {
     println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
-    let holdings = non_zero_holdings_at(&tx_store, None);
-    let prices_eur: std::collections::HashMap<String, f64> =
+    let holdings = non_zero_holdings_at(tx_store, None);
+    let prices_eur: HashMap<String, f64> =
         snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
-    let correlation_matrices = compute_correlation_matrices(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR);
-    
-    let dashboard_assets: Vec<DashboardAsset> = snapshot
-        .assets
-        .iter()
-        .map(|a| {
-            let cost_basis_eur = cost_basis.open_cost_basis(&a.symbol);
-            let pnl_eur = a.value_eur - cost_basis_eur;
-            let pnl_pct = if cost_basis_eur > 0.0 { pnl_eur / cost_basis_eur * 100.0 } else { 0.0 };
-            let realized_pnl_eur = cost_basis.total_realized_pnl(Some(&a.symbol));
-            DashboardAsset {
-                symbol: a.symbol.clone(),
-                kind: a.kind.as_str().to_string(),
-                ticker: a.ticker.clone(),
-                quantity: a.quantity,
-                price_eur: a.price_eur,
-                value_eur: a.value_eur,
-                cost_basis_eur,
-                pnl_eur,
-                pnl_pct,
-                realized_pnl_eur
-            }
-        })
-        .collect();
+    compute_correlation_matrices(tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR)
+}
 
-    let total_cost_basis_eur: f64 = dashboard_assets.iter().map(|a| a.cost_basis_eur).sum();
-    let dashboard_data = DashboardData {
+fn dashboard_asset(asset: &AssetSnapshot, cost_basis: &CostBasisResult) -> DashboardAsset {
+    let cost_basis_eur = cost_basis.open_cost_basis(&asset.symbol);
+    let pnl_eur = asset.value_eur - cost_basis_eur;
+    let pnl_pct = if cost_basis_eur > 0.0 { pnl_eur / cost_basis_eur * 100.0 } else { 0.0 };
+
+    DashboardAsset {
+        symbol: asset.symbol.clone(),
+        kind: asset.kind.as_str().to_string(),
+        ticker: asset.ticker.clone(),
+        quantity: asset.quantity,
+        price_eur: asset.price_eur,
+        value_eur: asset.value_eur,
+        cost_basis_eur,
+        pnl_eur,
+        pnl_pct,
+        realized_pnl_eur: cost_basis.total_realized_pnl(Some(&asset.symbol)),
+    }
+}
+
+fn build_dashboard(
+    tx_store: &TxStore,
+    snapshot: &PortfolioSnapshot,
+    cost_basis: &CostBasisResult,
+    correlation_matrices: CorrelationMatrices,
+) -> DashboardData {
+    let assets: Vec<DashboardAsset> = snapshot.assets.iter().map(|a| dashboard_asset(a, cost_basis)).collect();
+    let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
+
+    DashboardData {
         total_value_eur: snapshot.total_value_eur,
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
-        realized_pnl_eur: total_realized_pnl_stocks,
-        trades: build_trades(&tx_store),
-        trade_frequency: build_trade_frequency(&tx_store),
-        assets: dashboard_assets,
+        realized_pnl_eur: cost_basis.total_realized_pnl_stocks(tx_store),
+        trades: build_trades(tx_store),
+        trade_frequency: build_trade_frequency(tx_store),
+        assets,
         correlation_matrices,
-    };
- 
-    let dashboard_path = PathBuf::from("./data/dashboard.json");
-
-    std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
-    println!("Dashboard écrit : {dashboard_path:?}");
-
-    // Sauvegarde atomique et définitive du cache de prix
-    save_price_caches(&cache_path);
-    println!("Cache des prix 1h sauvegardé : {cache_path:?}");
-
-    // --- Génération des fichiers pour le LLM ---
-    generate_concatenated_txt("src", "rs", "forllm.txt", &["Cargo.toml"])?;
-    generate_concatenated_txt("dashboard", "py", "forllmdashboard.txt", &[])?;
-
-    Ok(())
+    }
 }
 
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    fs::write(path, serde_json::to_string_pretty(value)?)?;
+    Ok(())
+}
