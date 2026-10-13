@@ -16,6 +16,7 @@ pub mod market;
 pub mod parse;
 pub mod schema;
 pub mod store;
+pub mod devtools;
 
 #[cfg(test)]
 mod testutil;
