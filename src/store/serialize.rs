@@ -57,7 +57,9 @@ impl TxStore {
     pub fn new() -> Self {
         Self::default()
     }
-
+    pub fn is_stock(&self, symbol: &str) -> bool {
+    self.assets.get(symbol).map(|a| a.kind) == Some(AssetKind::Stock)
+    }
     pub fn find_or_create_asset(
         &mut self,
         symbol: &str,
