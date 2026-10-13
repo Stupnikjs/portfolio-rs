@@ -24,6 +24,7 @@ pub struct XtbClosedPosition {
     pub close_time: DateTime<Utc>,
     pub close_price: f64,
     pub purchase_value: f64,
+    pub occurrence: usize,
     pub sale_value: f64,
     pub source_file: String,
 }
@@ -50,7 +51,7 @@ impl XtbClosedPosition {
                 quote_currency: None,
                 time: self.open_time,
                 value_eur: self.purchase_value,
-                external_id: Some(format!("{}-buy", self.position_id)),
+                external_id: Some(self.ext_id("buy")),
                 remark: None,
                 source_file: self.source_file.clone(),
             },
@@ -65,11 +66,18 @@ impl XtbClosedPosition {
                 quote_currency: None,
                 time: self.close_time,
                 value_eur: self.sale_value,
-                external_id: Some(format!("{}-sell", self.position_id)),
+                external_id: Some(self.ext_id("sell")),
                 remark: None,
                 source_file: self.source_file.clone(),
             },
         ]
+    }
+    fn ext_id(&self, leg: &str) -> String {
+        if self.occurrence == 0 {
+            format!("{}-{leg}", self.position_id)
+        } else {
+            format!("{}#{}-{leg}", self.position_id, self.occurrence)
+        }
     }
 }
 
@@ -275,21 +283,28 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str, known_ids: &std::co
     let col_map = column_map(&rows[header_idx]);
     let mut out = Vec::new();
 
+    let mut seen: HashMap<String, usize> = HashMap::new();
     for row in &rows[header_idx + 1..] {
         let position_id = match cell_f64(col(row, &col_map, "Position ID")?) {
             Some(id) => (id as i64).to_string(),
             None => continue,
         };
-
+        let occurrence = {
+        let n = seen.entry(position_id.clone()).or_insert(0);
+        let current = *n;
+        *n += 1;
+        current
+        };
         // SKIP EARLY
         let buy_id = format!("{}-buy", position_id);
         let sell_id = format!("{}-sell", position_id);
         if known_ids.contains(&buy_id) && known_ids.contains(&sell_id) {
             continue;
         }
-
+       
         out.push(XtbClosedPosition {
             position_id,
+            occurrence,
             symbol: cell_str(col(row, &col_map, "Ticker")?),
             volume: cell_f64(col(row, &col_map, "Volume")?).unwrap_or(0.0),
             open_time: cell_datetime(col(row, &col_map, "Open Time (UTC)")?)?,

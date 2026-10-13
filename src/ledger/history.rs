@@ -13,6 +13,13 @@
 //! manquantes, et seulement celles dont la journée est terminée
 //! (date < aujourd'hui) : la semaine / le mois en cours n'est pas écrit.
 //!
+//! Le P&L total d'une entrée = latent (valeur - cost basis des lots ouverts)
+//! + plus-values RÉALISÉES CUMULÉES jusqu'à la date du snapshot. Sans le
+//! réalisé, une vente fait disparaître son gain de toutes les courbes (le
+//! produit part en cash, exclu de l'historique). Seules les actions
+//! (`AssetKind::Stock`) comptent, comme dans `main.rs` : les WITHDRAW crypto
+//! sont vus comme des ventes FIFO et fausseraient le résultat.
+//!
 //! Le cash (EUR, USDC, USD...) est EXCLU de l'historique : ses dépôts
 //! créent des lots à coût de revient plein alors que les achats ne le
 //! consomment pas toujours (jambes cash non tracées), ce qui gonfle le
@@ -76,7 +83,7 @@ impl Frequency {
 
 /// Version du format des entrées. Une entrée de version inférieure (ancien
 /// history.json, calculé avec des prix figés) est recalculée.
-pub const HISTORY_ENTRY_VERSION: u32 = 2;
+pub const HISTORY_ENTRY_VERSION: u32 = 3;
 
 /// Fiabilité du prix utilisé pour un actif dans un snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -112,7 +119,14 @@ pub struct HistoryEntry {
     pub date: String,
     pub total_value_eur: f64,
     pub total_cost_basis_eur: f64,
+    /// P&L total = latent + réalisé cumulé.
     pub total_pnl_eur: f64,
+    /// Latent : valeur - cost basis des lots ouverts. 0 pour une entrée < v3.
+    #[serde(default)]
+    pub unrealized_pnl_eur: f64,
+    /// Plus-values réalisées cumulées (actions) jusqu'à cette date. 0 pour une entrée < v3.
+    #[serde(default)]
+    pub realized_pnl_eur: f64,
     /// 0 pour un ancien fichier (champ absent) -> entrée recalculée.
     #[serde(default)]
     pub version: u32,
@@ -270,11 +284,29 @@ fn build_entry(
     let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
     let complete = assets.iter().all(|a| a.price_status == PriceStatus::Ok);
 
+    // Plus-values réalisées cumulées jusqu'à `at` (compute_fifo est déjà borné à `at`),
+    // actions uniquement -- même périmètre que `total_realized_pnl_stocks` de main.rs.
+    let stock_symbols: std::collections::HashSet<&str> = tx_store
+        .assets
+        .values()
+        .filter(|a| a.kind == AssetKind::Stock)
+        .map(|a| a.symbol.as_str())
+        .collect();
+    let realized_pnl_eur: f64 = cost_basis
+        .realized_gains
+        .iter()
+        .filter(|g| stock_symbols.contains(g.symbol.as_str()))
+        .map(|g| g.pnl_eur)
+        .sum();
+    let unrealized_pnl_eur = total_value_eur - total_cost_basis_eur;
+
     Ok(HistoryEntry {
         date: target.format("%Y-%m-%d").to_string(),
         total_value_eur,
         total_cost_basis_eur,
-        total_pnl_eur: total_value_eur - total_cost_basis_eur,
+        total_pnl_eur: unrealized_pnl_eur + realized_pnl_eur,
+        unrealized_pnl_eur,
+        realized_pnl_eur,
         version: HISTORY_ENTRY_VERSION,
         complete,
         assets,
@@ -398,6 +430,8 @@ mod tests {
             total_value_eur: 1.0,
             total_cost_basis_eur: 1.0,
             total_pnl_eur: 0.0,
+            unrealized_pnl_eur: 0.0,
+            realized_pnl_eur: 0.0,
             version: 0,
             complete: false,
             assets: Vec::new(),
@@ -718,7 +752,8 @@ mod tests {
             let cost: f64 = e.assets.iter().map(|a| a.cost_basis_eur).sum();
             assert!(approx(e.total_value_eur, value), "{}", e.date);
             assert!(approx(e.total_cost_basis_eur, cost), "{}", e.date);
-            assert!(approx(e.total_pnl_eur, value - cost), "{}", e.date);
+            assert!(approx(e.unrealized_pnl_eur, value - cost), "{}", e.date);
+            assert!(approx(e.total_pnl_eur, e.unrealized_pnl_eur + e.realized_pnl_eur), "{}", e.date);
             assert!(e.assets.iter().all(|a| approx(a.value_eur, a.quantity * a.price_eur)), "{}", e.date);
             assert_eq!(e.version, HISTORY_ENTRY_VERSION);
             assert!(e.complete);
@@ -875,6 +910,51 @@ mod tests {
         assert_eq!(read(&tmp.file()).len(), 5);
     }
 
+
+    // --- plus-values réalisées dans le P&L cumulé ---
+
+    #[test]
+    fn total_pnl_includes_cumulative_realized_gains_on_stocks_only() {
+        let s = store(vec![
+            tx(Buy, "BTC", AssetKind::Crypto, 1.0, 40_000.0, "2026-01-02T10:00:00Z", "r1"),
+            tx(Buy, "AIR", AssetKind::Stock, 10.0, 900.0, "2026-02-10T10:00:00Z", "r2"),
+            // 4 AIR vendus le 10/03 : coût FIFO 360, produit 500 -> +140 réalisés.
+            tx(Sell, "AIR", AssetKind::Stock, 4.0, 500.0, "2026-03-10T10:00:00Z", "r3"),
+            // Vente crypto : ne doit PAS compter dans le réalisé de l'historique.
+            tx(Sell, "BTC", AssetKind::Crypto, 0.5, 26_000.0, "2026-03-10T11:00:00Z", "r4"),
+        ]);
+        let tmp = TmpDir::new("realized");
+        run(&s, &tmp.file(), &moving(), false);
+        let h = read(&tmp.file());
+
+        // Avant la vente (02/03) : rien de réalisé, total = latent.
+        let before = entry_at(&h, "2026-03-02");
+        assert!(approx(before.realized_pnl_eur, 0.0));
+        assert!(approx(before.total_pnl_eur, before.unrealized_pnl_eur));
+
+        // Après la vente (06/04) : +140 cumulés, inclus dans le total.
+        let after = entry_at(&h, "2026-04-06");
+        assert!(approx(after.realized_pnl_eur, 140.0));
+        assert!(approx(after.total_pnl_eur, after.unrealized_pnl_eur + 140.0));
+
+        // Cumulatif : toujours présent dans les snapshots suivants.
+        assert!(approx(entry_at(&h, "2026-05-04").realized_pnl_eur, 140.0));
+    }
+
+    #[test]
+    fn entries_older_than_v3_are_recomputed_to_get_realized_pnl() {
+        let tmp = TmpDir::new("v2_entries");
+        std::fs::write(
+            tmp.file(),
+            r#"[{"date":"2026-01-05","total_value_eur":50040.0,"total_cost_basis_eur":40000.0,"total_pnl_eur":10040.0,"version":2,"complete":true,"assets":[]}]"#,
+        )
+        .unwrap();
+        run(&fixture(), &tmp.file(), &moving(), false);
+
+        let h = read(&tmp.file());
+        assert!(h.iter().all(|e| e.version == HISTORY_ENTRY_VERSION));
+    }
+
     // --- hebdomadaire ---
 
     #[test]
@@ -990,7 +1070,8 @@ mod tests {
             let value: f64 = e.assets.iter().map(|a| a.value_eur).sum();
             let cost: f64 = e.assets.iter().map(|a| a.cost_basis_eur).sum();
             assert!(approx(e.total_value_eur, value), "{}", e.date);
-            assert!(approx(e.total_pnl_eur, value - cost), "{}", e.date);
+            assert!(approx(e.unrealized_pnl_eur, value - cost), "{}", e.date);
+            assert!(approx(e.total_pnl_eur, e.unrealized_pnl_eur + e.realized_pnl_eur), "{}", e.date);
         }
     }
 
@@ -1040,4 +1121,3 @@ mod tests {
         assert!(entry_at(&read(&tmp.file()), "2026-03-01").complete);
     }
 }
-

@@ -99,10 +99,11 @@ impl TxStore {
             );
 
             let ext_id = tx.external_id.clone();
+            
             let mut stored_tx = tx;
             stored_tx.asset = local_asset;
             self.transactions.push(stored_tx);
-
+            
             if let Some(ext_id) = ext_id {
                 self.known_external_ids.insert(ext_id);
             }

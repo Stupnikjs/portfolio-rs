@@ -1868,12 +1868,13 @@ def history_to_df(raw: list[dict]) -> pd.DataFrame:
         raise ValueError(f"history.json : colonne(s) manquante(s) : {', '.join(sorted(missing))}")
 
     df["date"] = pd.to_datetime(df["date"])
+    
     df["complete"] = df["complete"].fillna(True).astype(bool) if "complete" in df.columns else True
     if "total_pnl_eur" not in df.columns:
         df["total_pnl_eur"] = df["total_value_eur"] - df["total_cost_basis_eur"]
     if "assets" not in df.columns:
         df["assets"] = None
-
+       
     return (
         df.sort_values("date")
         .drop_duplicates(subset="date", keep="last")
