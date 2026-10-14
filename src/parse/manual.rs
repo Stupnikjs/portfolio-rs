@@ -68,6 +68,7 @@ pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
             external_id: Some(format!("manual-{raw_id}")),
             remark: entry.get("remark").and_then(|v| v.as_str()).map(String::from),
             source_file: path.display().to_string(),
+            cash_flow: None,
         });
     }
 

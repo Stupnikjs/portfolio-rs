@@ -42,6 +42,16 @@ impl TransactionKind {
     }
 }
 
+/// Nature d'un mouvement de cash (posée par les parsers qui la connaissent : XTB).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CashFlowKind {
+    ExternalDeposit,    // virement entrant
+    ExternalWithdrawal, // virement sortant
+    Income,             // dividende, intérêts
+    TradeLeg,           // jambe cash d'un achat / d'une vente
+    Tax,                // retenue à la source, taxe
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AssetKind {
     Cash,
@@ -94,4 +104,7 @@ pub struct Transaction {
     pub external_id: Option<String>,
     pub remark: Option<String>,
     pub source_file: String,
+    /// Nature du mouvement s'il s'agit de cash (None pour tout le reste).
+    #[serde(default)]
+    pub cash_flow: Option<CashFlowKind>,
 }

@@ -46,6 +46,8 @@ pub fn tx(
         external_id: Some(id.to_string()),
         remark: None,
         source_file: "test".to_string(),
+        cash_flow:None,
+        
     }
 }
 

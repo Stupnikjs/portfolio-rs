@@ -107,6 +107,7 @@ pub fn parse_trades(
                 external_id: Some(trade_id.clone()),
                 remark: None,
                 source_file: source_file.clone(),
+                cash_flow: None,
             });
 
             if fee_amount > 0.0 {
@@ -132,6 +133,7 @@ pub fn parse_trades(
                     external_id: None,
                     remark: Some(format!("Fee on {side} {base_symbol}")),
                     source_file: source_file.clone(),
+                    cash_flow: None,
                 });
             }
             Ok(())
@@ -252,6 +254,7 @@ pub fn parse_converts(
             external_id: Some(format!("{convert_id}-sell")),
             remark: Some("Convert".to_string()),
             source_file: source_file.clone(),
+            cash_flow: None,
         });
         out.push(Transaction {
             platform: Platform::Binance,
@@ -267,6 +270,7 @@ pub fn parse_converts(
             external_id: Some(format!("{convert_id}-buy")),
             remark: Some("Convert".to_string()),
             source_file: source_file.clone(),
+            cash_flow: None,
         });
     }
 

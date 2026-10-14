@@ -11,7 +11,8 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use once_cell::sync::Lazy;
 
 use crate::market::client::{MarketDataClient, normalize_currency_for_fx};
-use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind, CashFlowKind};
+
 
 #[derive(Debug, Clone)]
 pub struct XtbClosedPosition {
@@ -53,6 +54,7 @@ impl XtbClosedPosition {
                 external_id: Some(self.ext_id("buy")),
                 remark: None,
                 source_file: self.source_file.clone(),
+                cash_flow: None,
             },
             Transaction {
                 platform: Platform::Xtb,
@@ -68,6 +70,7 @@ impl XtbClosedPosition {
                 external_id: Some(self.ext_id("sell")),
                 remark: None,
                 source_file: self.source_file.clone(),
+                cash_flow: None,
             },
         ]
     }
@@ -116,6 +119,7 @@ impl XtbOpenPosition {
             external_id: Some(self.position_id.clone()),
             remark: self.comment.clone(),
             source_file: self.source_file.clone(),
+            cash_flow: None,
         }
     }
 }
@@ -341,15 +345,16 @@ pub fn parse_open_positions(path: &Path, sheet_name: &str, known_ids: &HashSet<S
     Ok(out)
 }
 
-fn cash_kind_for(op_type: &str) -> Option<TransactionKind> {
+fn cash_kind_for(op_type: &str) -> Option<(TransactionKind, CashFlowKind)> {
+    use CashFlowKind::*;
+    use TransactionKind as K;
     match op_type {
-        "Deposit" | "Free funds interest" => Some(TransactionKind::Deposit),
-        "Stock purchase" => Some(TransactionKind::Withdraw),
-        "Stock sell" => Some(TransactionKind::Deposit),
-        "Dividend" => Some(TransactionKind::Deposit),
-        "Withholding tax" => Some(TransactionKind::Fee),
-        "Tax IFTT" => Some(TransactionKind::Fee),
-        "Fractional shares" => Some(TransactionKind::Deposit),
+        "Deposit" => Some((K::Deposit, ExternalDeposit)),
+        "Withdrawal" => Some((K::Withdraw, ExternalWithdrawal)), // nom à confirmer sur ton export
+        "Free funds interest" | "Dividend" => Some((K::Deposit, Income)),
+        "Stock purchase" => Some((K::Withdraw, TradeLeg)),
+        "Stock sell" | "Fractional shares" => Some((K::Deposit, TradeLeg)),
+        "Withholding tax" | "Tax IFTT" => Some((K::Fee, Tax)),
         _ => None,
     }
 }
@@ -380,7 +385,8 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
             continue;
         }
 
-        let kind = cash_kind_for(&op_type).ok_or_else(|| anyhow!("Type d'opération Cash non géré: {op_type:?}"))?;
+        let (kind, cash_flow) = cash_kind_for(&op_type)
+    .ok_or_else(|| anyhow!("Type d'opération Cash non géré: {op_type:?}"))?;
         let amount = cell_f64(col(row, &col_map, "Amount")?).unwrap_or(0.0);
         let op_id = cell_str(col(row, &col_map, "ID")?);
         let comment = if has_col(&col_map, "Comment") { cell_str(col(row, &col_map, "Comment")?) } else { String::new() };
@@ -388,7 +394,8 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
         out.push(Transaction {
             platform: Platform::Xtb,
             account_label: "XTB".to_string(),
-            kind,
+            kind: kind,
+            cash_flow: Some(cash_flow),
             asset: eur_asset.clone(),
             quantity: amount.abs(),
             price: Some(1.0),

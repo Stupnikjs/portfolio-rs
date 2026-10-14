@@ -30,7 +30,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 
 use crate::ledger::portfolio::{portfolio_snapshot_with, PriceFn};
 use crate::ledger::realized::TaxAccount;
-use crate::ledger::scope::scope_to_account;
+use crate::ledger::scope::scope_to_accounts;
 use crate::schema::{CashFlowKind, Tranche, TrancheReport, Transaction};
 use crate::store::serialize::TxStore;
 
@@ -261,16 +261,20 @@ fn valuation(scoped: &TxStore, at: DateTime<Utc>, price_fn: PriceFn) -> Valuatio
     Valuation { value_eur: snapshot.total_value_eur, missing_prices }
 }
 
-/// Rapport par tranche d'un compte fiscal (CTO, PEA...).
+/// Rapport par tranche d'un ou plusieurs comptes fiscaux vus comme un seul.
 /// `label` est le nom affiché dans dashboard.json.
+///
+/// Passer `&[Cto, Pea]` quand les virements CTO -> PEA sont ignorés par le
+/// parser (`PEA deposit`) : pris séparément, le cash sorti du CTO y reste
+/// comme du cash fantôme ; réunis, les deux jambes s'annulent.
 pub fn tranche_report(
     tx_store: &TxStore,
-    account: TaxAccount,
+    accounts: &[TaxAccount],
     label: &str,
     price_fn: PriceFn,
     now: DateTime<Utc>,
 ) -> TrancheReport {
-    let scoped = scope_to_account(tx_store, account);
+    let scoped = scope_to_accounts(tx_store, accounts);
     let flows = external_flows(&scoped);
     let mut value_at = |at: DateTime<Utc>| valuation(&scoped, at, price_fn);
     build_report(label, &flows, now, &mut value_at)
@@ -504,7 +508,7 @@ mod tests {
             _ => 0.0,
         };
 
-        let r = tranche_report(&s, TaxAccount::Cto, "CTO", &prices, utc("2025-06-01T00:00:00Z"));
+        let r = tranche_report(&s, &[TaxAccount::Cto], "CTO", &prices, utc("2025-06-01T00:00:00Z"));
 
         assert_eq!(r.account, "CTO");
         assert_eq!(r.tranches.len(), 1);
@@ -512,5 +516,44 @@ mod tests {
         assert!(approx(r.current_value_eur, 1_200.0)); // 10 AIR x 120, cash à 0
         assert!(approx(r.tranches[0].roi_pct, 20.0));
         assert!(r.warnings.is_empty());
+    }
+
+    /// Virement CTO -> PEA ignoré par le parser : l'apport est sur le CTO, l'achat
+    /// (et sa jambe cash) sur le PEA, sans entrée de cash correspondante sur le PEA.
+    fn transfer_ignored_fixture() -> TxStore {
+        store(vec![
+            xtb(CTO_FILE, Deposit, "EUR", AssetKind::Cash, 1_000.0, 1_000.0, "2025-01-01T10:00:00Z", "c1", Some(CashFlowKind::ExternalDeposit)),
+            xtb(PEA_FILE, Buy, "AIR", AssetKind::Stock, 10.0, 1_000.0, "2025-01-02T10:00:00Z", "s1", None),
+            xtb(PEA_FILE, Withdraw, "EUR", AssetKind::Cash, 1_000.0, 1_000.0, "2025-01-02T10:00:00Z", "c2", Some(CashFlowKind::TradeLeg)),
+        ])
+    }
+
+    fn air_at_120(symbol: &str, _k: AssetKind, _t: Option<&str>, _at: DateTime<Utc>) -> f64 {
+        match symbol {
+            "EUR" => 1.0,
+            "AIR" => 120.0,
+            _ => 0.0,
+        }
+    }
+
+    #[test]
+    fn cto_and_pea_grouped_cancel_the_ignored_transfer() {
+        let s = transfer_ignored_fixture();
+        let now = utc("2025-06-01T00:00:00Z");
+        let r = tranche_report(&s, &[TaxAccount::Cto, TaxAccount::Pea], "XTB", &air_at_120, now);
+
+        assert!(approx(r.current_value_eur, 1_200.0)); // cash 1000 - 1000 = 0, AIR 1200
+        assert!(approx(r.tranches[0].roi_pct, 20.0));
+    }
+
+    #[test]
+    fn cto_alone_keeps_phantom_cash_when_the_transfer_is_ignored() {
+        // Documente le piège : séparé du PEA, le CTO garde 1000 EUR de cash fantôme.
+        let s = transfer_ignored_fixture();
+        let now = utc("2025-06-01T00:00:00Z");
+        let r = tranche_report(&s, &[TaxAccount::Cto], "CTO", &air_at_120, now);
+
+        assert!(approx(r.current_value_eur, 1_000.0));
+        assert!(approx(r.tranches[0].roi_pct, 0.0));
     }
 }

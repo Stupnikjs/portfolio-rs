@@ -27,6 +27,10 @@ use portfolio_rs::market::correlation::{compute_correlation_matrices, Correlatio
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{save_wallet, TxStore};
+use chrono::{DateTime, Utc};
+use portfolio_rs::ledger::tranches::{tranche_report};
+use portfolio_rs::schema::TrancheReport;
+
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -78,7 +82,8 @@ fn main() -> Result<()> {
 
     // 5. Corrélations et Dashboard
     let correlations = compute_correlations(&tx_store, &snapshot, &market_client);
-    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations);
+    let tranches = compute_tranches(&tx_store, &market_client);
+    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations, tranches);
     let dashboard_path = PathBuf::from("./data/dashboard.json");
     write_json(&dashboard_path, &dashboard)?;
     println!("Dashboard écrit : {dashboard_path:?}");
@@ -267,6 +272,7 @@ fn build_dashboard(
     snapshot: &PortfolioSnapshot,
     cost_basis: &CostBasisResult,
     correlation_matrices: CorrelationMatrices,
+    tranches:Vec<TrancheReport>,
 ) -> DashboardData {
     let assets: Vec<DashboardAsset> = snapshot.assets.iter().map(|a| dashboard_asset(a, cost_basis)).collect();
     let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
@@ -280,10 +286,53 @@ fn build_dashboard(
         trade_frequency: build_trade_frequency(tx_store),
         assets,
         correlation_matrices,
+        tranches, 
     }
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     fs::write(path, serde_json::to_string_pretty(value)?)?;
     Ok(())
+}
+
+/// CTO + PEA regroupés en UN compte : les virements CTO -> PEA sont ignorés par
+/// le parser (`PEA deposit`), donc seuls les deux comptes réunis ont un cash cohérent.
+fn compute_tranches(tx_store: &TxStore, market_client: &MarketDataClient) -> Vec<TrancheReport> {
+    println!("\n=== RETOUR PAR TRANCHE DE CASH (CTO + PEA regroupés) ===");
+    let live_prices = |symbol: &str, kind: AssetKind, ticker: Option<&str>, at: DateTime<Utc>| {
+        market_client.historical_price_eur(symbol, at, kind, ticker)
+    };
+
+    let report = tranche_report(
+        tx_store,
+        &[TaxAccount::Cto, TaxAccount::Pea],
+        "XTB (CTO + PEA)",
+        &live_prices,
+        Utc::now(),
+    );
+    print_tranche_report(&report);
+    vec![report]
+}
+
+fn print_tranche_report(r: &TrancheReport) {
+    println!(
+        "--- {} : apports nets {:.2} EUR, valeur {:.2} EUR, gain {:+.2} EUR, TWR {:+.2}%",
+        r.account, r.net_contributions_eur, r.current_value_eur, r.total_gain_eur, r.time_weighted_return_pct
+    );
+    println!("  {:<12} {:>12} {:>10} {:>10} {:>12}", "Date", "Apporté", "ROI", "Annualisé", "Gain total");
+    for t in &r.tranches {
+        let annualized = t.annualized_pct.map_or("—".to_string(), |a| format!("{a:>+9.1}%"));
+        println!(
+            "  {:<12} {:>12.2} {:>+9.2}% {:>10} {:>+12.2}{}",
+            t.date,
+            t.invested_eur,
+            t.roi_pct,
+            annualized,
+            t.realized_gain_eur + t.unrealized_gain_eur,
+            if t.inferred { "  (déduit)" } else { "" }
+        );
+    }
+    for warning in &r.warnings {
+        println!("  ⚠ {warning}");
+    }
 }
