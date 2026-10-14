@@ -504,4 +504,13 @@ mod tests {
             _ => 0.0,
         };
 
-        let r = tranche_report(&
+        let r = tranche_report(&s, TaxAccount::Cto, "CTO", &prices, utc("2025-06-01T00:00:00Z"));
+
+        assert_eq!(r.account, "CTO");
+        assert_eq!(r.tranches.len(), 1);
+        assert!(approx(r.net_contributions_eur, 1_000.0));
+        assert!(approx(r.current_value_eur, 1_200.0)); // 10 AIR x 120, cash à 0
+        assert!(approx(r.tranches[0].roi_pct, 20.0));
+        assert!(r.warnings.is_empty());
+    }
+}
