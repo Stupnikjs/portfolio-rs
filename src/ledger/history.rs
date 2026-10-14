@@ -284,20 +284,9 @@ fn build_entry(
     let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
     let complete = assets.iter().all(|a| a.price_status == PriceStatus::Ok);
 
-    // Plus-values réalisées cumulées jusqu'à `at` (compute_fifo est déjà borné à `at`),
-    // actions uniquement -- même périmètre que `total_realized_pnl_stocks` de main.rs.
-    let stock_symbols: std::collections::HashSet<&str> = tx_store
-        .assets
-        .values()
-        .filter(|a| a.kind == AssetKind::Stock)
-        .map(|a| a.symbol.as_str())
-        .collect();
-    let realized_pnl_eur: f64 = cost_basis
-        .realized_gains
-        .iter()
-        .filter(|g| stock_symbols.contains(g.symbol.as_str()))
-        .map(|g| g.pnl_eur)
-        .sum();
+    // Plus-values réalisées cumulées jusqu'à `at` (compute_fifo est déjà borné à `at`).
+    // Point d'entrée unique pour le périmètre « titres » : voir CostBasisResult.
+    let realized_pnl_eur = cost_basis.total_realized_pnl_stocks(tx_store);
     let unrealized_pnl_eur = total_value_eur - total_cost_basis_eur;
 
     Ok(HistoryEntry {

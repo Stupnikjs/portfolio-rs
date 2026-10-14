@@ -30,6 +30,136 @@ bincode = "1.3"
 
 
 ################################################################################
+# Dossier : src
+# Fichier : devtools.rs
+# Chemin relatif : devtools.rs
+################################################################################
+
+//! Outils de développement (hors métier) : concatène les sources du projet
+//! dans un .txt à donner à un LLM.
+//!
+//! Sorti de `main.rs` : ce n'est pas du pipeline portefeuille.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+
+const SEPARATOR: &str = "################################################################################";
+
+/// Fichiers d'extension `extension` sous `dir`, récursivement.
+fn collect_files(dir: &Path, extension: &str, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, extension, out)?;
+        } else if path.extension().map_or(false, |ext| ext == extension) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// (dossier, chemin relatif) affichés dans l'en-tête d'un fichier.
+/// Un fichier hors de `root_dir` (Cargo.toml...) est rattaché à ".".
+fn header_parts(path: &str, root_dir: &str) -> (String, String) {
+    match path.strip_prefix(&format!("{root_dir}/")) {
+        Some(rel) => {
+            let dir = rel.rsplit_once('/').map_or_else(|| root_dir.to_string(), |(d, _)| format!("{root_dir}/{d}"));
+            (dir, rel.to_string())
+        }
+        None => (".".to_string(), path.to_string()),
+    }
+}
+
+fn render_file(path: &Path, root_dir: &str) -> Result<String> {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let (dossier, relatif) = header_parts(&normalized, root_dir);
+    let fichier = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let content = fs::read_to_string(path)?;
+
+    Ok(format!(
+        "{SEPARATOR}\n# Dossier : {dossier}\n# Fichier : {fichier}\n# Chemin relatif : {relatif}\n{SEPARATOR}\n\n{content}\n\n"
+    ))
+}
+
+/// Concatène `prepend_files` (dans l'ordre donné), puis les fichiers
+/// `extension` de `root_dir` triés par chemin.
+pub fn render_bundle(root_dir: &str, extension: &str, prepend_files: &[&str]) -> Result<String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    for prepend in prepend_files {
+        let p = Path::new(prepend);
+        if p.exists() {
+            files.push(p.to_path_buf());
+        } else {
+            println!("[Omis] Fichier à inclure introuvable : {prepend}");
+        }
+    }
+
+    let mut sources = Vec::new();
+    if Path::new(root_dir).exists() {
+        collect_files(Path::new(root_dir), extension, &mut sources)?;
+    } else {
+        println!("[Omis] Dossier introuvable pour la génération : {root_dir}");
+    }
+    sources.sort();
+    files.extend(sources);
+
+    let mut output = String::new();
+    for file in &files {
+        output.push_str(&render_file(file, root_dir)?);
+    }
+    Ok(output)
+}
+
+pub fn write_bundle(root_dir: &str, extension: &str, output_file: &str, prepend_files: &[&str]) -> Result<()> {
+    fs::write(output_file, render_bundle(root_dir, extension, prepend_files)?)?;
+    println!("{output_file} généré avec succès.");
+    Ok(())
+}
+
+/// Les deux dumps habituels : le crate Rust et le dashboard Python.
+pub fn dump_for_llm() -> Result<()> {
+    write_bundle("src", "rs", "forllm.txt", &["Cargo.toml"])?;
+    write_bundle("dashboard", "py", "forllmdashboard.txt", &[])?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_of_a_nested_file_keeps_its_subfolder() {
+        assert_eq!(
+            header_parts("src/ledger/history.rs", "src"),
+            ("src/ledger".to_string(), "ledger/history.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn header_of_a_file_at_the_root_of_the_dump_folder() {
+        assert_eq!(header_parts("src/lib.rs", "src"), ("src".to_string(), "lib.rs".to_string()));
+    }
+
+    #[test]
+    fn header_of_a_file_outside_the_dump_folder_is_attached_to_dot() {
+        assert_eq!(header_parts("Cargo.toml", "src"), (".".to_string(), "Cargo.toml".to_string()));
+    }
+
+    #[test]
+    fn a_sibling_folder_sharing_the_prefix_is_not_confused_with_root() {
+        // "src2/x.rs" ne commence pas par "src/".
+        assert_eq!(header_parts("src2/x.rs", "src"), (".".to_string(), "src2/x.rs".to_string()));
+    }
+}
+
+
+################################################################################
 # Dossier : src/ledger
 # Fichier : cost_basis.rs
 # Chemin relatif : ledger/cost_basis.rs
@@ -38,31 +168,33 @@ bincode = "1.3"
 //! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
 //! revient) par méthode FIFO, et du P&L réalisé à la vente.
 //!
-//! FIFO plutôt que coût moyen pondéré : méthode retenue par défaut par
-//! l'administration fiscale française pour les cessions de valeurs
-//! mobilières.
+//! ⚠ FIFO = convention d'ANALYSE de ce projet (P&L latent / réalisé). Ce
+//! n'est pas la règle fiscale des titres (prix moyen pondéré, PMP) : la
+//! déclaration des plus-values du CTO doit passer par un calcul dédié.
 //!
 //! Le coût/produit de chaque transaction est dérivé de `value_eur` (champ
 //! immutable qui fait autorité) plutôt que de `quantity * price` : `price`
 //! est optionnel et parfois exprimé dans la devise locale de l'actif
 //! plutôt qu'en EUR (cas XTB).
+//!
+//! Structure du fichier :
+//! - types de résultat (`Lot`, `RealizedGain`, `CostBasisResult`) ;
+//! - `consume_lots` : brique pure (une file de lots, une quantité) ;
+//! - `compute_fifo` : rejoue les transactions et orchestre les briques.
 
 use std::collections::{HashMap, VecDeque};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 
-use crate::schema::TransactionKind;
+use crate::schema::{Transaction, TransactionKind};
 use crate::store::serialize::TxStore;
 
 const EPSILON: f64 = 1e-12;
 
-fn unit_value_eur(quantity: f64, value_eur: f64) -> Result<f64> {
-    if quantity <= 0.0 {
-        return Err(anyhow!("quantity doit être positive, reçu {quantity}"));
-    }
-    Ok(value_eur / quantity)
-}
+// ---------------------------------------------------------------------
+// Types de résultat
+// ---------------------------------------------------------------------
 
 /// Un lot FIFO : une tranche de quantité acquise à un prix donné.
 #[derive(Debug, Clone)]
@@ -133,7 +265,107 @@ impl CostBasisResult {
             None => self.fees_eur_by_symbol.values().sum(),
         }
     }
+
+    /// Cessions de TITRES uniquement (ni crypto, ni cash). Point d'entrée
+    /// unique : remplace les filtres `stock_symbols` dupliqués dans
+    /// main.rs, history.rs et realized.rs.
+    ///
+    /// Pourquoi exclure la crypto : les WITHDRAW (transferts entre
+    /// wallets) sont vus comme des ventes FIFO et fausseraient le résultat.
+    pub fn stock_realized_gains<'a>(&'a self, tx_store: &'a TxStore) -> impl Iterator<Item = &'a RealizedGain> + 'a {
+        self.realized_gains.iter().filter(move |g| tx_store.is_stock(&g.symbol))
+    }
+
+    /// P&L réalisé total sur les titres.
+    pub fn total_realized_pnl_stocks(&self, tx_store: &TxStore) -> f64 {
+        self.stock_realized_gains(tx_store).map(|g| g.pnl_eur).sum()
+    }
 }
+
+// ---------------------------------------------------------------------
+// Briques pures
+// ---------------------------------------------------------------------
+
+fn unit_value_eur(quantity: f64, value_eur: f64) -> Result<f64> {
+    if quantity <= 0.0 {
+        return Err(anyhow!("quantity doit être positive, reçu {quantity}"));
+    }
+    Ok(value_eur / quantity)
+}
+
+/// Lot ouvert par un BUY / DEPOSIT.
+fn open_lot(tx: &Transaction) -> Result<Lot> {
+    Ok(Lot {
+        quantity: tx.quantity,
+        unit_cost_eur: unit_value_eur(tx.quantity, tx.value_eur)?,
+        acquired_at: tx.time,
+        external_id: tx.external_id.clone(),
+    })
+}
+
+/// Ce qu'a coûté la consommation de `quantity` dans une file de lots.
+#[derive(Debug)]
+struct Consumption {
+    /// Tranches réellement prélevées (une par lot touché).
+    consumed: Vec<Lot>,
+    cost_eur: f64,
+    /// Quantité que les lots connus n'ont pas pu couvrir.
+    uncovered: f64,
+}
+
+/// Prélève `quantity` dans `queue` en commençant par le lot le plus
+/// ancien (FIFO). Pure : ne connaît ni les transactions ni les symboles.
+fn consume_lots(queue: &mut VecDeque<Lot>, quantity: f64) -> Consumption {
+    let mut remaining = quantity;
+    let mut consumed = Vec::new();
+    let mut cost_eur = 0.0;
+
+    while remaining > EPSILON {
+        let Some(lot) = queue.front_mut() else { break };
+        let take = lot.quantity.min(remaining);
+
+        cost_eur += take * lot.unit_cost_eur;
+        consumed.push(Lot { quantity: take, ..lot.clone() });
+
+        lot.quantity -= take;
+        remaining -= take;
+        if lot.quantity <= EPSILON {
+            queue.pop_front();
+        }
+    }
+
+    Consumption { consumed, cost_eur, uncovered: remaining.max(0.0) }
+}
+
+/// Transforme un SELL / WITHDRAW en plus-value réalisée.
+///
+/// Si la vente dépasse les lots connus, le reliquat est valorisé à un
+/// coût de 0 et le résultat est marqué `incomplete` -- son `pnl_eur` est
+/// donc surestimé d'autant (signalé plutôt qu'absorbé silencieusement).
+fn realize(tx: &Transaction, queue: &mut VecDeque<Lot>) -> RealizedGain {
+    let Consumption { mut consumed, cost_eur, uncovered } = consume_lots(queue, tx.quantity);
+
+    let incomplete = uncovered > EPSILON;
+    if incomplete {
+        consumed.push(Lot { quantity: uncovered, unit_cost_eur: 0.0, acquired_at: tx.time, external_id: None });
+    }
+
+    RealizedGain {
+        symbol: tx.asset.symbol.clone(),
+        sell_time: tx.time,
+        quantity: tx.quantity,
+        proceeds_eur: tx.value_eur,
+        cost_eur,
+        pnl_eur: tx.value_eur - cost_eur,
+        external_id: tx.external_id.clone(),
+        lots_consumed: consumed,
+        incomplete,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------
 
 /// Rejoue les transactions du wallet dans l'ordre chronologique et
 /// applique la méthode FIFO : chaque SELL/WITHDRAW consomme les lots
@@ -142,112 +374,31 @@ impl CostBasisResult {
 /// `at = None` -- comme pour `holdings_at` -- rejoue toutes les
 /// transactions connues.
 ///
-/// Les FEE ne sont pas rattachés à un lot précis : accumulés séparément
-/// par actif (`fees_eur_by_symbol`) -- à soustraire soi-même du P&L pour
-/// un résultat net de frais.
-///
-/// Si une vente dépasse la quantité connue en lots ouverts, le reliquat
-/// est valorisé à un coût de 0 et le `RealizedGain` correspondant est
-/// marqué `incomplete = true` -- son `pnl_eur` est donc surestimé d'autant.
+/// Les FEE consomment de la quantité (frais payés dans l'actif) mais ne
+/// sont pas rattachés à un lot précis : accumulés séparément par actif
+/// (`fees_eur_by_symbol`) -- à soustraire soi-même du P&L pour un
+/// résultat net de frais. Un FEE qui dépasse les lots connus est ignoré
+/// (edge case qui ne devrait pas arriver en pratique).
 pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<CostBasisResult> {
     let mut lots: HashMap<String, VecDeque<Lot>> = HashMap::new();
     let mut realized: Vec<RealizedGain> = Vec::new();
     let mut fees: HashMap<String, f64> = HashMap::new();
 
-    let mut transactions: Vec<&crate::schema::Transaction> = tx_store.transactions.iter().collect();
+    let mut transactions: Vec<&Transaction> = tx_store.transactions.iter().collect();
     transactions.sort_by_key(|tx| tx.time);
 
-    for tx in transactions {
-        if let Some(at) = at {
-            if tx.time > at {
-                break;
-            }
-        }
+    let in_scope = |tx: &&Transaction| at.map_or(true, |at| tx.time <= at);
 
-        let symbol = tx.asset.symbol.clone();
+    for tx in transactions.into_iter().take_while(in_scope) {
+        let queue = lots.entry(tx.asset.symbol.clone()).or_default();
 
         match tx.kind {
-            TransactionKind::Buy | TransactionKind::Deposit => {
-                let queue = lots.entry(symbol).or_default();
-                queue.push_back(Lot {
-                    quantity: tx.quantity,
-                    unit_cost_eur: unit_value_eur(tx.quantity, tx.value_eur)?,
-                    acquired_at: tx.time,
-                    external_id: tx.external_id.clone(),
-                });
-            }
-            TransactionKind::Sell | TransactionKind::Withdraw => {
-                let queue = lots.entry(symbol.clone()).or_default();
-                let mut remaining = tx.quantity;
-                let mut consumed: Vec<Lot> = Vec::new();
-                let mut cost_eur = 0.0;
-                let mut incomplete = false;
-
-                while remaining > EPSILON {
-                    let Some(lot) = queue.front_mut() else { break };
-                    let take = lot.quantity.min(remaining);
-
-                    cost_eur += take * lot.unit_cost_eur;
-                    consumed.push(Lot {
-                        quantity: take,
-                        unit_cost_eur: lot.unit_cost_eur,
-                        acquired_at: lot.acquired_at,
-                        external_id: lot.external_id.clone(),
-                    });
-
-                    lot.quantity -= take;
-                    remaining -= take;
-                    if lot.quantity <= EPSILON {
-                        queue.pop_front();
-                    }
-                }
-
-                if remaining > EPSILON {
-                    // Pas de lot connu pour couvrir le reliquat : coût
-                    // inconnu, traité comme 0 -- signalé via `incomplete`
-                    // plutôt que silencieusement absorbé dans le P&L.
-                    consumed.push(Lot {
-                        quantity: remaining,
-                        unit_cost_eur: 0.0,
-                        acquired_at: tx.time,
-                        external_id: None,
-                    });
-                    incomplete = true;
-                }
-
-                let proceeds_eur = tx.value_eur;
-                realized.push(RealizedGain {
-                    symbol,
-                    sell_time: tx.time,
-                    quantity: tx.quantity,
-                    proceeds_eur,
-                    cost_eur,
-                    pnl_eur: proceeds_eur - cost_eur,
-                    external_id: tx.external_id.clone(),
-                    lots_consumed: consumed,
-                    incomplete,
-                });
-            }
+            TransactionKind::Buy | TransactionKind::Deposit => queue.push_back(open_lot(tx)?),
+            TransactionKind::Sell | TransactionKind::Withdraw => realized.push(realize(tx, queue)),
             TransactionKind::Fee => {
-        let queue = lots.entry(symbol.clone()).or_default();
-        let mut remaining = tx.quantity;
-
-        while remaining > EPSILON {
-            let Some(lot) = queue.front_mut() else { break };
-            let take = lot.quantity.min(remaining);
-
-            lot.quantity -= take;
-            remaining -= take;
-            if lot.quantity <= EPSILON {
-                queue.pop_front();
+                consume_lots(queue, tx.quantity);
+                *fees.entry(tx.asset.symbol.clone()).or_insert(0.0) += tx.value_eur;
             }
-        }
-        // Reliquat non couvert par des lots connus (frais > solde tracé) :
-        // ignoré silencieusement, comme pour un Withdraw incomplet -- edge
-        // case qui ne devrait pas arriver en pratique.
-
-        *fees.entry(symbol).or_insert(0.0) += tx.value_eur;
-    }
         }
     }
 
@@ -260,7 +411,160 @@ pub fn compute_fifo(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Result<Cos
     Ok(CostBasisResult { open_lots, realized_gains: realized, fees_eur_by_symbol: fees })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::AssetKind;
+    use crate::schema::TransactionKind::{Buy, Deposit, Fee, Sell, Withdraw};
+    use crate::testutil::{store, tx, utc};
 
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn lot(quantity: f64, unit_cost_eur: f64) -> Lot {
+        Lot { quantity, unit_cost_eur, acquired_at: utc("2025-01-01T00:00:00Z"), external_id: None }
+    }
+
+    // --- consume_lots (pure, sans TxStore) ---
+
+    #[test]
+    fn consume_lots_takes_the_oldest_lot_first_and_splits_across_lots() {
+        let mut queue: VecDeque<Lot> = vec![lot(10.0, 100.0), lot(10.0, 200.0)].into();
+        let c = consume_lots(&mut queue, 15.0);
+
+        assert!(approx(c.cost_eur, 10.0 * 100.0 + 5.0 * 200.0));
+        assert_eq!(c.consumed.len(), 2);
+        assert!(approx(c.uncovered, 0.0));
+        assert_eq!(queue.len(), 1);
+        assert!(approx(queue[0].quantity, 5.0)); // reste du 2e lot
+    }
+
+    #[test]
+    fn consume_lots_reports_the_uncovered_quantity() {
+        let mut queue: VecDeque<Lot> = vec![lot(5.0, 100.0)].into();
+        let c = consume_lots(&mut queue, 8.0);
+
+        assert!(approx(c.cost_eur, 500.0));
+        assert!(approx(c.uncovered, 3.0));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn consume_lots_on_an_empty_queue_covers_nothing() {
+        let mut queue: VecDeque<Lot> = VecDeque::new();
+        let c = consume_lots(&mut queue, 2.0);
+
+        assert!(c.consumed.is_empty());
+        assert!(approx(c.cost_eur, 0.0));
+        assert!(approx(c.uncovered, 2.0));
+    }
+
+    // --- compute_fifo ---
+
+    #[test]
+    fn partial_sale_leaves_the_remainder_open_at_its_original_cost() {
+        let s = store(vec![
+            tx(Buy, "AIR", AssetKind::Stock, 10.0, 1_000.0, "2025-01-01T10:00:00Z", "a1"),
+            tx(Sell, "AIR", AssetKind::Stock, 4.0, 600.0, "2025-02-01T10:00:00Z", "a2"),
+        ]);
+        let r = compute_fifo(&s, None).unwrap();
+
+        assert_eq!(r.realized_gains.len(), 1);
+        assert!(approx(r.realized_gains[0].cost_eur, 400.0));
+        assert!(approx(r.realized_gains[0].pnl_eur, 200.0));
+        assert!(approx(r.open_quantity("AIR"), 6.0));
+        assert!(approx(r.open_cost_basis("AIR"), 600.0));
+        assert!(approx(r.average_cost("AIR").unwrap(), 100.0));
+    }
+
+    #[test]
+    fn a_sale_beyond_known_lots_is_flagged_incomplete_with_zero_cost_remainder() {
+        let s = store(vec![
+            tx(Buy, "AIR", AssetKind::Stock, 5.0, 500.0, "2025-01-01T10:00:00Z", "a1"),
+            tx(Sell, "AIR", AssetKind::Stock, 10.0, 1_200.0, "2025-02-01T10:00:00Z", "a2"),
+        ]);
+        let g = &compute_fifo(&s, None).unwrap().realized_gains[0];
+
+        assert!(g.incomplete);
+        assert!(approx(g.pnl_eur, 700.0)); // 1200 - 500
+        assert_eq!(g.lots_consumed.len(), 2); // lot réel + reliquat à coût 0
+    }
+
+    #[test]
+    fn withdraw_is_treated_like_a_sale() {
+        let s = store(vec![
+            tx(Deposit, "BTC", AssetKind::Crypto, 1.0, 10_000.0, "2025-01-01T10:00:00Z", "d1"),
+            tx(Withdraw, "BTC", AssetKind::Crypto, 1.0, 12_000.0, "2025-02-01T10:00:00Z", "w1"),
+        ]);
+        let r = compute_fifo(&s, None).unwrap();
+
+        assert!(approx(r.total_realized_pnl(Some("BTC")), 2_000.0));
+        assert!(r.open_lots.is_empty());
+    }
+
+    #[test]
+    fn fee_consumes_quantity_and_accumulates_fees_without_realizing_a_gain() {
+        let s = store(vec![
+            tx(Buy, "BNB", AssetKind::Crypto, 10.0, 1_000.0, "2025-01-01T10:00:00Z", "b1"),
+            tx(Fee, "BNB", AssetKind::Crypto, 1.0, 2.0, "2025-01-02T10:00:00Z", "f1"),
+        ]);
+        let r = compute_fifo(&s, None).unwrap();
+
+        assert!(r.realized_gains.is_empty());
+        assert!(approx(r.open_quantity("BNB"), 9.0));
+        assert!(approx(r.total_fees(Some("BNB")), 2.0));
+        assert!(approx(r.total_fees(None), 2.0));
+    }
+
+    #[test]
+    fn at_excludes_later_transactions() {
+        let s = store(vec![
+            tx(Buy, "AIR", AssetKind::Stock, 10.0, 1_000.0, "2025-01-01T10:00:00Z", "a1"),
+            tx(Sell, "AIR", AssetKind::Stock, 10.0, 1_500.0, "2025-03-01T10:00:00Z", "a2"),
+        ]);
+        let r = compute_fifo(&s, Some(utc("2025-02-01T00:00:00Z"))).unwrap();
+
+        assert!(r.realized_gains.is_empty());
+        assert!(approx(r.open_quantity("AIR"), 10.0));
+    }
+
+    #[test]
+    fn transactions_are_replayed_chronologically_whatever_their_insertion_order() {
+        // La vente est insérée AVANT l'achat : le tri chronologique doit la rapprocher du bon lot.
+        let s = store(vec![
+            tx(Sell, "AIR", AssetKind::Stock, 5.0, 700.0, "2025-02-01T10:00:00Z", "a2"),
+            tx(Buy, "AIR", AssetKind::Stock, 5.0, 500.0, "2025-01-01T10:00:00Z", "a1"),
+        ]);
+        let g = &compute_fifo(&s, None).unwrap().realized_gains[0];
+
+        assert!(!g.incomplete);
+        assert!(approx(g.pnl_eur, 200.0));
+    }
+
+    #[test]
+    fn a_buy_with_a_non_positive_quantity_is_an_error() {
+        let s = store(vec![tx(Buy, "AIR", AssetKind::Stock, 0.0, 10.0, "2025-01-01T10:00:00Z", "a1")]);
+        assert!(compute_fifo(&s, None).is_err());
+    }
+
+    // --- filtres titres ---
+
+    #[test]
+    fn stock_helpers_ignore_crypto_sales() {
+        let s = store(vec![
+            tx(Buy, "AIR", AssetKind::Stock, 10.0, 1_000.0, "2025-01-01T10:00:00Z", "a1"),
+            tx(Sell, "AIR", AssetKind::Stock, 10.0, 1_200.0, "2025-02-01T10:00:00Z", "a2"), // +200
+            tx(Buy, "BTC", AssetKind::Crypto, 1.0, 20_000.0, "2025-01-01T10:00:00Z", "b1"),
+            tx(Sell, "BTC", AssetKind::Crypto, 1.0, 50_000.0, "2025-02-01T10:00:00Z", "b2"), // +30000
+        ]);
+        let r = compute_fifo(&s, None).unwrap();
+
+        assert_eq!(r.stock_realized_gains(&s).count(), 1);
+        assert!(approx(r.total_realized_pnl_stocks(&s), 200.0));
+        assert!(approx(r.total_realized_pnl(None), 30_200.0));
+    }
+}
 
 
 ################################################################################
@@ -2314,6 +2618,7 @@ pub mod market;
 pub mod parse;
 pub mod schema;
 pub mod store;
+pub mod devtools;
 
 #[cfg(test)]
 mod testutil;
@@ -2330,26 +2635,36 @@ mod testutil;
 //!
 //! Ré-exécutable sans risque : le tx_store est recréé from scratch à chaque run.
 //! Le cache des prix (price_cache.bin) persiste et bloque les appels API inutiles.
+//!
+//! `main` ne fait qu'enchaîner des étapes ; chacune vit dans sa fonction :
+//! construction du wallet -> tickers -> persistance -> valorisation
+//! (affichage) -> corrélations -> dashboard.json.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::Serialize;
 
-use portfolio_rs::ledger::cost_basis::compute_fifo;
-use portfolio_rs::ledger::portfolio::portfolio_snapshot_at;
-use portfolio_rs::ledger::positions::non_zero_holdings_at;
-use portfolio_rs::market::correlation::compute_correlation_matrices;
+use portfolio_rs::devtools;
+use portfolio_rs::ledger::cost_basis::{compute_fifo, CostBasisResult, RealizedGain};
 use portfolio_rs::ledger::history::record_weekly_history;
-use portfolio_rs::market::tickers::resolve_ticker;
-use portfolio_rs::parse::{binance, manual, xtb};
-use portfolio_rs::schema::{AssetKind,  DashboardAsset, DashboardData, TransactionKind};
-use portfolio_rs::store::serialize::{TxStore, save_wallet};
-use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
+use portfolio_rs::ledger::portfolio::{portfolio_snapshot_at, AssetSnapshot, PortfolioSnapshot};
+use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::ledger::realized::{realized_summary, TaxAccount};
 use portfolio_rs::ledger::trades::{build_trade_frequency, build_trades};
+use portfolio_rs::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
+use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
+use portfolio_rs::market::tickers::resolve_ticker;
+use portfolio_rs::parse::{binance, manual, xtb};
+use portfolio_rs::schema::{AssetKind, DashboardAsset, DashboardData, TransactionKind};
+use portfolio_rs::store::serialize::{save_wallet, TxStore};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
+
+/// Symboles masqués dans le tableau de valorisation (poussière / hors suivi).
+const HIDDEN_SYMBOLS: &[&str] = &["USDC", "SOL", "ALGO"];
 
 fn data_dir() -> PathBuf {
     PathBuf::from("./data/raw")
@@ -2359,113 +2674,68 @@ fn accounts_path() -> PathBuf {
     data_dir().join("accounts")
 }
 
-// --- NOUVEAU : Génération automatique des fichiers pour le LLM ---
-
-fn collect_files(dir: &Path, files: &mut Vec<PathBuf>, extension: &str) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files(&path, files, extension)?;
-        } else if path.extension().map_or(false, |ext| ext == extension) {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn generate_concatenated_txt(
-    root_dir: &str,
-    extension: &str,
-    output_file: &str,
-    prepend_files: &[&str],
-) -> Result<()> {
-    let mut files = Vec::new();
-
-    // Fichiers isolés à inclure en tête (Cargo.toml, README.md...).
-    // Ils ne sont pas triés : l'ordre du slice est respecté.
-    for prepend in prepend_files {
-        let p = Path::new(prepend);
-        if p.exists() {
-            files.push(p.to_path_buf());
-        } else {
-            println!("[Omis] Fichier à inclure introuvable : {}", prepend);
-        }
-    }
-
-    // Fichiers source du dossier racine, collectés puis triés.
-    // "Cargo.toml" < "src/..." lexicographiquement : il reste en tête
-    // même après le sort, ce qui donne le bon contexte au LLM.
-    let path = Path::new(root_dir);
-    if path.exists() {
-        collect_files(path, &mut files, extension)?;
-    } else {
-        println!("[Omis] Dossier introuvable pour la génération : {}", root_dir);
-    }
-    files.sort();
-
-    let mut output = String::new();
-    for file_path in &files {
-        let absolute_rel_path = file_path.to_string_lossy().replace("\\", "/");
-
-        let (dossier, chemin_relatif) = if absolute_rel_path.starts_with(&format!("{}/", root_dir)) {
-            let rel = absolute_rel_path.trim_start_matches(&format!("{}/", root_dir));
-            let d = rel.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-            let full_d = if d.is_empty() { root_dir.to_string() } else { format!("{}/{}", root_dir, d) };
-            (full_d, rel.to_string())
-        } else {
-            // Fichier à la racine du projet (Cargo.toml, etc.)
-            (".".to_string(), absolute_rel_path.clone())
-        };
-
-        let fichier = file_path.file_name().unwrap().to_string_lossy();
-
-        output.push_str("################################################################################
-");
-        output.push_str(&format!("# Dossier : {}\n", dossier));
-        output.push_str(&format!("# Fichier : {}\n", fichier));
-        output.push_str(&format!("# Chemin relatif : {}\n", chemin_relatif));
-        output.push_str("################################################################################
-
-");
-
-        let content = fs::read_to_string(file_path)?;
-        output.push_str(&content);
-        output.push_str("
-
-");
-    }
-
-    fs::write(output_file, output)?;
-    println!("{} généré avec succès.", output_file);
-    Ok(())
-}
-// ---------------------------------------------------
-
 fn main() -> Result<()> {
-    println!("=== CONSTRUCTION DU WALLET ===");
-    let cache_path = PathBuf::from("./data/cache");
-    init_price_caches(&cache_path);
+    let cache_dir = PathBuf::from("./data/cache");
+    init_price_caches(&cache_dir);
 
-    // Le wallet repart de zéro à chaque exécution
+    let mut tx_store = build_wallet()?;
+    warn_on_invalid_quantities(&tx_store);
+    resolve_missing_tickers(&mut tx_store);
+
+    save_wallet(&tx_store, Path::new("./data/tx_store.json"))?;
+    println!("tx_store.json regénéré.");
+
+    record_weekly_history(&tx_store, Path::new("./data/history.json"))?;
+
+    let snapshot = portfolio_snapshot_at(&tx_store, None);
+    let cost_basis = compute_fifo(&tx_store, None)?;
+
+    let latent_pnl = print_valuation(&snapshot, &cost_basis);
+    let realized_pnl = cost_basis.total_realized_pnl_stocks(&tx_store);
+    print_performance(latent_pnl, realized_pnl);
+    print_realized_by_stock(&cost_basis, &tx_store);
+
+    // Compte-titres seul : XTB hors PEA, FIFO refait sur ce compte (voir realized.rs).
+    println!();
+    print!(
+        "{}",
+        realized_summary(&tx_store, TaxAccount::Cto)?
+            .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
+    );
+
+    let correlations = compute_correlations(&tx_store, &snapshot);
+    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations);
+    let dashboard_path = PathBuf::from("./data/dashboard.json");
+    write_json(&dashboard_path, &dashboard)?;
+    println!("Dashboard écrit : {dashboard_path:?}");
+
+    save_price_caches(&cache_dir);
+    println!("Cache des prix 1h sauvegardé : {cache_dir:?}");
+
+    devtools::dump_for_llm()
+}
+
+// ---------------------------------------------------------------------
+// Construction du wallet
+// ---------------------------------------------------------------------
+
+/// Parse toutes les sources (Binance, XTB CTO + PEA, saisies manuelles).
+fn build_wallet() -> Result<TxStore> {
+    println!("=== CONSTRUCTION DU WALLET ===");
+    let accounts = accounts_path();
     let mut tx_store = TxStore::new();
 
-    let new_transactions = binance::parse_binance_sources(accounts_path());
-    let mut xtb_tx = Vec::new();
-    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account.xlsx")));
-    xtb_tx.extend(xtb::parse_xtb_file(&accounts_path().join("account_pea.xlsx")));
+    tx_store.add_transactions(binance::parse_binance_sources(accounts.clone()));
+    for file in ["account.xlsx", "account_pea.xlsx"] {
+        tx_store.add_transactions(xtb::parse_xtb_file(&accounts.join(file)));
+    }
+    tx_store.add_transactions(manual::parse_manual(&data_dir().join("manual_tx.json"))?);
 
-    // L'ajout des transactions va automatiquement "nourrir" le cache des prix
-    // au cas où le cache binaire aurait une trouée.
-    tx_store.add_transactions(new_transactions);
-    tx_store.add_transactions(xtb_tx);
+    Ok(tx_store)
+}
 
-    let manual_tx = manual::parse_manual(&data_dir().join("manual_tx.json"))?;
-    tx_store.add_transactions(manual_tx);
-
+/// Un BUY/DEPOSIT à quantité <= 0 fait échouer le FIFO : on le signale ici.
+fn warn_on_invalid_quantities(tx_store: &TxStore) {
     println!("\n=== DIAGNOSTIC : BUY/DEPOSIT à quantité négative ===");
     for tx in &tx_store.transactions {
         if matches!(tx.kind, TransactionKind::Buy | TransactionKind::Deposit) && tx.quantity <= 0.0 {
@@ -2475,29 +2745,30 @@ fn main() -> Result<()> {
             );
         }
     }
+}
 
-    // --- RÉSOLUTION DES TICKERS MANQUANTS ---
+/// Renseigne `identifiers.ticker` des actifs qui n'en ont pas (hors cash).
+fn resolve_missing_tickers(tx_store: &mut TxStore) {
     println!("\n=== RÉSOLUTION DES TICKERS ===");
-    let mut resolved = 0;
-    let mut skipped = 0;
-    let mut failed = 0;
+    let (mut resolved, mut skipped, mut failed) = (0, 0, 0);
 
-    let symbols: Vec<String> = tx_store.assets.keys().cloned().collect();
-    for symbol in symbols {
-        let (kind, has_ticker) = {
-            let asset = tx_store.assets.get(&symbol).unwrap();
-            (asset.kind, asset.identifiers.ticker.is_some())
-        };
+    let candidates: Vec<(String, AssetKind, bool)> = tx_store
+        .assets
+        .iter()
+        .map(|(symbol, asset)| (symbol.clone(), asset.kind, asset.identifiers.ticker.is_some()))
+        .collect();
 
+    for (symbol, kind, has_ticker) in candidates {
         if kind == AssetKind::Cash || has_ticker {
             skipped += 1;
             continue;
         }
-
         match resolve_ticker(&symbol, kind) {
             Some(ticker) => {
                 println!("  ✓ {symbol:<12} -> {ticker}");
-                tx_store.assets.get_mut(&symbol).unwrap().identifiers.ticker = Some(ticker);
+                if let Some(asset) = tx_store.assets.get_mut(&symbol) {
+                    asset.identifiers.ticker = Some(ticker);
+                }
                 resolved += 1;
             }
             None => {
@@ -2507,18 +2778,30 @@ fn main() -> Result<()> {
         }
     }
     println!("({resolved} résolus, {skipped} ignorés, {failed} échoués)");
+}
 
-    // On écrase systématiquement tx_store.json (fichier jetable)
-    let tx_store_path = PathBuf::from("./data/tx_store.json");
-    save_wallet(&tx_store, &tx_store_path)?;
-    println!("tx_store.json regénéré.");
+// ---------------------------------------------------------------------
+// Affichage terminal
+// ---------------------------------------------------------------------
 
-    record_weekly_history(&tx_store, &PathBuf::from("./data/history.json"))?;
-    
+fn is_displayed(asset: &AssetSnapshot) -> bool {
+    asset.value_eur > 0.01 && asset.kind != AssetKind::Cash && !HIDDEN_SYMBOLS.contains(&asset.symbol.as_str())
+}
+
+/// Colonnes (cost basis, P&L, P&L %) d'une ligne, et le P&L à cumuler.
+fn pnl_columns(asset: &AssetSnapshot, cost_basis: &CostBasisResult) -> (String, String, String, f64) {
+    if cost_basis.average_cost(&asset.symbol).is_none() {
+        return (format!("{:>11}", "—"), format!("{:>11}", "—"), format!("{:>8}", "—"), 0.0);
+    }
+    let cb_total = cost_basis.open_cost_basis(&asset.symbol);
+    let pnl_eur = asset.value_eur - cb_total;
+    let pnl_pct = if cb_total > 0.0 { pnl_eur / cb_total * 100.0 } else { 0.0 };
+    (format!("{cb_total:>11.2}"), format!("{pnl_eur:>+11.2}"), format!("{pnl_pct:>+7.2}%"), pnl_eur)
+}
+
+/// Tableau de valorisation. Renvoie le P&L latent total affiché.
+fn print_valuation(snapshot: &PortfolioSnapshot, cost_basis: &CostBasisResult) -> f64 {
     println!("\n=== VALORISATION ACTUELLE ===");
-    let snapshot = portfolio_snapshot_at(&tx_store, None);
-    let cost_basis = compute_fifo(&tx_store, None)?;
-
     println!("Date: {}", snapshot.date);
     println!("Valeur totale: {:.2} EUR", snapshot.total_value_eur);
     println!("Détail par actif:");
@@ -2528,150 +2811,105 @@ fn main() -> Result<()> {
     );
 
     let mut total_pnl = 0.0;
-    for asset in &snapshot.assets {
-        if asset.value_eur <= 0.01 || matches!(asset.symbol.as_str(), "USDC" | "SOL" | "ALGO") || asset.kind == AssetKind::Cash {
-            continue; 
-        }
-
-        let avg_cost = cost_basis.average_cost(&asset.symbol);
-        let cb_total = cost_basis.open_cost_basis(&asset.symbol);
-
-        let (cb_str, pnl_eur_str, pnl_pct_str) = match avg_cost {
-            Some(_) => {
-                let pnl_eur = asset.value_eur - cb_total;
-                let pnl_pct = if cb_total > 0.0 { pnl_eur / cb_total * 100.0 } else { 0.0 };
-                total_pnl += pnl_eur;
-                (format!("{cb_total:>11.2}"), format!("{pnl_eur:>+11.2}"), format!("{pnl_pct:>+7.2}%"))
-            }
-            None => (format!("{:>11}", "—"), format!("{:>11}", "—"), format!("{:>8}", "—")),
-        };
-
+    for asset in snapshot.assets.iter().filter(|a| is_displayed(a)) {
+        let (cb, pnl, pct, pnl_eur) = pnl_columns(asset, cost_basis);
+        total_pnl += pnl_eur;
         println!(
             "  {:<10} {:>10.4} {:>10.2} {:>12.2} {} {} {}",
-            asset.symbol, asset.quantity, asset.price_eur, asset.value_eur, cb_str, pnl_eur_str, pnl_pct_str
+            asset.symbol, asset.quantity, asset.price_eur, asset.value_eur, cb, pnl, pct
         );
     }
 
     println!("\nP&L latent total : {total_pnl:>+.2} EUR");
+    total_pnl
+}
 
-        
-    // On ignore la crypto : les WITHDRAW (transferts entre wallets/exchanges)
-    // sont comptés comme des "ventes" FIFO, ce qui gonfle artificiellement le
-    // P&L réalisé alors qu'aucune vente réelle n'a eu lieu côté crypto.
-    let stock_symbols: std::collections::HashSet<&str> = tx_store
-        .assets
-        .values()
-        .filter(|a| a.kind == AssetKind::Stock)
-        .map(|a| a.symbol.as_str())
-        .collect();
-
-    let total_realized_pnl_stocks: f64 = cost_basis
-        .realized_gains
-        .iter()
-        .filter(|g| stock_symbols.contains(g.symbol.as_str()))
-        .map(|g| g.pnl_eur)
-        .sum();
-
-    let overall_pnl = total_pnl + total_realized_pnl_stocks;
-
-    println!("P&L réalisé total (actions uniquement) : {total_realized_pnl_stocks:>+.2} EUR");
+fn print_performance(latent_pnl: f64, realized_pnl: f64) {
+    println!("P&L réalisé total (actions uniquement) : {realized_pnl:>+.2} EUR");
     println!("\n=== PERFORMANCE GLOBALE (latent + réalisé actions) ===");
-    println!("Overall P&L : {overall_pnl:>+.2} EUR  (latent {total_pnl:>+.2} + réalisé {total_realized_pnl_stocks:>+.2})");
+    println!(
+        "Overall P&L : {:>+.2} EUR  (latent {latent_pnl:>+.2} + réalisé {realized_pnl:>+.2})",
+        latent_pnl + realized_pnl
+    );
+}
 
-
+fn print_realized_by_stock(cost_basis: &CostBasisResult, tx_store: &TxStore) {
     println!("\nDétail P&L réalisé par action :");
     println!("  {:<10} {:>10} {:>12} {:>12} {:>12}", "Symbole", "Qty", "Produit", "Coût", "P&L");
 
-    let mut realized_by_stock: std::collections::HashMap<&str, Vec<&portfolio_rs::ledger::cost_basis::RealizedGain>> =
-        std::collections::HashMap::new();
-    for g in cost_basis.realized_gains.iter().filter(|g| stock_symbols.contains(g.symbol.as_str())) {
-        realized_by_stock.entry(g.symbol.as_str()).or_default().push(g);
+    // BTreeMap : symboles déjà triés.
+    let mut by_symbol: BTreeMap<&str, Vec<&RealizedGain>> = BTreeMap::new();
+    for gain in cost_basis.stock_realized_gains(tx_store) {
+        by_symbol.entry(gain.symbol.as_str()).or_default().push(gain);
     }
 
-    let mut symbols_sorted: Vec<&&str> = realized_by_stock.keys().collect();
-    symbols_sorted.sort();
-
-    for symbol in symbols_sorted {
-        let gains = &realized_by_stock[symbol];
+    for (symbol, gains) in by_symbol {
         let qty: f64 = gains.iter().map(|g| g.quantity).sum();
         let proceeds: f64 = gains.iter().map(|g| g.proceeds_eur).sum();
         let cost: f64 = gains.iter().map(|g| g.cost_eur).sum();
         let pnl: f64 = gains.iter().map(|g| g.pnl_eur).sum();
-        let has_incomplete = gains.iter().any(|g| g.incomplete);
+        let flag = if gains.iter().any(|g| g.incomplete) { "  ⚠ incomplet" } else { "" };
 
-        println!(
-            "  {:<10} {:>10.4} {:>12.2} {:>12.2} {:>+12.2}{}",
-            symbol, qty, proceeds, cost, pnl,
-            if has_incomplete { "  ⚠ incomplet" } else { "" }
-        );
+        println!("  {symbol:<10} {qty:>10.4} {proceeds:>12.2} {cost:>12.2} {pnl:>+12.2}{flag}");
     }
+}
 
-    // Plus-values réalisées sur le compte-titres seul : XTB hors PEA, FIFO refait sur
-    // ce compte (voir realized.rs). La crypto (Binance) est calculée à part.
-    println!();
-    print!(
-        "{}",
-        realized_summary(&tx_store, TaxAccount::Cto)?
-            .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
-    );
+// ---------------------------------------------------------------------
+// Corrélations et dashboard.json
+// ---------------------------------------------------------------------
 
+fn compute_correlations(tx_store: &TxStore, snapshot: &PortfolioSnapshot) -> CorrelationMatrices {
     println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
-    let holdings = non_zero_holdings_at(&tx_store, None);
-    let prices_eur: std::collections::HashMap<String, f64> =
+    let holdings = non_zero_holdings_at(tx_store, None);
+    let prices_eur: HashMap<String, f64> =
         snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
-    let correlation_matrices = compute_correlation_matrices(&tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR);
-    
-    let dashboard_assets: Vec<DashboardAsset> = snapshot
-        .assets
-        .iter()
-        .map(|a| {
-            let cost_basis_eur = cost_basis.open_cost_basis(&a.symbol);
-            let pnl_eur = a.value_eur - cost_basis_eur;
-            let pnl_pct = if cost_basis_eur > 0.0 { pnl_eur / cost_basis_eur * 100.0 } else { 0.0 };
-            let realized_pnl_eur = cost_basis.total_realized_pnl(Some(&a.symbol));
-            DashboardAsset {
-                symbol: a.symbol.clone(),
-                kind: a.kind.as_str().to_string(),
-                ticker: a.ticker.clone(),
-                quantity: a.quantity,
-                price_eur: a.price_eur,
-                value_eur: a.value_eur,
-                cost_basis_eur,
-                pnl_eur,
-                pnl_pct,
-                realized_pnl_eur
-            }
-        })
-        .collect();
+    compute_correlation_matrices(tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR)
+}
 
-    let total_cost_basis_eur: f64 = dashboard_assets.iter().map(|a| a.cost_basis_eur).sum();
-    let dashboard_data = DashboardData {
+fn dashboard_asset(asset: &AssetSnapshot, cost_basis: &CostBasisResult) -> DashboardAsset {
+    let cost_basis_eur = cost_basis.open_cost_basis(&asset.symbol);
+    let pnl_eur = asset.value_eur - cost_basis_eur;
+    let pnl_pct = if cost_basis_eur > 0.0 { pnl_eur / cost_basis_eur * 100.0 } else { 0.0 };
+
+    DashboardAsset {
+        symbol: asset.symbol.clone(),
+        kind: asset.kind.as_str().to_string(),
+        ticker: asset.ticker.clone(),
+        quantity: asset.quantity,
+        price_eur: asset.price_eur,
+        value_eur: asset.value_eur,
+        cost_basis_eur,
+        pnl_eur,
+        pnl_pct,
+        realized_pnl_eur: cost_basis.total_realized_pnl(Some(&asset.symbol)),
+    }
+}
+
+fn build_dashboard(
+    tx_store: &TxStore,
+    snapshot: &PortfolioSnapshot,
+    cost_basis: &CostBasisResult,
+    correlation_matrices: CorrelationMatrices,
+) -> DashboardData {
+    let assets: Vec<DashboardAsset> = snapshot.assets.iter().map(|a| dashboard_asset(a, cost_basis)).collect();
+    let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
+
+    DashboardData {
         total_value_eur: snapshot.total_value_eur,
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
-        realized_pnl_eur: total_realized_pnl_stocks,
-        trades: build_trades(&tx_store),
-        trade_frequency: build_trade_frequency(&tx_store),
-        assets: dashboard_assets,
+        realized_pnl_eur: cost_basis.total_realized_pnl_stocks(tx_store),
+        trades: build_trades(tx_store),
+        trade_frequency: build_trade_frequency(tx_store),
+        assets,
         correlation_matrices,
-    };
- 
-    let dashboard_path = PathBuf::from("./data/dashboard.json");
-
-    std::fs::write(&dashboard_path, serde_json::to_string_pretty(&dashboard_data)?)?;
-    println!("Dashboard écrit : {dashboard_path:?}");
-
-    // Sauvegarde atomique et définitive du cache de prix
-    save_price_caches(&cache_path);
-    println!("Cache des prix 1h sauvegardé : {cache_path:?}");
-
-    // --- Génération des fichiers pour le LLM ---
-    generate_concatenated_txt("src", "rs", "forllm.txt", &["Cargo.toml"])?;
-    generate_concatenated_txt("dashboard", "py", "forllmdashboard.txt", &[])?;
-
-    Ok(())
+    }
 }
 
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    fs::write(path, serde_json::to_string_pretty(value)?)?;
+    Ok(())
+}
 
 
 ################################################################################
@@ -5286,7 +5524,9 @@ impl TxStore {
     pub fn new() -> Self {
         Self::default()
     }
-
+    pub fn is_stock(&self, symbol: &str) -> bool {
+    self.assets.get(symbol).map(|a| a.kind) == Some(AssetKind::Stock)
+    }
     pub fn find_or_create_asset(
         &mut self,
         symbol: &str,
