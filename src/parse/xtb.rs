@@ -10,8 +10,7 @@ use calamine::{open_workbook, Data, Reader, Xlsx};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use once_cell::sync::Lazy;
 
-use crate::market::prices::{normalize_currency_for_fx, yahoo_historical_price};
-use crate::market::tickers::resolve_ticker;
+use crate::market::client::{MarketDataClient, normalize_currency_for_fx};
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
 
 #[derive(Debug, Clone)]
@@ -135,10 +134,7 @@ fn infer_currency(symbol: &str) -> String {
 static FX_RATE_CACHE: Lazy<Mutex<HashMap<(String, String), f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static TRADING_CURRENCY_CACHE: Lazy<Mutex<HashMap<(String, String), String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Facteur multiplicatif -> EUR à la date donnée, via Yahoo. Best-effort :
-/// en cas d'échec réseau/format, renvoie 1.0 (dégradé) plutôt que de
-/// lever une erreur qui casserait tout l'import.
-fn fx_rate_to_eur(currency: &str, day_str: &str) -> f64 {
+fn fx_rate_to_eur(market_client: &MarketDataClient, currency: &str, day_str: &str) -> f64 {
     if currency == "EUR" {
         return 1.0;
     }
@@ -147,7 +143,7 @@ fn fx_rate_to_eur(currency: &str, day_str: &str) -> f64 {
         return *cached;
     }
     let (fx_currency, price_factor) = normalize_currency_for_fx(currency);
-    let rate = match yahoo_historical_price(&format!("EUR{fx_currency}=X"), day_str) {
+    let rate = match market_client.yahoo_historical_price(&format!("EUR{fx_currency}=X"), day_str) {
         Ok((fx_price, _)) if fx_price != 0.0 => price_factor / fx_price,
         _ => 1.0,
     };
@@ -155,24 +151,19 @@ fn fx_rate_to_eur(currency: &str, day_str: &str) -> f64 {
     rate
 }
 
-/// Devise de cotation RÉELLE de `symbol`, lue chez Yahoo -- ne jamais la
-/// deviner depuis le suffixe XTB seul (repli sur l'heuristique si la
-/// résolution Yahoo échoue).
-fn real_trading_currency(symbol: &str, day_str: &str) -> String {
+fn real_trading_currency(market_client: &MarketDataClient, symbol: &str, day_str: &str) -> String {
     let key = (symbol.to_string(), day_str.to_string());
     if let Some(cached) = TRADING_CURRENCY_CACHE.lock().unwrap().get(&key) {
         return cached.clone();
     }
-    let currency = resolve_ticker(symbol, AssetKind::Stock)
-        .and_then(|ticker| yahoo_historical_price(&ticker, day_str).ok())
+    let currency = market_client.resolve_ticker(symbol, AssetKind::Stock)
+        .and_then(|ticker| market_client.yahoo_historical_price(&ticker, day_str).ok())
         .map(|(_, currency)| currency)
         .unwrap_or_else(|| infer_currency(symbol));
     TRADING_CURRENCY_CACHE.lock().unwrap().insert(key, currency.clone());
     currency
 }
 
-/// Trouve dynamiquement le nom d'onglet commençant par un préfixe donné,
-/// utile pour 'OPEN POSITION <date>' dont le nom exact change à chaque export.
 pub fn find_sheet_by_prefix(path: &Path, prefix: &str) -> Result<String> {
     let workbook: Xlsx<_> = open_workbook(path).with_context(|| format!("ouverture de {path:?}"))?;
     workbook
@@ -203,10 +194,6 @@ fn cell_f64(value: &Data) -> Option<f64> {
     }
 }
 
-/// Excel/xlsx stocke les dates comme un nombre de jours depuis 1899-12-30 ;
-/// calamine expose déjà ce nombre via `as_f64` pour les cellules formatées
-/// date, donc on repasse par cette base -- équivalent du comportement
-/// openpyxl (qui renvoie directement un datetime Python).
 fn cell_datetime(value: &Data) -> Result<DateTime<Utc>> {
     match value {
         Data::DateTime(excel_dt) => {
@@ -222,9 +209,6 @@ fn cell_datetime(value: &Data) -> Result<DateTime<Utc>> {
     }
 }
 
-/// Trouve l'index de la ligne d'en-tête -- celle qui contient
-/// `required_col`. Les exports XTB ont un nombre variable de lignes de
-/// titre/résumé de compte au-dessus du vrai tableau.
 fn find_header_row(rows: &[Vec<Data>], required_col: &str) -> Result<usize> {
     let required_lower = required_col.trim().to_lowercase();
     for (i, row) in rows.iter().enumerate() {
@@ -235,9 +219,6 @@ fn find_header_row(rows: &[Vec<Data>], required_col: &str) -> Result<usize> {
     Err(anyhow!("en-tête introuvable (colonne '{required_col}' non trouvée)"))
 }
 
-/// Nom de colonne (normalisé en minuscules) -> index. Insensible à la
-/// casse : les exports XTB ont déjà changé la casse de certains en-têtes
-/// d'une version à l'autre.
 fn column_map(header_row: &[Data]) -> HashMap<String, usize> {
     header_row
         .iter()
@@ -290,12 +271,11 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str, known_ids: &std::co
             None => continue,
         };
         let occurrence = {
-        let n = seen.entry(position_id.clone()).or_insert(0);
-        let current = *n;
-        *n += 1;
-        current
+            let n = seen.entry(position_id.clone()).or_insert(0);
+            let current = *n;
+            *n += 1;
+            current
         };
-        // SKIP EARLY
         let buy_id = format!("{}-buy", position_id);
         let sell_id = format!("{}-sell", position_id);
         if known_ids.contains(&buy_id) && known_ids.contains(&sell_id) {
@@ -318,12 +298,8 @@ pub fn parse_closed_positions(path: &Path, sheet_name: &str, known_ids: &std::co
     }
     Ok(out)
 }
-/// Parse l'onglet 'Open Positions' d'un export XTB xlsx.
-///
-/// Le tableau contient deux types de lignes : des lignes "résumé" par
-/// instrument (colonne Type vide) et des lignes "détail" par position
-/// individuelle (Type='BUY'). Seules les secondes sont retenues.
-pub fn parse_open_positions(path: &Path, sheet_name: &str, known_ids: &HashSet<String>) -> Result<Vec<XtbOpenPosition>> {
+
+pub fn parse_open_positions(path: &Path, sheet_name: &str, known_ids: &HashSet<String>, market_client: &MarketDataClient) -> Result<Vec<XtbOpenPosition>> {
     let source_file = path.display().to_string();
     let rows = load_rows(path, sheet_name)?;
     let header_idx = find_header_row(&rows, "Instrument/Position")?;
@@ -345,15 +321,9 @@ pub fn parse_open_positions(path: &Path, sheet_name: &str, known_ids: &HashSet<S
         let open_price = cell_f64(col(row, &col_map, "Open price")?).unwrap_or(0.0);
         let volume = cell_f64(col(row, &col_map, "Volume")?).unwrap_or(0.0);
 
-        // Coût réel d'acquisition (Volume x Open price), converti en EUR à
-        // la date d'ouverture -- PAS la colonne "Value" (valeur de marché
-        // au moment de l'export) : utiliser celle-ci comme purchase_value
-        // faussait silencieusement tout le cost basis FIFO à chaque
-        // réimport (le "coût d'achat" devenait la valeur de marché du jour
-        // d'export).
         let day_str = open_time.format("%Y-%m-%d").to_string();
-        let currency = real_trading_currency(&symbol, &day_str);
-        let fx_rate = fx_rate_to_eur(&currency, &day_str);
+        let currency = real_trading_currency(market_client, &symbol, &day_str);
+        let fx_rate = fx_rate_to_eur(market_client, &currency, &day_str);
         let acquisition_cost_eur = volume * open_price * fx_rate;
 
         out.push(XtbOpenPosition {
@@ -371,30 +341,21 @@ pub fn parse_open_positions(path: &Path, sheet_name: &str, known_ids: &HashSet<S
     Ok(out)
 }
 
-// Mapping des types d'opération 'Cash Operations' -> TransactionKind. Si un
-// nouveau type apparaît dans un futur export, on renvoie une erreur
-// explicite plutôt que de l'ignorer silencieusement.
 fn cash_kind_for(op_type: &str) -> Option<TransactionKind> {
     match op_type {
         "Deposit" | "Free funds interest" => Some(TransactionKind::Deposit),
-        // jambe cash de l'achat/vente -- le titre est déjà géré par
-        // parse_open_positions/parse_closed_positions.
         "Stock purchase" => Some(TransactionKind::Withdraw),
         "Stock sell" => Some(TransactionKind::Deposit),
         "Dividend" => Some(TransactionKind::Deposit),
-        "Withholding tax" => Some(TransactionKind::Fee), // retenue à la source sur dividende
-        "Tax IFTT" => Some(TransactionKind::Fee),         // taxe française sur transactions financières
-        "Fractional shares" => Some(TransactionKind::Deposit), // compensation cash pour rompus d'actions
+        "Withholding tax" => Some(TransactionKind::Fee),
+        "Tax IFTT" => Some(TransactionKind::Fee),
+        "Fractional shares" => Some(TransactionKind::Deposit),
         _ => None,
     }
 }
 
-// Ignoré : mouvement interne entre sous-comptes XTB, pas une entrée/sortie
-// réelle de patrimoine (vu sur le principal et sur le PEA).
 const SKIP_CASH_TYPES: &[&str] = &["PEA deposit"];
 
-/// Parse l'onglet 'Cash Operations' d'un export XTB xlsx en transactions de
-/// cash EUR (dépôts, dividendes, taxes, achats/ventes de titres...).
 pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
     let rows = load_rows(path, sheet_name)?;
@@ -444,9 +405,7 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
     Ok(out)
 }
 
-
-
-pub fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
+pub fn parse_xtb_file(path: &Path, market_client: &MarketDataClient) -> Vec<Transaction> {
     let mut out = Vec::new();
     if !path.exists() {
         println!("[Omis] Fichier introuvable : {path:?}");
@@ -469,7 +428,7 @@ pub fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
     }
 
     match find_sheet_by_prefix(path, "Open Position") {
-        Ok(sheet) => match parse_open_positions(path, &sheet, &empty_ids) {
+        Ok(sheet) => match parse_open_positions(path, &sheet, &empty_ids, market_client) {
             Ok(positions) => out.extend(positions.iter().map(|p| p.to_transaction())),
             Err(e) => println!("  [Erreur XTB Open] {e}"),
         },
@@ -486,5 +445,3 @@ pub fn parse_xtb_file(path: &Path) -> Vec<Transaction> {
 
     out
 }
-
-

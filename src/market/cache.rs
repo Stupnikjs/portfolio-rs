@@ -105,15 +105,15 @@ pub(crate) struct ResolutionCache {
 }
 
 impl ResolutionCache {
-    fn empty(resolution: Resolution) -> Self {
+    pub fn empty(resolution: Resolution) -> Self {
         Self { resolution, cache: Mutex::new(PriceCache::default()) }
     }
 
-    fn init(&self, path: &Path) {
+    pub fn init(&self, path: &Path) {
         *self.cache.lock().unwrap() = PriceCache::load(path);
     }
 
-    fn save(&self, path: &Path) {
+    pub fn save(&self, path: &Path) {
         if let Err(e) = self.cache.lock().unwrap().save(path) {
             eprintln!("Erreur sauvegarde cache: {e}");
         }

@@ -22,9 +22,8 @@ use portfolio_rs::ledger::portfolio::{portfolio_snapshot_at, AssetSnapshot, Port
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::ledger::realized::{realized_summary, TaxAccount};
 use portfolio_rs::ledger::trades::{build_trade_frequency, build_trades};
+use portfolio_rs::market::client::MarketDataClient; // <-- NOUVEAU SERVICE INJECTÉ
 use portfolio_rs::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
-use portfolio_rs::market::prices::{init_price_caches, save_price_caches};
-use portfolio_rs::market::tickers::resolve_ticker;
 use portfolio_rs::parse::{binance, manual, xtb};
 use portfolio_rs::schema::{AssetKind, DashboardAsset, DashboardData, TransactionKind};
 use portfolio_rs::store::serialize::{save_wallet, TxStore};
@@ -44,18 +43,24 @@ fn accounts_path() -> PathBuf {
 
 fn main() -> Result<()> {
     let cache_dir = PathBuf::from("./data/cache");
-    init_price_caches(&cache_dir);
+    
+    // 1. Initialisation du client de données de marché (remplace les globals)
+    let mut market_client = MarketDataClient::new();
+    market_client.init_caches(&cache_dir);
 
-    let mut tx_store = build_wallet()?;
+    // 2. Construction du wallet (le client est passé aux parseurs pour valoriser en EUR à l'import)
+    let mut tx_store = build_wallet(&market_client)?;
     warn_on_invalid_quantities(&tx_store);
-    resolve_missing_tickers(&mut tx_store);
+    resolve_missing_tickers(&mut tx_store, &market_client);
 
     save_wallet(&tx_store, Path::new("./data/tx_store.json"))?;
     println!("tx_store.json regénéré.");
 
-    record_weekly_history(&tx_store, Path::new("./data/history.json"))?;
+    // 3. Historique (le client est passé pour récupérer les prix passés)
+    record_weekly_history(&tx_store, Path::new("./data/history.json"), &market_client)?;
 
-    let snapshot = portfolio_snapshot_at(&tx_store, None);
+    // 4. Valorisation actuelle et FIFO
+    let snapshot = portfolio_snapshot_at(&tx_store, None, &market_client);
     let cost_basis = compute_fifo(&tx_store, None)?;
 
     let latent_pnl = print_valuation(&snapshot, &cost_basis);
@@ -71,14 +76,16 @@ fn main() -> Result<()> {
             .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
     );
 
-    let correlations = compute_correlations(&tx_store, &snapshot);
+    // 5. Corrélations et Dashboard
+    let correlations = compute_correlations(&tx_store, &snapshot, &market_client);
     let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations);
     let dashboard_path = PathBuf::from("./data/dashboard.json");
     write_json(&dashboard_path, &dashboard)?;
     println!("Dashboard écrit : {dashboard_path:?}");
 
-    save_price_caches(&cache_dir);
-    println!("Cache des prix 1h sauvegardé : {cache_dir:?}");
+    // 6. Sauvegarde des caches sur disque avant de quitter
+    market_client.save_caches(&cache_dir);
+    println!("Cache des prix 1h/1j sauvegardé : {cache_dir:?}");
 
     devtools::dump_for_llm()
 }
@@ -88,14 +95,15 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------
 
 /// Parse toutes les sources (Binance, XTB CTO + PEA, saisies manuelles).
-fn build_wallet() -> Result<TxStore> {
+fn build_wallet(market_client: &MarketDataClient) -> Result<TxStore> {
     println!("=== CONSTRUCTION DU WALLET ===");
     let accounts = accounts_path();
     let mut tx_store = TxStore::new();
 
-    tx_store.add_transactions(binance::parse_binance_sources(accounts.clone()));
+    // On passe le client aux parseurs qui en ont besoin (pour valoriser en EUR lors de l'import)
+    tx_store.add_transactions(binance::parse_binance_sources(accounts.clone(), market_client));
     for file in ["account.xlsx", "account_pea.xlsx"] {
-        tx_store.add_transactions(xtb::parse_xtb_file(&accounts.join(file)));
+        tx_store.add_transactions(xtb::parse_xtb_file(&accounts.join(file), market_client));
     }
     tx_store.add_transactions(manual::parse_manual(&data_dir().join("manual_tx.json"))?);
 
@@ -116,7 +124,7 @@ fn warn_on_invalid_quantities(tx_store: &TxStore) {
 }
 
 /// Renseigne `identifiers.ticker` des actifs qui n'en ont pas (hors cash).
-fn resolve_missing_tickers(tx_store: &mut TxStore) {
+fn resolve_missing_tickers(tx_store: &mut TxStore, market_client: &MarketDataClient) {
     println!("\n=== RÉSOLUTION DES TICKERS ===");
     let (mut resolved, mut skipped, mut failed) = (0, 0, 0);
 
@@ -131,7 +139,8 @@ fn resolve_missing_tickers(tx_store: &mut TxStore) {
             skipped += 1;
             continue;
         }
-        match resolve_ticker(&symbol, kind) {
+        // Utilisation de la méthode du client injecté
+        match market_client.resolve_ticker(&symbol, kind) {
             Some(ticker) => {
                 println!("  ✓ {symbol:<12} -> {ticker}");
                 if let Some(asset) = tx_store.assets.get_mut(&symbol) {
@@ -226,12 +235,12 @@ fn print_realized_by_stock(cost_basis: &CostBasisResult, tx_store: &TxStore) {
 // Corrélations et dashboard.json
 // ---------------------------------------------------------------------
 
-fn compute_correlations(tx_store: &TxStore, snapshot: &PortfolioSnapshot) -> CorrelationMatrices {
+fn compute_correlations(tx_store: &TxStore, snapshot: &PortfolioSnapshot, market_client: &MarketDataClient) -> CorrelationMatrices {
     println!("\n=== CALCUL DE LA CORRÉLATION (90j / 6m / 1an, seuil {CORRELATION_MIN_VALUE_EUR}€) ===");
     let holdings = non_zero_holdings_at(tx_store, None);
     let prices_eur: HashMap<String, f64> =
         snapshot.assets.iter().map(|a| (a.symbol.clone(), a.price_eur)).collect();
-    compute_correlation_matrices(tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR)
+    compute_correlation_matrices(tx_store, &holdings, &prices_eur, CORRELATION_MIN_VALUE_EUR, market_client)
 }
 
 fn dashboard_asset(asset: &AssetSnapshot, cost_basis: &CostBasisResult) -> DashboardAsset {
