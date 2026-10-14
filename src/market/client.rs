@@ -69,7 +69,6 @@ impl MarketDataClient {
         Self {
             http_client: reqwest::blocking::Client::builder()
                 .user_agent("Mozilla/5.0")
-                .expect("user agent")
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("client HTTP"),

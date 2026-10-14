@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{TimeZone, Utc};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,22 +160,7 @@ impl ResolutionCache {
     }
 }
 
-pub(crate) static CACHE_1H: Lazy<ResolutionCache> = Lazy::new(|| ResolutionCache::empty(Resolution::Hour));
-pub(crate) static CACHE_1D: Lazy<ResolutionCache> = Lazy::new(|| ResolutionCache::empty(Resolution::Day));
 
-/// Charge les caches persistés sur disque. À appeler une fois au
-/// démarrage, avant tout appel aux fonctions de `prices.rs`.
-pub fn init_price_caches(dir: &Path) {
-    CACHE_1H.init(&dir.join("price_cache_1h.bin"));
-    CACHE_1D.init(&dir.join("price_cache_1d.bin"));
-}
-
-/// Persiste les caches sur disque. À appeler avant de quitter le
-/// programme pour ne pas reperdre les prix récupérés durant le run.
-pub fn save_price_caches(dir: &Path) {
-    CACHE_1H.save(&dir.join("price_cache_1h.bin"));
-    CACHE_1D.save(&dir.join("price_cache_1d.bin"));
-}
 
 #[cfg(test)]
 mod tests {

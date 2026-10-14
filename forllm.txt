@@ -1,6 +1,9 @@
 ################################################################################
+# Dossier : .
 # Fichier : Cargo.toml
+# Chemin relatif : Cargo.toml
 ################################################################################
+
 [package]
 name = "portfolio_rs"
 version = "0.1.0"
@@ -26,10 +29,12 @@ encoding_rs = "=0.8.33"
 bincode = "1.3"
 
 
+################################################################################
+# Dossier : src
+# Fichier : devtools.rs
+# Chemin relatif : devtools.rs
+################################################################################
 
-################################################################################
-# Fichier : src/devtools.rs
-################################################################################
 //! Outils de développement (hors métier) : concatène les sources du projet
 //! dans un .txt à donner à un LLM.
 //!
@@ -154,10 +159,12 @@ mod tests {
 }
 
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : cost_basis.rs
+# Chemin relatif : ledger/cost_basis.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/cost_basis.rs
-################################################################################
 //! Portage de src/ledger/cost_basis.py -- calcul du cost basis (prix de
 //! revient) par méthode FIFO, et du P&L réalisé à la vente.
 //!
@@ -560,10 +567,12 @@ mod tests {
 }
 
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : history.rs
+# Chemin relatif : ledger/history.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/history.rs
-################################################################################
 //! Historique de valorisation du portefeuille, hebdomadaire ou mensuel.
 //!
 //! Principe : un snapshot par période, pris en fin de journée (23:59:59 UTC) :
@@ -918,10 +927,12 @@ pub fn record_history_with(
     Ok(computed)
 }
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : mod.rs
+# Chemin relatif : ledger/mod.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/mod.rs
-################################################################################
 //! Calculs à partir des transactions du wallet.
 
 pub mod cost_basis;
@@ -933,10 +944,12 @@ pub mod realized;
 pub mod trades;
 
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : periods.rs
+# Chemin relatif : ledger/periods.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/periods.rs
-################################################################################
 //! Arithmétique de calendrier partagée (historique, fréquence des trades).
 //!
 //! Évite que `trades.rs` dépende de `history.rs` juste pour `week_end`, et
@@ -1059,10 +1072,12 @@ mod tests {
 }
 
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : portfolio.rs
+# Chemin relatif : ledger/portfolio.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/portfolio.rs
-################################################################################
 //! Portage de src/ledger/portfolio.py -- valorisation du portefeuille à
 //! une date donnée. Combine les positions (quantités) avec les prix de
 //! marché historiques.
@@ -1135,10 +1150,12 @@ pub fn portfolio_snapshot_with(
     PortfolioSnapshot { date: at.format("%Y-%m-%d").to_string(), total_value_eur, assets: details }
 }
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : positions.rs
+# Chemin relatif : ledger/positions.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/positions.rs
-################################################################################
 //! Portage de src/ledger/positions.py -- reconstruction des positions
 //! (quantités détenues) à partir du log de transactions. Pattern
 //! event-sourcing : serialized_tx.json ne stocke jamais de solde calculé,
@@ -1207,10 +1224,12 @@ pub fn non_zero_holdings_at(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> Ha
 
 
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : realized.rs
+# Chemin relatif : ledger/realized.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/realized.rs
-################################################################################
 //! Plus-values réalisées par compte fiscal (CTO, PEA, Binance).
 //!
 //! `compute_fifo` rejoue TOUTES les transactions et indexe les lots par
@@ -1528,10 +1547,12 @@ mod tests {
 }
 
 
+################################################################################
+# Dossier : src/ledger
+# Fichier : trades.rs
+# Chemin relatif : ledger/trades.rs
+################################################################################
 
-################################################################################
-# Fichier : src/ledger/trades.rs
-################################################################################
 //! Trades passés (Buy/Sell) et leur fréquence par mois / semaine, pour
 //! dashboard.json.
 //!
@@ -1739,10 +1760,12 @@ mod tests {
 }
 
 
+################################################################################
+# Dossier : src
+# Fichier : lib.rs
+# Chemin relatif : lib.rs
+################################################################################
 
-################################################################################
-# Fichier : src/lib.rs
-################################################################################
 //! Pipeline portefeuille : parse des exports (Binance, XTB, manuel), calculs
 //! (cost basis FIFO, valorisation, historique, plus-values) et export vers le dashboard.
 //!
@@ -1767,10 +1790,12 @@ pub mod devtools;
 mod testutil;
 
 
+################################################################################
+# Dossier : src
+# Fichier : main.rs
+# Chemin relatif : main.rs
+################################################################################
 
-################################################################################
-# Fichier : src/main.rs
-################################################################################
 //! Portage de src/cli.py -- construit (ou met à jour) serialized_tx.json
 //! à partir des exports bruts dans ./data/raw/.
 //!
@@ -2061,10 +2086,12 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+################################################################################
+# Dossier : src/market
+# Fichier : benchmarks.rs
+# Chemin relatif : market/benchmarks.rs
+################################################################################
 
-################################################################################
-# Fichier : src/market/benchmarks.rs
-################################################################################
 //! Indices régionaux et matières premières suivis par défaut dans la
 //! matrice de corrélation, indépendamment de ce qui est détenu en
 //! portefeuille -- servent de référence pour juger la diversification
@@ -2107,10 +2134,12 @@ pub const BENCHMARKS: &[Benchmark] = &[
 
 
 
+################################################################################
+# Dossier : src/market
+# Fichier : cache.rs
+# Chemin relatif : market/cache.rs
+################################################################################
 
-################################################################################
-# Fichier : src/market/cache.rs
-################################################################################
 //! src/market/cache.rs — cache de prix persistant (bincode), par résolution
 //! horaire ou journalière. Isolé de prices.rs pour séparer "stockage" et
 //! "récupération / logique métier".
@@ -2120,7 +2149,6 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{TimeZone, Utc};
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2274,22 +2302,7 @@ impl ResolutionCache {
     }
 }
 
-pub(crate) static CACHE_1H: Lazy<ResolutionCache> = Lazy::new(|| ResolutionCache::empty(Resolution::Hour));
-pub(crate) static CACHE_1D: Lazy<ResolutionCache> = Lazy::new(|| ResolutionCache::empty(Resolution::Day));
 
-/// Charge les caches persistés sur disque. À appeler une fois au
-/// démarrage, avant tout appel aux fonctions de `prices.rs`.
-pub fn init_price_caches(dir: &Path) {
-    CACHE_1H.init(&dir.join("price_cache_1h.bin"));
-    CACHE_1D.init(&dir.join("price_cache_1d.bin"));
-}
-
-/// Persiste les caches sur disque. À appeler avant de quitter le
-/// programme pour ne pas reperdre les prix récupérés durant le run.
-pub fn save_price_caches(dir: &Path) {
-    CACHE_1H.save(&dir.join("price_cache_1h.bin"));
-    CACHE_1D.save(&dir.join("price_cache_1d.bin"));
-}
 
 #[cfg(test)]
 mod tests {
@@ -2449,10 +2462,12 @@ mod tests {
 
 
 
+################################################################################
+# Dossier : src/market
+# Fichier : client.rs
+# Chemin relatif : market/client.rs
+################################################################################
 
-################################################################################
-# Fichier : src/market/client.rs
-################################################################################
 //! src/market/client.rs — Service central pour les données de marché.
 //!
 //! Suppression de l'état global (Lazy<Mutex>) au profit d'une struct injectable.
@@ -2525,6 +2540,7 @@ impl MarketDataClient {
             http_client: reqwest::blocking::Client::builder()
                 .user_agent("Mozilla/5.0")
                 .timeout(Duration::from_secs(10))
+                .build()
                 .expect("client HTTP"),
             cache_1h: ResolutionCache::empty(Resolution::Hour),
             cache_1d: ResolutionCache::empty(Resolution::Day),
@@ -2956,10 +2972,12 @@ fn manual_ticker_overrides() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+################################################################################
+# Dossier : src/market
+# Fichier : correlation.rs
+# Chemin relatif : market/correlation.rs
+################################################################################
 
-################################################################################
-# Fichier : src/market/correlation.rs
-################################################################################
 //! Matrice de corrélation des rendements journaliers : actifs détenus
 //! (au-dessus d'un seuil de valeur) + benchmarks (`benchmarks.rs`), sur des
 //! fenêtres glissantes (`CORRELATION_WINDOWS`).
@@ -3118,10 +3136,12 @@ pub fn compute_correlation_matrices(
         .collect()
 }
 
+################################################################################
+# Dossier : src/market
+# Fichier : mod.rs
+# Chemin relatif : market/mod.rs
+################################################################################
 
-################################################################################
-# Fichier : src/market/mod.rs
-################################################################################
 pub mod benchmarks;
 pub mod correlation;
 pub mod client;
@@ -3129,10 +3149,12 @@ mod cache;
 
 
 
+################################################################################
+# Dossier : src/parse
+# Fichier : binance.rs
+# Chemin relatif : parse/binance.rs
+################################################################################
 
-################################################################################
-# Fichier : src/parse/binance.rs
-################################################################################
 //! Portage de src/parse/binance.py.
 
 use std::collections::{HashMap, HashSet};
@@ -3151,29 +3173,27 @@ use crate::market::client::MarketDataClient;
 pub enum BinanceParseError {
     #[error("colonne manquante: {0}")]
     MissingColumn(String),
-    #[error("format de montant invalide '{raw}': {source}")]
-    InvalidAmount { raw: String, source: String },
-    #[error("format de date invalide '{raw}': {source}")]
-    InvalidTime { raw: String, source: chrono::ParseError },
-    #[error("side inconnu: {0}")]
-    UnknownSide(String),
     #[error("erreur de lecture CSV: {0}")]
     Csv(String),
+    #[error("format de montant invalide '{0}'")]
+    InvalidAmount(String),
+    #[error("format de date invalide '{0}'")]
+    InvalidTime(String),
+    #[error("side inconnu: {0}")]
+    UnknownSide(String),
 }
 
+// On force l'utilisation de std::result::Result pour ne pas conflit avec anyhow::Result
 pub fn parse_trades(
     path: &Path, 
     known_ids: &HashSet<String>,
     price_client: &MarketDataClient,
-) -> Result<Vec<Transaction>, BinanceParseError> {
+) -> std::result::Result<Vec<Transaction>, BinanceParseError> {
     let source_file = path.display().to_string();
     let mut out = Vec::new();
 
     let mut reader = csv::Reader::from_path(path).map_err(|e| BinanceParseError::Csv(e.to_string()))?;
-    let headers = reader
-    .headers()
-    .map_err(|e| BinanceParseError::Csv(e.to_string()))?
-    .clone();
+    let headers = reader.headers().map_err(|e| BinanceParseError::Csv(e.to_string()))?.clone();
 
     for record in reader.records() {
         let record = match record {
@@ -3201,10 +3221,10 @@ pub fn parse_trades(
             continue;
         }
 
-        let parsed_row = (|| -> Result<(), BinanceParseError> {
+        let parsed_row = (|| -> std::result::Result<(), BinanceParseError> {
             let time_str = get_col!("Time");
             let naive = NaiveDateTime::parse_from_str(time_str, "%Y-%m-%d %H:%M:%S")
-                .map_err(|e| BinanceParseError::InvalidTime { raw: time_str.to_string(), source: e })?;
+                .map_err(|_| BinanceParseError::InvalidTime(time_str.to_string()))?;
             let time = Utc.from_utc_datetime(&naive);
 
             let (base_qty, base_symbol) = split_amount(get_col!("Executed"))?;
@@ -3282,28 +3302,12 @@ pub fn parse_trades(
     Ok(out)
 }
 
-fn split_amount(raw: &str) -> Result<(f64, String), BinanceParseError> {
+fn split_amount(raw: &str) -> std::result::Result<(f64, String), BinanceParseError> {
     let re = Regex::new(r"^([0-9.]+)([A-Za-z]+)$").unwrap();
-
-    let caps = re.captures(raw.trim()).ok_or_else(|| {
-        BinanceParseError::InvalidAmount {
-            raw: raw.to_string(),
-            source: "format attendu : nombre suivi du symbole".to_string(),
-        }
-    })?;
-
-    let qty: f64 = caps[1]
-        .parse()
-        .map_err(|e: std::num::ParseFloatError| {
-            BinanceParseError::InvalidAmount {
-                raw: raw.to_string(),
-                source: e.to_string(),
-            }
-        })?;
-
+    let caps = re.captures(raw.trim()).ok_or_else(|| BinanceParseError::InvalidAmount(raw.to_string()))?;
+    let qty: f64 = caps[1].parse().map_err(|_| BinanceParseError::InvalidAmount(raw.to_string()))?;
     Ok((qty, caps[2].to_string()))
 }
-
 pub fn synthetic_id(prefix: &str, parts: &[&str]) -> String {
     let joined = parts.join("|");
     let digest = Sha256::digest(joined.as_bytes());
@@ -3455,10 +3459,12 @@ pub fn parse_binance_sources(accounts_path: PathBuf, price_client: &MarketDataCl
     out
 }
 
+################################################################################
+# Dossier : src/parse
+# Fichier : manual.rs
+# Chemin relatif : parse/manual.rs
+################################################################################
 
-################################################################################
-# Fichier : src/parse/manual.rs
-################################################################################
 //! Portage de src/parse/manual.py -- comble les trous non couverts par les
 //! exports automatisés (ex: on-chain non tracé). Remplacé en bloc à chaque
 //! run -- voir TxStore::replace_platform.
@@ -3538,10 +3544,12 @@ pub fn parse_manual(path: &Path) -> Result<Vec<Transaction>> {
 
 
 
+################################################################################
+# Dossier : src/parse
+# Fichier : mod.rs
+# Chemin relatif : parse/mod.rs
+################################################################################
 
-################################################################################
-# Fichier : src/parse/mod.rs
-################################################################################
 pub mod binance;
 pub mod xtb;
 pub mod manual;
@@ -3549,10 +3557,12 @@ pub mod manual;
 
 
 
+################################################################################
+# Dossier : src/parse
+# Fichier : xtb.rs
+# Chemin relatif : parse/xtb.rs
+################################################################################
 
-################################################################################
-# Fichier : src/parse/xtb.rs
-################################################################################
 //! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
 //! opérations de cash XTB, lues depuis les exports xlsx.
 
@@ -4001,10 +4011,12 @@ pub fn parse_xtb_file(path: &Path, market_client: &MarketDataClient) -> Vec<Tran
     out
 }
 
+################################################################################
+# Dossier : src/schema
+# Fichier : dashboard.rs
+# Chemin relatif : schema/dashboard.rs
+################################################################################
 
-################################################################################
-# Fichier : src/schema/dashboard.rs
-################################################################################
 //! Structures sérialisées dans dashboard.json (lues par le dashboard Python).
 //! Lecture seule côté Python : tout changement de champ ici doit être répercuté
 //! dans le dashboard (dossier `dashboard/`).
@@ -4072,10 +4084,12 @@ pub struct TradeFrequency {
 }
 
 
+################################################################################
+# Dossier : src/schema
+# Fichier : mod.rs
+# Chemin relatif : schema/mod.rs
+################################################################################
 
-################################################################################
-# Fichier : src/schema/mod.rs
-################################################################################
 //! Types partagés par tout le crate.
 //!
 //! - `types`     : plateformes, transactions, actifs (modèle du wallet)
@@ -4090,10 +4104,12 @@ pub use dashboard::*;
 pub use types::*;
 
 
+################################################################################
+# Dossier : src/schema
+# Fichier : types.rs
+# Chemin relatif : schema/types.rs
+################################################################################
 
-################################################################################
-# Fichier : src/schema/types.rs
-################################################################################
 //! Types de base (portage direct de src/schema.py) : plateformes, transactions, actifs.
 //! Equivalent du crate pf-core évoqué dans le Python d'origine.
 
@@ -4193,19 +4209,23 @@ pub struct Transaction {
 }
 
 
+################################################################################
+# Dossier : src/store
+# Fichier : mod.rs
+# Chemin relatif : store/mod.rs
+################################################################################
 
-################################################################################
-# Fichier : src/store/mod.rs
-################################################################################
 pub mod serialize;
 
 
 
 
+################################################################################
+# Dossier : src/store
+# Fichier : serialize.rs
+# Chemin relatif : store/serialize.rs
+################################################################################
 
-################################################################################
-# Fichier : src/store/serialize.rs
-################################################################################
 //! Portage de src/store/serialize.py : TxStore (conteneur en mémoire) +
 //! chargement/sauvegarde JSON. 
 
@@ -4378,10 +4398,12 @@ pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
 
 
 
+################################################################################
+# Dossier : src
+# Fichier : testutil.rs
+# Chemin relatif : testutil.rs
+################################################################################
 
-################################################################################
-# Fichier : src/testutil.rs
-################################################################################
 //! Helpers partagés par les tests unitaires (compilé uniquement en `cargo test`).
 
 use chrono::{DateTime, Utc};
@@ -4438,7 +4460,6 @@ pub fn store(txs: Vec<Transaction>) -> TxStore {
     s.add_transactions(txs);
     s
 }
-
 
 
 

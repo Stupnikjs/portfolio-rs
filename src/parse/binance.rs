@@ -151,6 +151,7 @@ fn split_amount(raw: &str) -> std::result::Result<(f64, String), BinanceParseErr
     let qty: f64 = caps[1].parse().map_err(|_| BinanceParseError::InvalidAmount(raw.to_string()))?;
     Ok((qty, caps[2].to_string()))
 }
+
 pub fn synthetic_id(prefix: &str, parts: &[&str]) -> String {
     let joined = parts.join("|");
     let digest = Sha256::digest(joined.as_bytes());
