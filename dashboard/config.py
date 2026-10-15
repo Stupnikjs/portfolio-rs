@@ -17,6 +17,11 @@ ROOT_DIR = DASHBOARD_DIR.parent
 DATA_PATH = ROOT_DIR / "data" / "dashboard.json"
 HISTORY_PATH = ROOT_DIR / "data" / "history.json"
 
+# --- Positions de poussière ---
+# Les positions détenues dont la valeur actuelle est inférieure à ce seuil (EUR) sont masquées
+# des tableaux et graphiques. Les totaux (KPIs, historique) les incluent toujours.
+MIN_POSITION_VALUE_EUR = 30.0
+
 # --- Fenêtres de corrélation ---
 # Mapping label de fenêtre (côté Rust) -> période acceptée par yfinance
 WINDOW_TO_YF_PERIOD = {"90d": "3mo", "6m": "6mo", "1y": "1y"}

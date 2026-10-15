@@ -4,7 +4,11 @@ from __future__ import annotations
 import streamlit as st
 
 from theme import apply_theme
-from data import load_data, build_assets_df, compute_kpis, yfinance_ticker_for,CASH_KIND  # <-- Ajout de yfinance_ticker_for
+from config import MIN_POSITION_VALUE_EUR
+from data import (
+    load_data, build_assets_df, compute_kpis, yfinance_ticker_for, CASH_KIND,
+    filter_small_positions, small_positions_summary,
+)
 from charts import render_kpis, render_allocation_and_pnl, render_positions_table
 from correlation import render_correlation_section
 from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio  # <-- NOUVELLE LIGNE
@@ -38,6 +42,14 @@ def get_tags(row):
     return []
 
 df["tags"] = df.apply(get_tags, axis=1)
+
+# --- POSITIONS DE POUSSIÈRE ---
+# `df_all` garde toutes les positions pour les totaux : une position soldée (valeur 0) porte du
+# P&L réalisé qu'il ne faut pas perdre. `df` ne sert qu'à l'affichage (tableaux, graphiques,
+# corrélations). Le filtre vient APRÈS la synchro watchlist : tout actif détenu y est ajouté.
+df_all = df.copy()
+n_dust, dust_value = small_positions_summary(df_all, MIN_POSITION_VALUE_EUR)
+df = filter_small_positions(df_all, MIN_POSITION_VALUE_EUR)
 
 
 # --- NOUVEAU : TABLEAU D'AGRÉGATION GLOBAL PAR TAG ---
@@ -81,13 +93,25 @@ if all_tags:
     selected_tags = st.sidebar.multiselect("Sélectionner un ou plusieurs tags", all_tags)
     
     if selected_tags:
-        df = df[df["tags"].apply(lambda x: any(t in x for t in selected_tags))].copy()
+        has_selected_tag = lambda x: any(t in x for t in selected_tags)
+        df = df[df["tags"].apply(has_selected_tag)].copy()
+        df_all = df_all[df_all["tags"].apply(has_selected_tag)].copy()
 
-kpis = compute_kpis(df)
+if n_dust:
+    st.sidebar.caption(
+        f"{n_dust} position(s) < {MIN_POSITION_VALUE_EUR:.0f} € masquée(s) des tableaux et graphiques "
+        f"({dust_value:,.2f} € au total). Les totaux les incluent."
+    )
+
+kpis = compute_kpis(df_all)
 
 render_kpis(kpis)
 
 st.divider()
+
+if df.empty:
+    st.info(f"Aucune position d'au moins {MIN_POSITION_VALUE_EUR:.0f} €.")
+    st.stop()
 
 render_allocation_and_pnl(df)
 

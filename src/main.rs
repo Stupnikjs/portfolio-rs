@@ -13,11 +13,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use chrono::Utc;
 use serde::Serialize;
 
 use portfolio_rs::devtools;
 use portfolio_rs::ledger::cost_basis::{compute_fifo, CostBasisResult, RealizedGain};
 use portfolio_rs::ledger::history::record_weekly_history;
+use portfolio_rs::ledger::holding::{closed_sales, holding_stats};
 use portfolio_rs::ledger::portfolio::{portfolio_snapshot_at, AssetSnapshot, PortfolioSnapshot};
 use portfolio_rs::ledger::positions::non_zero_holdings_at;
 use portfolio_rs::ledger::realized::{realized_summary, TaxAccount};
@@ -25,10 +27,8 @@ use portfolio_rs::ledger::trades::{build_trade_frequency, build_trades};
 use portfolio_rs::market::client::MarketDataClient; // <-- NOUVEAU SERVICE INJECTÉ
 use portfolio_rs::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
 use portfolio_rs::parse::{binance, manual, xtb};
-use portfolio_rs::schema::{AssetKind, DashboardAsset, DashboardData, TransactionKind};
+use portfolio_rs::schema::{AssetKind, ClosedSale, DashboardAsset, DashboardData, HoldingStats, TransactionKind};
 use portfolio_rs::store::serialize::{save_wallet, TxStore};
-use chrono::{DateTime, Utc};
-
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -78,9 +78,12 @@ fn main() -> Result<()> {
             .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
     );
 
+    // Durée de détention (lots FIFO) et ventes de titres
+    let (holdings, sales) = compute_holdings(&tx_store, &cost_basis, &snapshot);
+
     // 5. Corrélations et Dashboard
     let correlations = compute_correlations(&tx_store, &snapshot, &market_client);
-    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations);
+    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations, holdings, sales);
     let dashboard_path = PathBuf::from("./data/dashboard.json");
     write_json(&dashboard_path, &dashboard)?;
     println!("Dashboard écrit : {dashboard_path:?}");
@@ -269,6 +272,8 @@ fn build_dashboard(
     snapshot: &PortfolioSnapshot,
     cost_basis: &CostBasisResult,
     correlation_matrices: CorrelationMatrices,
+    holdings: Vec<HoldingStats>,
+    sales: Vec<ClosedSale>,
 ) -> DashboardData {
     let assets: Vec<DashboardAsset> = snapshot.assets.iter().map(|a| dashboard_asset(a, cost_basis)).collect();
     let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
@@ -282,6 +287,8 @@ fn build_dashboard(
         trade_frequency: build_trade_frequency(tx_store),
         assets,
         correlation_matrices,
+        holdings,
+        closed_sales: sales,
     }
 }
 
@@ -290,3 +297,43 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+fn compute_holdings(
+    tx_store: &TxStore,
+    cost_basis: &CostBasisResult,
+    snapshot: &PortfolioSnapshot,
+) -> (Vec<HoldingStats>, Vec<ClosedSale>) {
+    println!("\n=== DURÉE DE DÉTENTION (FIFO) ===");
+    let kind_of = |symbol: &str| tx_store.assets.get(symbol).map(|a| a.kind);
+    let prices: HashMap<&str, f64> =
+        snapshot.assets.iter().map(|a| (a.symbol.as_str(), a.price_eur)).collect();
+    // Un prix à 0 est un prix manquant : le lot n'est alors pas valorisé.
+    let price_of = |symbol: &str| prices.get(symbol).copied().filter(|p| *p > 0.0);
+
+    let holdings = holding_stats(cost_basis, Utc::now(), &kind_of, &price_of);
+    print_holdings(&holdings);
+    (holdings, closed_sales(cost_basis, &kind_of))
+}
+
+fn fmt_days(days: Option<f64>) -> String {
+    days.map_or("—".to_string(), |d| format!("{d:.0} j"))
+}
+
+fn print_holdings(stats: &[HoldingStats]) {
+    println!(
+        "  {:<10} {:>12} {:>12} {:>10} {:>10} {:>8} {:>10}",
+        "Symbole", "1er achat", "Capital", "Moyenne", "Plus vieux", "Vendus", "Moy. vendus"
+    );
+    for s in stats {
+        println!(
+            "  {:<10} {:>12} {:>12.2} {:>10} {:>10} {:>8} {:>10}{}",
+            s.symbol,
+            s.first_acquired.as_deref().unwrap_or("—"),
+            s.open_cost_eur,
+            fmt_days(s.open_avg_days),
+            fmt_days(s.open_oldest_days),
+            s.closed_lots,
+            fmt_days(s.closed_avg_days),
+            if s.closed_incomplete { "  ⚠ incomplet" } else { "" }
+        );
+    }
+}

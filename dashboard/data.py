@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from config import DATA_PATH, HISTORY_PATH
+from config import DATA_PATH, HISTORY_PATH, MIN_POSITION_VALUE_EUR
 
 
 CASH_KIND = "Cash"  # ajuste si besoin
@@ -29,6 +29,24 @@ def compute_kpis(df: pd.DataFrame, exclude_cash: bool = True) -> dict:
         "total_pnl_realized_eur": total_pnl_realized,
         "total_pnl_eur": total_pnl_latent + total_pnl_realized,
     }
+
+def filter_small_positions(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> pd.DataFrame:
+    """Écarte les lignes dont la valeur actuelle est inférieure au seuil (>= seuil conservé).
+
+    À réserver à l'AFFICHAGE : une position soldée (valeur 0) est aussi écartée, or elle porte
+    du P&L réalisé qui doit rester dans les totaux (voir `compute_kpis`).
+    """
+    return df[df["value_eur"] >= min_value_eur].copy()
+
+
+def small_positions_summary(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> tuple[int, float]:
+    """(nombre, valeur totale) des positions encore détenues mais sous le seuil.
+
+    Les positions soldées (valeur nulle) ne comptent pas : on ne les « possède » plus.
+    """
+    dust = df[(df["value_eur"] > 0) & (df["value_eur"] < min_value_eur)]
+    return int(len(dust)), float(dust["value_eur"].sum())
+
 
 def load_data(path: Path = DATA_PATH) -> dict:
     """Charge le JSON du pipeline Rust. Arrête l'app proprement s'il est absent."""
