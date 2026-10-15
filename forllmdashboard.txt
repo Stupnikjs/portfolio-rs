@@ -2396,18 +2396,6 @@ from history_view import render_history_page
 render_history_page()
 
 ################################################################################
-# Dossier : dashboard/pages
-# Fichier : 6_Tranches.py
-# Chemin relatif : pages/6_Tranches.py
-################################################################################
-
-"""Page Tranches : retour de chaque apport de cash (data/dashboard.json -> `tranches`)."""
-from tranches_view import render_tranches_page
- 
-render_tranches_page()
- 
-
-################################################################################
 # Dossier : dashboard
 # Fichier : test_history.py
 # Chemin relatif : test_history.py

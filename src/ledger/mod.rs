@@ -7,5 +7,4 @@ pub mod portfolio;
 pub mod positions;
 pub mod realized;
 pub mod trades;
-pub mod scope;
-pub mod tranches;
+
