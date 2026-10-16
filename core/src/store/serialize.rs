@@ -167,4 +167,3 @@ pub fn save_wallet(tx_store: &TxStore, path: &Path) -> Result<()> {
     fs::write(path, json).with_context(|| format!("écriture de {:?}", path))?;
     Ok(())
 }
-

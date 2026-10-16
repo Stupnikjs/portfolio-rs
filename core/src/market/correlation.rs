@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{Duration, NaiveDate, Utc};
 
 use crate::market::benchmarks::{Benchmark, BENCHMARKS};
-use crate::market::client::MarketDataClient;
+use crate::market::MarketDataClient;
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
 

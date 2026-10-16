@@ -36,5 +36,3 @@ pub const BENCHMARKS: &[Benchmark] = &[
     eur("NASDAQ", "^NDX"),
     eur("SU.FR", "SU.PA"),
 ];
-
-

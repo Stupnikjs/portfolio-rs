@@ -10,7 +10,7 @@ use calamine::{open_workbook, Data, Reader, Xlsx};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use once_cell::sync::Lazy;
 
-use crate::market::client::{MarketDataClient, normalize_currency_for_fx};
+use pricer::{MarketDataClient, normalize_currency_for_fx};
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind, CashFlowKind};
 
 
@@ -160,7 +160,7 @@ fn real_trading_currency(market_client: &MarketDataClient, symbol: &str, day_str
     if let Some(cached) = TRADING_CURRENCY_CACHE.lock().unwrap().get(&key) {
         return cached.clone();
     }
-    let currency = market_client.resolve_ticker(symbol, AssetKind::Stock)
+    let currency = market_client.resolve_ticker(symbol, AssetKind::Stock.to_market_kind())
         .and_then(|ticker| market_client.yahoo_historical_price(&ticker, day_str).ok())
         .map(|(_, currency)| currency)
         .unwrap_or_else(|| infer_currency(symbol));

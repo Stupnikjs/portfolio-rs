@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::ledger::positions::holdings_at;
-use crate::market::client::MarketDataClient;
+use crate::market::MarketDataClient;
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
 
@@ -33,7 +33,7 @@ pub type PriceFn<'a> = &'a dyn Fn(&str, AssetKind, Option<&str>, DateTime<Utc>) 
 
 pub fn portfolio_snapshot_at(tx_store: &TxStore, at: Option<DateTime<Utc>>, market_client: &MarketDataClient) -> PortfolioSnapshot {
     let live_prices = |symbol: &str, kind: AssetKind, ticker: Option<&str>, at: DateTime<Utc>| {
-        market_client.historical_price_eur(symbol, at, kind, ticker)
+        market_client.historical_price_eur(symbol, at, kind.to_market_kind(), ticker)
     };
     portfolio_snapshot_with(tx_store, at, &live_prices)
 }

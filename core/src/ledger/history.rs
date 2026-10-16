@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use crate::ledger::cost_basis::compute_fifo;
 use crate::ledger::periods::{first_monday, is_first_monday, months_between, sundays_from};
 use crate::ledger::portfolio::{portfolio_snapshot_with, AssetSnapshot, PriceFn};
-use crate::market::client::MarketDataClient;
+use crate::market::MarketDataClient;
 use crate::schema::AssetKind;
 use crate::store::serialize::TxStore;
 
@@ -275,7 +275,7 @@ pub fn record_monthly_history(tx_store: &TxStore, path: &Path, market_client: &M
 pub fn record_history(tx_store: &TxStore, path: &Path, freq: Frequency, market_client: &MarketDataClient) -> Result<()> {
     let rebuild = std::env::args().any(|a| a == "--rebuild-history");
     let live_prices = |symbol: &str, kind: AssetKind, ticker: Option<&str>, at: DateTime<Utc>| {
-        market_client.historical_price_eur(symbol, at, kind, ticker)
+        market_client.historical_price_eur(symbol, at, kind.to_market_kind(), ticker)
     };
     record_history_with(tx_store, path, &live_prices, Utc::now().date_naive(), freq, rebuild)?;
     Ok(())

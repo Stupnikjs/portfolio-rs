@@ -119,6 +119,11 @@ impl ResolutionCache {
     }
 
 
+    #[cfg(test)]
+    pub(crate) fn get_closest(&self, symbol: &str, ts: i64) -> Option<f64> {
+        self.cache.lock().unwrap().get_closest(symbol, self.resolution.align(ts))
+    }
+
     pub(crate) fn get_within(&self, symbol: &str, ts: i64, max_age_secs: i64) -> Option<f64> {
         self.cache.lock().unwrap().get_within(symbol, self.resolution.align(ts), max_age_secs)
     }
@@ -313,4 +318,3 @@ mod tests {
         assert_eq!(cache.earliest("DOES_NOT_EXIST"), None);
     }
 }
-

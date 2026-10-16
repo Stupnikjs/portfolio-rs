@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
-use crate::market::client::MarketDataClient; 
+use crate::market::MarketDataClient; 
 
 #[derive(Debug, Error)]
 pub enum BinanceParseError {
@@ -90,7 +90,7 @@ pub fn parse_trades(
                 identifiers: AssetIdentifiers::default(),
             };
 
-            let eur_price = price_client.historical_price_eur(&base_symbol, time, asset_kind_for(&base_symbol), None);
+            let eur_price = price_client.historical_price_eur(&base_symbol, time, asset_kind_for(&base_symbol).to_market_kind(), None);
             let value_eur = base_qty * eur_price;
            
             out.push(Transaction {
@@ -118,7 +118,7 @@ pub fn parse_trades(
                     ref_currency: normalize_currency(&fee_symbol).unwrap_or("USD").to_string(),
                     identifiers: AssetIdentifiers::default(),
                 };
-                let fee_price_eur = price_client.historical_price_eur(&fee_symbol, time, asset_kind_for(&fee_symbol), None);
+                let fee_price_eur = price_client.historical_price_eur(&fee_symbol, time, asset_kind_for(&fee_symbol).to_market_kind(), None);
                 out.push(Transaction {
                     platform: Platform::Binance,
                     account_label: "Spot".to_string(),
@@ -234,10 +234,10 @@ pub fn parse_converts(
             identifiers: AssetIdentifiers::default(),
         };
 
-        let sell_price_eur = price_client.historical_price_eur(&sell_symbol, time, asset_kind_for(&sell_symbol), None);
+        let sell_price_eur = price_client.historical_price_eur(&sell_symbol, time, asset_kind_for(&sell_symbol).to_market_kind(), None);
         let sell_value_eur = sell_qty * sell_price_eur;
 
-        let buy_price_eur = price_client.historical_price_eur(&buy_symbol, time, asset_kind_for(&buy_symbol), None);
+        let buy_price_eur = price_client.historical_price_eur(&buy_symbol, time, asset_kind_for(&buy_symbol).to_market_kind(), None);
         let buy_value_eur = buy_qty * buy_price_eur;
 
         out.push(Transaction {

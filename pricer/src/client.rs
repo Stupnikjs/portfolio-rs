@@ -12,7 +12,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::schema::AssetKind;
+use crate::MarketKind;
 
 use super::cache::{is_live_bucket, Resolution, ResolutionCache};
 
@@ -95,11 +95,11 @@ impl MarketDataClient {
     // PRIX HISTORIQUES & FX
     // ---------------------------------------------------------------------
 
-    pub fn historical_price_eur(&self, symbol: &str, time: DateTime<Utc>, kind: AssetKind, ticker: Option<&str>) -> f64 {
+    pub fn historical_price_eur(&self, symbol: &str, time: DateTime<Utc>, kind: MarketKind, ticker: Option<&str>) -> f64 {
         let symbol = symbol.to_uppercase();
         let aligned_ts = Resolution::Hour.align(time.timestamp());
 
-        if kind == AssetKind::Cash {
+        if kind == MarketKind::Cash {
             return match symbol.as_str() {
                 "EUR" | "EURI" => 1.0,
                 "USD" | "USDT" | "USDC" | "BUSD" => 1.0 / self.eur_rate("USD", aligned_ts),
@@ -113,12 +113,12 @@ impl MarketDataClient {
         }
 
         let price = match kind {
-            AssetKind::Crypto => self.crypto_closes_eur(&symbol, aligned_ts * 1000, "1h", "1")
+            MarketKind::Crypto => self.crypto_closes_eur(&symbol, aligned_ts * 1000, "1h", "1")
                 .ok()
                 .and_then(|v| v.into_iter().next())
                 .map(|(_, p)| p)
                 .unwrap_or(0.0),
-            AssetKind::Stock => {
+            MarketKind::Stock => {
                 let Some(ticker) = ticker else { return 0.0 };
                 let day_str = Utc.timestamp_opt(aligned_ts, 0).unwrap().format("%Y-%m-%d").to_string();
                 match self.yahoo_historical_price(ticker, &day_str) {
@@ -130,7 +130,7 @@ impl MarketDataClient {
                     Err(_) => 0.0,
                 }
             }
-            AssetKind::Cash => unreachable!(),
+            MarketKind::Cash => unreachable!(),
         };
 
         if price > 0.0 {
@@ -343,11 +343,11 @@ impl MarketDataClient {
     // RÉSOLUTION DES TICKERS
     // ---------------------------------------------------------------------
 
-    pub fn resolve_ticker(&self, symbol: &str, kind: AssetKind) -> Option<String> {
+    pub fn resolve_ticker(&self, symbol: &str, kind: MarketKind) -> Option<String> {
         match kind {
-            AssetKind::Crypto => self.ticker_for_crypto(symbol),
-            AssetKind::Stock => self.ticker_for_stock(symbol),
-            AssetKind::Cash => None,
+            MarketKind::Crypto => self.ticker_for_crypto(symbol),
+            MarketKind::Stock => self.ticker_for_stock(symbol),
+            MarketKind::Cash => None,
         }
     }
 

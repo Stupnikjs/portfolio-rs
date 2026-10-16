@@ -16,19 +16,19 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;
 
-use portfolio_rs::devtools;
-use portfolio_rs::ledger::cost_basis::{compute_fifo, CostBasisResult, RealizedGain};
-use portfolio_rs::ledger::history::record_weekly_history;
-use portfolio_rs::ledger::holding::{closed_sales, holding_stats};
-use portfolio_rs::ledger::portfolio::{portfolio_snapshot_at, AssetSnapshot, PortfolioSnapshot};
-use portfolio_rs::ledger::positions::non_zero_holdings_at;
-use portfolio_rs::ledger::realized::{realized_summary, TaxAccount};
-use portfolio_rs::ledger::trades::{build_trade_frequency, build_trades};
-use portfolio_rs::market::client::MarketDataClient; // <-- NOUVEAU SERVICE INJECTÉ
-use portfolio_rs::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
-use portfolio_rs::parse::{binance, manual, xtb};
-use portfolio_rs::schema::{AssetKind, ClosedSale, DashboardAsset, DashboardData, HoldingStats, TransactionKind};
-use portfolio_rs::store::serialize::{save_wallet, TxStore};
+use core::devtools;
+use core::ledger::cost_basis::{compute_fifo, CostBasisResult, RealizedGain};
+use core::ledger::history::record_weekly_history;
+use core::ledger::holding::{closed_sales, holding_stats};
+use core::ledger::portfolio::{portfolio_snapshot_at, AssetSnapshot, PortfolioSnapshot};
+use core::ledger::positions::non_zero_holdings_at;
+use core::ledger::realized::{realized_summary, TaxAccount};
+use core::ledger::trades::{build_trade_frequency, build_trades};
+use core::market::MarketDataClient; // <-- NOUVEAU SERVICE INJECTÉ
+use core::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
+use core::parse::{binance, manual, xtb};
+use core::schema::{AssetKind, ClosedSale, DashboardAsset, DashboardData, HoldingStats, TransactionKind};
+use core::store::serialize::{save_wallet, TxStore};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
 
@@ -145,7 +145,7 @@ fn resolve_missing_tickers(tx_store: &mut TxStore, market_client: &MarketDataCli
             continue;
         }
         // Utilisation de la méthode du client injecté
-        match market_client.resolve_ticker(&symbol, kind) {
+        match market_client.resolve_ticker(&symbol, kind.to_market_kind()) {
             Some(ticker) => {
                 println!("  ✓ {symbol:<12} -> {ticker}");
                 if let Some(asset) = tx_store.assets.get_mut(&symbol) {

@@ -67,6 +67,14 @@ impl AssetKind {
             AssetKind::Stock => "Stock",
         }
     }
+
+    pub fn to_market_kind(&self) -> pricer::MarketKind {
+        match self {
+            AssetKind::Cash => pricer::MarketKind::Cash,
+            AssetKind::Crypto => pricer::MarketKind::Crypto,
+            AssetKind::Stock => pricer::MarketKind::Stock,
+        }
+    }
 }
 
 /// Identifiants externes optionnels d'un actif (ISIN, ticker...).
