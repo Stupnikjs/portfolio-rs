@@ -1,31 +1,43 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Fusionne le workspace Cargo (manifestes + code Rust) dans un seul fichier à fournir à un LLM.
+# À lancer depuis la racine du workspace (là où se trouve le Cargo.toml avec [workspace]).
+set -euo pipefail
 
-# Nom du fichier de sortie
 OUTPUT_FILE="forllm.txt"
+MEMBERS=(core pricer model parse)   # dossiers des crates du workspace
 
-# On vide le fichier de sortie s'il existe déjà
-> "$OUTPUT_FILE"
+if ! grep -q '^\[workspace\]' Cargo.toml 2>/dev/null; then
+    echo "Erreur : lance ce script depuis la racine du workspace (Cargo.toml avec [workspace] introuvable ici)." >&2
+    exit 1
+fi
 
-# Fonction pour ajouter un fichier avec un en-tête propre
+: > "$OUTPUT_FILE"
+
+# Ajoute un fichier avec un en-tête propre (ignoré s'il n'existe pas).
 add_file() {
     local file_path="$1"
-    if [ -f "$file_path" ]; then
-        echo "################################################################################
-# Fichier : $file_path
-################################################################################" >> "$OUTPUT_FILE"
-        cat "$file_path" >> "$OUTPUT_FILE"
-        echo -e "\n\n" >> "$OUTPUT_FILE"
-    fi
+    [ -f "$file_path" ] || return 0
+    {
+        printf '%s\n' "################################################################################"
+        printf '# Fichier : %s\n' "$file_path"
+        printf '%s\n' "################################################################################"
+        cat "$file_path"
+        printf '\n\n'
+    } >> "$OUTPUT_FILE"
 }
 
 echo "Génération de $OUTPUT_FILE..."
 
-# 1. On ajoute d'abord le Cargo.toml (à la racine)
+# 1. Manifeste racine du workspace
 add_file "Cargo.toml"
 
-# 2. On trouve tous les .rs dans src/, on les trie par nom, et on les ajoute
-find src -name "*.rs" | sort | while read -r file; do
-    add_file "$file"
+# 2. Pour chaque crate : son Cargo.toml, puis tous ses .rs triés (hors dossier target/)
+for member in "${MEMBERS[@]}"; do
+    add_file "$member/Cargo.toml"
+    while IFS= read -r -d '' file; do
+        add_file "$file"
+    done < <(find "$member" -name "*.rs" -not -path "*/target/*" -print0 | sort -z)
 done
 
-echo "✅ Terminus ! Tout le code Rust et le Cargo.toml ont été fusionnés dans $OUTPUT_FILE"
+nb_files=$(grep -c '^# Fichier : ' "$OUTPUT_FILE")
+echo "✅ Terminé : $nb_files fichiers fusionnés dans $OUTPUT_FILE ($(wc -c < "$OUTPUT_FILE") octets)"

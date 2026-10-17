@@ -9,8 +9,8 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
-use crate::market::MarketDataClient; 
+use model::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind};
+use pricer::MarketDataClient; 
 
 #[derive(Debug, Error)]
 pub enum BinanceParseError {
@@ -305,4 +305,60 @@ pub fn parse_binance_sources(accounts_path: PathBuf, price_client: &MarketDataCl
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_amount_separates_the_quantity_from_the_ticker() {
+        assert_eq!(split_amount("0.5BTC").unwrap(), (0.5, "BTC".to_string()));
+        assert_eq!(split_amount(" 100EUR ").unwrap(), (100.0, "EUR".to_string()));
+    }
+
+    #[test]
+    fn split_amount_rejects_malformed_amounts() {
+        for bad in ["BTC", "", "1,5BTC", "0.5 BTC", "-1BTC"] {
+            assert!(matches!(split_amount(bad), Err(BinanceParseError::InvalidAmount(_))), "devrait échouer : {bad:?}");
+        }
+    }
+
+    #[test]
+    fn split_space_amount_expects_a_quantity_then_a_symbol() {
+        assert_eq!(split_space_amount("12.5 BTC").unwrap(), (12.5, "BTC".to_string()));
+        assert!(split_space_amount("12.5").is_err());
+        assert!(split_space_amount("abc BTC").is_err());
+    }
+
+    #[test]
+    fn synthetic_ids_are_stable_prefixed_and_order_sensitive() {
+        let a = synthetic_id("binance-trade", &["2025-03-01 10:00:00", "BTCEUR", "BUY"]);
+        assert_eq!(a, synthetic_id("binance-trade", &["2025-03-01 10:00:00", "BTCEUR", "BUY"]));
+        assert!(a.starts_with("binance-trade-"));
+        let suffix = a.trim_start_matches("binance-trade-");
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, synthetic_id("binance-trade", &["BTCEUR", "2025-03-01 10:00:00", "BUY"]));
+        assert_ne!(a, synthetic_id("binance-convert", &["2025-03-01 10:00:00", "BTCEUR", "BUY"]));
+    }
+
+    #[test]
+    fn fiat_coins_are_cash_and_everything_else_is_crypto() {
+        assert_eq!(normalize_currency("EUR"), Some("EUR"));
+        assert_eq!(normalize_currency("EURI"), Some("EUR"));
+        for usd in ["USDC", "BUSD", "USD"] {
+            assert_eq!(normalize_currency(usd), Some("USD"));
+        }
+        assert_eq!(normalize_currency("BTC"), None);
+        assert_eq!(asset_kind_for("EURI"), AssetKind::Cash);
+        assert_eq!(asset_kind_for("ETH"), AssetKind::Crypto);
+    }
+
+    #[test]
+    fn parse_time_reads_binance_timestamps() {
+        use chrono::TimeZone;
+        assert_eq!(parse_time("2025-03-01 10:00:00").unwrap(), Utc.with_ymd_and_hms(2025, 3, 1, 10, 0, 0).unwrap());
+        assert!(parse_time("01/03/2025").is_err());
+    }
 }

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "core",
-    "pricer",
+    "portfolio-rs/core",
+    "portfolio-rs/pricer",
+    "portfolio-rs/model",
+    "portfolio-rs/parse",
 ]

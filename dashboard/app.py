@@ -117,6 +117,3 @@ render_allocation_and_pnl(df)
 
 st.divider()
 render_positions_table(df)
-
-st.divider()
-render_correlation_section(df, data)

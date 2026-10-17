@@ -16,11 +16,14 @@ from theme import PASTEL_DARK_SEQUENCE
 def distance_matrix(corr_matrix: pd.DataFrame) -> np.ndarray:
     """d = sqrt(2 * (1 - corr)) -- vraie métrique, contrairement à 1 - corr
     qui ne respecte pas l'inégalité triangulaire."""
-    corr = corr_matrix.clip(-1, 1)
+    # CORRECTION ICI : on remplace les NaN par 0 avant de clipper.
+    # Un NaN (données insuffisantes) est considéré comme "décorrélé" (0),
+    # ce qui donne la distance maximale (sqrt(2)) entre les deux actifs.
+    corr = corr_matrix.fillna(0).clip(-1, 1)
+    
     dist = np.sqrt(2 * (1 - corr.values))
     np.fill_diagonal(dist, 0.0)
     return (dist + dist.T) / 2  # symétrise (absorbe les arrondis flottants)
-
 
 def compute_linkage(corr_matrix: pd.DataFrame, method: str = "average") -> np.ndarray:
     """Linkage hiérarchique scipy à partir de la matrice de corrélation."""

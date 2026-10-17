@@ -11,7 +11,7 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use once_cell::sync::Lazy;
 
 use pricer::{MarketDataClient, normalize_currency_for_fx};
-use crate::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind, CashFlowKind};
+use model::schema::{Asset, AssetIdentifiers, AssetKind, Platform, Transaction, TransactionKind, CashFlowKind};
 
 
 #[derive(Debug, Clone)]
@@ -451,4 +451,193 @@ pub fn parse_xtb_file(path: &Path, market_client: &MarketDataClient) -> Vec<Tran
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use rust_xlsxwriter::{ExcelDateTime, Format, Workbook};
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    /// Chemin de fichier temporaire unique par test (pas de dépendance `tempfile`).
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("importers-xtb-{}-{name}.xlsx", std::process::id()))
+    }
+
+    enum When {
+        Text(&'static str),
+        Excel(u16, u8, u8, u16, u8, u8),
+    }
+
+    /// Écrit un export XTB minimal : une ligne de préambule, l'en-tête, puis les opérations.
+    fn write_cash_workbook(path: &Path, sheet: &str, ops: &[(&str, &str, f64, When, &str)]) {
+        let mut workbook = Workbook::new();
+        let date_format = Format::new().set_num_format("dd/mm/yyyy hh:mm:ss");
+        let ws = workbook.add_worksheet();
+        ws.set_name(sheet).unwrap();
+        ws.write_string(0, 0, "Account").unwrap();
+        ws.write_string(0, 1, "123456").unwrap();
+        for (c, h) in ["ID", "Type", "Time", "Amount", "Comment"].iter().enumerate() {
+            ws.write_string(2, c as u16, *h).unwrap();
+        }
+        for (i, (id, kind, amount, when, comment)) in ops.iter().enumerate() {
+            let row = 3 + i as u32;
+            ws.write_string(row, 0, *id).unwrap();
+            ws.write_string(row, 1, *kind).unwrap();
+            match when {
+                When::Text(s) => {
+                    ws.write_string(row, 2, *s).unwrap();
+                }
+                When::Excel(y, mo, d, h, mi, s) => {
+                    let dt = ExcelDateTime::from_ymd(*y, *mo, *d).unwrap().and_hms(*h, *mi, *s).unwrap();
+                    ws.write_datetime_with_format(row, 2, &dt, &date_format).unwrap();
+                }
+            }
+            ws.write_number(row, 3, *amount).unwrap();
+            if !comment.is_empty() {
+                ws.write_string(row, 4, *comment).unwrap();
+            }
+        }
+        workbook.save(path).unwrap();
+    }
+
+    #[test]
+    fn cash_operations_are_read_from_a_real_xlsx_file() {
+        let path = temp_path("cash-ok");
+        write_cash_workbook(
+            &path,
+            "Cash Operations 2025",
+            &[
+                ("1001", "Deposit", 1000.0, When::Text("01/03/2025 10:00:00"), "virement"),
+                ("1002", "Dividend", 12.5, When::Excel(2025, 3, 15, 9, 30, 0), ""),
+                ("1003", "Stock purchase", -500.0, When::Text("16/03/2025 11:00:00"), ""),
+                ("1004", "Withholding tax", -3.2, When::Text("16/03/2025 11:05:00"), ""),
+                ("1005", "PEA deposit", 200.0, When::Text("17/03/2025 08:00:00"), ""), // ignoré volontairement
+                ("", "Total", 0.0, When::Text("17/03/2025 08:00:00"), ""),              // ligne de total ignorée
+            ],
+        );
+
+        let sheet = find_sheet_by_prefix(&path, "Cash").unwrap();
+        assert_eq!(sheet, "Cash Operations 2025");
+        let tx = parse_cash_operations(&path, &sheet).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(tx.len(), 4);
+        let kinds: Vec<_> = tx.iter().map(|t| t.kind).collect();
+        assert_eq!(kinds, [TransactionKind::Deposit, TransactionKind::Deposit, TransactionKind::Withdraw, TransactionKind::Fee]);
+        let flows: Vec<_> = tx.iter().map(|t| t.cash_flow).collect();
+        assert_eq!(
+            flows,
+            [
+                Some(CashFlowKind::ExternalDeposit),
+                Some(CashFlowKind::Income),
+                Some(CashFlowKind::TradeLeg),
+                Some(CashFlowKind::Tax)
+            ]
+        );
+
+        // quantité et valeur toujours positives, montant signé conservé
+        assert_eq!(tx[2].quantity, 500.0);
+        assert_eq!(tx[2].value_eur, 500.0);
+        assert_eq!(tx[2].amount, Some(-500.0));
+        assert_eq!(tx[3].value_eur, 3.2);
+
+        assert_eq!(tx[0].external_id.as_deref(), Some("xtb-cash-1001"));
+        assert_eq!(tx[0].time, utc(2025, 3, 1, 10, 0, 0));
+        assert_eq!(tx[1].time, utc(2025, 3, 15, 9, 30, 0)); // cellule date Excel (calamine `dates`)
+        assert_eq!(tx[0].remark.as_deref(), Some("virement"));
+        assert_eq!(tx[1].remark, None);
+
+        assert!(tx.iter().all(|t| t.platform == Platform::Xtb && t.asset.symbol == "EUR" && t.asset.kind == AssetKind::Cash));
+    }
+
+    #[test]
+    fn an_unknown_cash_operation_type_fails_the_whole_sheet_with_a_clear_message() {
+        let path = temp_path("cash-unknown");
+        write_cash_workbook(
+            &path,
+            "Cash Operations",
+            &[
+                ("1", "Deposit", 100.0, When::Text("01/03/2025 10:00:00"), ""),
+                ("2", "Mystery fee", -1.0, When::Text("02/03/2025 10:00:00"), ""),
+            ],
+        );
+        let err = parse_cash_operations(&path, "Cash Operations").unwrap_err().to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("non géré") && err.contains("Mystery fee"), "message inattendu : {err}");
+    }
+
+    #[test]
+    fn find_sheet_by_prefix_reports_a_missing_sheet() {
+        let path = temp_path("sheet-missing");
+        write_cash_workbook(&path, "Cash Operations", &[]);
+        let err = find_sheet_by_prefix(&path, "Open Position").unwrap_err().to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("Open Position"), "message inattendu : {err}");
+    }
+
+    #[test]
+    fn cash_operation_types_map_to_a_kind_and_a_cash_flow() {
+        use CashFlowKind::*;
+        use TransactionKind as K;
+        assert_eq!(cash_kind_for("Deposit"), Some((K::Deposit, ExternalDeposit)));
+        assert_eq!(cash_kind_for("Withdrawal"), Some((K::Withdraw, ExternalWithdrawal)));
+        assert_eq!(cash_kind_for("Free funds interest"), Some((K::Deposit, Income)));
+        assert_eq!(cash_kind_for("Dividend"), Some((K::Deposit, Income)));
+        assert_eq!(cash_kind_for("Stock purchase"), Some((K::Withdraw, TradeLeg)));
+        assert_eq!(cash_kind_for("Stock sell"), Some((K::Deposit, TradeLeg)));
+        assert_eq!(cash_kind_for("Fractional shares"), Some((K::Deposit, TradeLeg)));
+        assert_eq!(cash_kind_for("Withholding tax"), Some((K::Fee, Tax)));
+        assert_eq!(cash_kind_for("Tax IFTT"), Some((K::Fee, Tax)));
+        assert_eq!(cash_kind_for("PEA deposit"), None); // géré à part (SKIP_CASH_TYPES)
+        assert!(SKIP_CASH_TYPES.contains(&"PEA deposit"));
+        assert_eq!(cash_kind_for("anything else"), None);
+    }
+
+    #[test]
+    fn cell_helpers_convert_the_cell_types_calamine_produces() {
+        assert_eq!(cell_str(&Data::Empty), "");
+        assert_eq!(cell_str(&Data::String("  Deposit ".into())), "Deposit");
+        assert_eq!(cell_str(&Data::Int(42)), "42");
+        assert_eq!(cell_f64(&Data::Float(1.5)), Some(1.5));
+        assert_eq!(cell_f64(&Data::Int(2)), Some(2.0));
+        assert_eq!(cell_f64(&Data::String(" 3.25 ".into())), Some(3.25));
+        assert_eq!(cell_f64(&Data::String("abc".into())), None);
+        assert_eq!(cell_f64(&Data::Empty), None);
+        assert_eq!(cell_datetime(&Data::String("01/03/2025 10:00:00".into())).unwrap(), utc(2025, 3, 1, 10, 0, 0));
+        assert!(cell_datetime(&Data::String("2025-03-01".into())).is_err());
+        assert!(cell_datetime(&Data::Empty).is_err());
+    }
+
+    #[test]
+    fn header_row_and_columns_are_found_case_insensitively() {
+        let rows = vec![
+            vec![Data::String("Account".into()), Data::String("123".into())],
+            vec![Data::String("id".into()), Data::String("TYPE".into()), Data::Empty, Data::String("Amount".into())],
+        ];
+        assert_eq!(find_header_row(&rows, "ID").unwrap(), 1);
+        assert!(find_header_row(&rows, "Symbol").is_err());
+
+        let map = column_map(&rows[1]);
+        assert_eq!(map.get("type"), Some(&1));
+        assert!(!map.contains_key("")); // les en-têtes vides sont ignorés
+        let data_row = vec![Data::String("7".into()), Data::String("Deposit".into()), Data::Empty, Data::Float(9.0)];
+        assert_eq!(cell_str(col(&data_row, &map, " Type ").unwrap()), "Deposit");
+        let err = col(&data_row, &map, "Nope").unwrap_err().to_string();
+        assert!(err.contains("Nope") && err.contains("amount"), "message inattendu : {err}");
+        assert!(has_col(&map, "AMOUNT") && !has_col(&map, "Comment"));
+    }
+
+    #[test]
+    fn the_trading_currency_is_inferred_from_the_ticker_suffix() {
+        assert_eq!(infer_currency("SAN.FR"), "EUR");
+        assert_eq!(infer_currency("SAP.DE"), "EUR");
+        assert_eq!(infer_currency("BP.UK"), "GBP");
+        assert_eq!(infer_currency("AAPL.US"), "USD");
+        assert_eq!(infer_currency("PLAIN"), "EUR");
+    }
 }

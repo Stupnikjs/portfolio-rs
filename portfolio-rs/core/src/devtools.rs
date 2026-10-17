@@ -85,10 +85,41 @@ pub fn write_bundle(root_dir: &str, extension: &str, output_file: &str, prepend_
     Ok(())
 }
 
-/// Les deux dumps habituels : le crate Rust et le dashboard Python.
 pub fn dump_for_llm() -> Result<()> {
-    write_bundle("src", "rs", "forllm.txt", &["Cargo.toml"])?;
-    write_bundle("dashboard", "py", "forllmdashboard.txt", &[])?;
+    let mut rust_bundle = String::new();
+
+    // 1. Tous les Cargo.toml du workspace (racine + crates)
+    let cargo_files = [
+        "Cargo.toml",
+        "portfolio-rs/Cargo.toml", // Au cas où tu en as laissé un dans le sous-dossier
+        "portfolio-rs/core/Cargo.toml",
+        "portfolio-rs/pricer/Cargo.toml",
+        "portfolio-rs/model/Cargo.toml",
+        "portfolio-rs/parse/Cargo.toml",
+    ];
+    for file in &cargo_files {
+        let path = Path::new(file);
+        if path.exists() {
+            rust_bundle.push_str(&render_file(path, ".")?);
+        }
+    }
+
+    // 2. Tout le code source (.rs) de chaque crate
+    for crate_name in &["core", "pricer", "model", "parse"] {
+        let src_dir = format!("portfolio-rs/{crate_name}/src");
+        if Path::new(&src_dir).exists() {
+            rust_bundle.push_str(&render_bundle(&src_dir, "rs", &[])?);
+        }
+    }
+
+    std::fs::write("forllm.txt", rust_bundle)?;
+    println!("forllm.txt généré avec succès (Workspace complet).");
+
+    // 3. Dashboard Python (si le dossier dashboard est aussi dans le dossier parent)
+    let py_bundle = render_bundle("dashboard", "py", &[])?;
+    std::fs::write("forllmdashboard.txt", py_bundle)?;
+    println!("forllmdashboard.txt généré avec succès.");
+
     Ok(())
 }
 
@@ -99,24 +130,24 @@ mod tests {
     #[test]
     fn header_of_a_nested_file_keeps_its_subfolder() {
         assert_eq!(
-            header_parts("src/ledger/history.rs", "src"),
-            ("src/ledger".to_string(), "ledger/history.rs".to_string())
+            header_parts("core/src/ledger/history.rs", "core/src"),
+            ("core/src/ledger".to_string(), "ledger/history.rs".to_string())
         );
     }
 
     #[test]
     fn header_of_a_file_at_the_root_of_the_dump_folder() {
-        assert_eq!(header_parts("src/lib.rs", "src"), ("src".to_string(), "lib.rs".to_string()));
+        assert_eq!(header_parts("core/src/lib.rs", "core/src"), ("core/src".to_string(), "lib.rs".to_string()));
     }
 
     #[test]
     fn header_of_a_file_outside_the_dump_folder_is_attached_to_dot() {
-        assert_eq!(header_parts("Cargo.toml", "src"), (".".to_string(), "Cargo.toml".to_string()));
+        assert_eq!(header_parts("Cargo.toml", "core/src"), (".".to_string(), "Cargo.toml".to_string()));
     }
 
     #[test]
     fn a_sibling_folder_sharing_the_prefix_is_not_confused_with_root() {
-        // "src2/x.rs" ne commence pas par "src/".
-        assert_eq!(header_parts("src2/x.rs", "src"), (".".to_string(), "src2/x.rs".to_string()));
+        // "core2/src/x.rs" ne commence pas par "core/src/".
+        assert_eq!(header_parts("core2/src/x.rs", "core/src"), (".".to_string(), "core2/src/x.rs".to_string()));
     }
 }
