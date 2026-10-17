@@ -31,7 +31,35 @@ if added > 0:
 # --- Récupérer tous les tags existants ---
 all_tags = sorted(set(tag for a in assets_data["assets"] for tag in a.get("tags", [])))
 
-# --- Interface de sélection d'actif ---
+# ==========================================
+# NOUVEAU : GESTION GLOBALE (SUPPRESSION)
+# ==========================================
+st.subheader("🧹 Gestion globale des tags")
+if not all_tags:
+    st.info("Aucun tag n'existe encore dans le système.")
+else:
+    col1, col2 = st.columns([3, 1])
+    tag_to_delete = col1.selectbox("Sélectionner un tag à supprimer de TOUS les actifs", all_tags)
+    if col2.button("🗑️ Supprimer définitivement", type="primary"):
+        if tag_to_delete:
+            count = 0
+            # On boucle sur tous les actifs pour retirer ce tag s'il est présent
+            for a in assets_data["assets"]:
+                if tag_to_delete in a.get("tags", []):
+                    a["tags"].remove(tag_to_delete)
+                    count += 1
+            
+            save_assets_data(assets_data)
+            st.success(f"Le tag '{tag_to_delete}' a été retiré de {count} actif(s).")
+            st.rerun() # Rafraîchit la page pour mettre à jour la liste des tags
+
+st.divider()
+
+# ==========================================
+# GESTION PAR ACTIF (INCHANGÉE + CORRIGÉE)
+# ==========================================
+st.subheader("✏️ Tags par actif")
+
 # On priorise les actifs réellement détenus
 current_tickers = set()
 for _, row in df_portfolio.iterrows():
@@ -50,10 +78,7 @@ selected_label = st.selectbox("Choisir un actif à tagger", options=asset_option
 selected_index = asset_options.index(selected_label)
 selected_asset = assets_list_sorted[selected_index]
 
-st.divider()
-
-# --- Éditeur de tags pour l'actif sélectionné ---
-st.subheader(f"Tags pour {selected_asset['name']}")
+st.markdown(f"##### Configuration pour {selected_asset['name']}")
 current_tags = selected_asset.get("tags", [])
 
 # 1. Multiselect avec les tags existants (SUGGESTION)
@@ -80,10 +105,3 @@ if st.button("💾 Sauvegarder les tags", type="primary"):
     save_assets_data(assets_data)
     st.success("Tags sauvegardés avec succès !")
     st.rerun()
-
-# 1. Multiselect avec les tags existants
-chosen_existing = st.multiselect(
-    "Tags actuels (désélectionner pour supprimer)",  # <-- Texte plus clair
-    options=all_tags, 
-    default=[t for t in current_tags if t in all_tags]
-)
