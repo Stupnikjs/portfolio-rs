@@ -108,107 +108,6 @@ rust_xlsxwriter = "0.100.0"
 
 ################################################################################
 # Dossier : portfolio-rs/core/src
-# Fichier : dashboard.rs
-# Chemin relatif : dashboard.rs
-################################################################################
-
-//! Structures sérialisées dans dashboard.json (lues par le dashboard Python).
-//! Lecture seule côté Python : tout changement de champ ici doit être répercuté
-//! dans le dashboard (dossier `dashboard/`).
-
-#[derive(serde::Serialize)]
-pub struct DashboardAsset {
-    pub symbol: String,
-    pub kind: String,
-    pub ticker: Option<String>,
-    pub quantity: f64,
-    pub price_eur: f64,
-    pub value_eur: f64,
-    pub cost_basis_eur: f64,
-    pub pnl_eur: f64,
-    pub pnl_pct: f64,
-    pub realized_pnl_eur: f64,
-}
-
-#[derive(serde::Serialize)]
-pub struct DashboardData {
-    pub total_value_eur: f64,
-    pub total_cost_basis_eur: f64,
-    pub total_pnl_eur: f64,
-    pub realized_pnl_eur: f64,
-    pub trades: Vec<DashboardTrade>,
-    pub trade_frequency: TradeFrequency,
-    /// Retour par tranche de cash apportée (aujourd'hui un seul rapport : CTO + PEA regroupés).
-    pub tranches: Vec<TrancheReport>,
-    pub assets: Vec<DashboardAsset>,
-    pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
-}
-
-#[derive(serde::Serialize)]
-pub struct DashboardTrade {
-    pub time: String,          // RFC3339 UTC
-    pub symbol: String,
-    pub kind: String,          // "Buy" | "Sell"
-    pub platform: String,
-    pub quantity: f64,
-    pub unit_price_eur: f64,
-    pub value_eur: f64,
-}
-
-#[derive(serde::Serialize, Default)]
-pub struct PeriodCount {
-    pub period: String,        // "YYYY-MM" (mois) ou "YYYY-MM-DD" (dimanche de fin de semaine)
-    pub trades: u32,
-    pub buys: u32,
-    pub sells: u32,
-    pub volume_eur: f64,
-}
-
-impl PeriodCount {
-    pub fn new(period: String) -> Self {
-        Self { period, ..Default::default() }
-    }
-}
-
-#[derive(serde::Serialize, Default)]
-pub struct TradeFrequency {
-    pub total_trades: u32,
-    pub avg_per_month: f64,
-    pub avg_per_week: f64,
-    pub by_month: Vec<PeriodCount>,
-    pub by_week: Vec<PeriodCount>,
-}
-
-/// Une tranche de cash apportée (voir `ledger/tranches.rs`).
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Tranche {
-    pub date: String,                 // "YYYY-MM-DD" de l'apport
-    pub invested_eur: f64,            // montant apporté
-    pub nav_at_entry: f64,            // valeur de la part ce jour-là
-    pub current_value_eur: f64,       // valeur actuelle des parts restantes
-    pub unrealized_gain_eur: f64,
-    pub realized_gain_eur: f64,       // gain déjà encaissé via des retraits
-    pub roi_pct: f64,                 // retour depuis l'apport
-    pub annualized_pct: Option<f64>,  // null si < 30 jours
-    pub inferred: bool,               // capital déduit, apports antérieurs non exportés
-}
-
-/// Rapport d'un compte : totaux + une ligne par tranche.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TrancheReport {
-    pub account: String,              // ex. "XTB (CTO + PEA)"
-    pub net_contributions_eur: f64,   // apports - retraits
-    pub current_value_eur: f64,
-    pub total_gain_eur: f64,          // valeur - apports nets
-    pub time_weighted_return_pct: f64,
-    pub nav_now: f64,
-    pub tranches: Vec<Tranche>,
-    pub warnings: Vec<String>,
-}
-
-
-################################################################################
-# Dossier : portfolio-rs/core/src
 # Fichier : devtools.rs
 # Chemin relatif : devtools.rs
 ################################################################################
@@ -364,6 +263,144 @@ mod tests {
     fn a_sibling_folder_sharing_the_prefix_is_not_confused_with_root() {
         // "core2/src/x.rs" ne commence pas par "core/src/".
         assert_eq!(header_parts("core2/src/x.rs", "core/src"), (".".to_string(), "core2/src/x.rs".to_string()));
+    }
+}
+
+################################################################################
+# Dossier : portfolio-rs/core/src/ledger
+# Fichier : cash.rs
+# Chemin relatif : ledger/cash.rs
+################################################################################
+
+//! Cash disponible et apports nets XTB, par compte (CTO / PEA), à une date.
+//!
+//! Source : les opérations de cash importées par `parse_cash_operations`
+//! (`amount` signé, `cash_flow` posé par le parseur). Le cash Binance n'est
+//! pas suivi (pas de jambe cash sur les achats, dépôts non importés).
+//!
+//! Limite : les types listés dans `SKIP_CASH_TYPES` (ex. "PEA deposit") sont
+//! ignorés à l'import, donc absents ici : comparer avec le solde affiché par XTB.
+
+use chrono::{DateTime, Utc};
+
+use crate::ledger::realized::{tax_account, TaxAccount};
+use crate::schema::{AssetKind, CashFlowKind, CashPosition, CashSummary, Platform, Transaction};
+use crate::store::serialize::TxStore;
+
+fn is_xtb_cash(tx: &Transaction) -> bool {
+    tx.platform == Platform::Xtb && tx.asset.kind == AssetKind::Cash
+}
+
+/// Cash et apports nets d'un compte XTB à la date `at` (incluse ; `None` = tout).
+pub fn cash_position(tx_store: &TxStore, account: TaxAccount, at: Option<DateTime<Utc>>) -> CashPosition {
+    let mut pos = CashPosition::default();
+    let in_scope = |tx: &&Transaction| {
+        is_xtb_cash(tx) && tax_account(tx) == account && at.map_or(true, |at| tx.time <= at)
+    };
+    for tx in tx_store.transactions.iter().filter(in_scope) {
+        let signed = tx.amount.unwrap_or(0.0);
+        pos.cash_eur += signed;
+        if matches!(tx.cash_flow, Some(CashFlowKind::ExternalDeposit | CashFlowKind::ExternalWithdrawal)) {
+            pos.net_contributions_eur += signed;
+        }
+    }
+    pos
+}
+
+pub fn cash_summary(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> CashSummary {
+    let cto = cash_position(tx_store, TaxAccount::Cto, at);
+    let pea = cash_position(tx_store, TaxAccount::Pea, at);
+    let total = CashPosition {
+        cash_eur: cto.cash_eur + pea.cash_eur,
+        net_contributions_eur: cto.net_contributions_eur + pea.net_contributions_eur,
+    };
+    CashSummary { total, cto, pea }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::TransactionKind::{self, Deposit, Fee, Withdraw};
+    use crate::testutil::{store, tx, utc};
+    use CashFlowKind::{ExternalDeposit, ExternalWithdrawal, Income, Tax, TradeLeg};
+
+    const CTO_FILE: &str = "./data/raw/accounts/account.xlsx";
+    const PEA_FILE: &str = "./data/raw/accounts/account_pea.xlsx";
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// Opération de cash XTB : `signed` est le montant du relevé (négatif = sortie).
+    fn op(file: &str, kind: TransactionKind, flow: CashFlowKind, signed: f64, time: &str, id: &str) -> Transaction {
+        let mut t = tx(kind, "EUR", AssetKind::Cash, signed.abs(), signed.abs(), time, id);
+        t.platform = Platform::Xtb;
+        t.source_file = file.to_string();
+        t.amount = Some(signed);
+        t.cash_flow = Some(flow);
+        t
+    }
+
+    #[test]
+    fn cash_is_the_sum_of_signed_amounts_and_contributions_only_count_external_flows() {
+        let s = store(vec![
+            op(CTO_FILE, Deposit, ExternalDeposit, 1_000.0, "2025-01-01T09:00:00Z", "1"),
+            op(CTO_FILE, Withdraw, TradeLeg, -400.0, "2025-01-02T09:00:00Z", "2"),
+            op(CTO_FILE, Deposit, Income, 12.5, "2025-01-03T09:00:00Z", "3"),
+            op(CTO_FILE, Fee, Tax, -3.0, "2025-01-03T09:05:00Z", "4"),
+        ]);
+        let p = cash_position(&s, TaxAccount::Cto, None);
+
+        assert!(approx(p.cash_eur, 609.5));
+        assert!(approx(p.net_contributions_eur, 1_000.0));
+    }
+
+    #[test]
+    fn an_external_withdrawal_lowers_both_cash_and_contributions() {
+        let s = store(vec![
+            op(CTO_FILE, Deposit, ExternalDeposit, 1_000.0, "2025-01-01T09:00:00Z", "1"),
+            op(CTO_FILE, Withdraw, ExternalWithdrawal, -300.0, "2025-02-01T09:00:00Z", "2"),
+        ]);
+        let p = cash_position(&s, TaxAccount::Cto, None);
+
+        assert!(approx(p.cash_eur, 700.0));
+        assert!(approx(p.net_contributions_eur, 700.0));
+    }
+
+    #[test]
+    fn at_excludes_later_operations() {
+        let s = store(vec![
+            op(CTO_FILE, Deposit, ExternalDeposit, 1_000.0, "2025-01-01T09:00:00Z", "1"),
+            op(CTO_FILE, Deposit, ExternalDeposit, 500.0, "2025-03-01T09:00:00Z", "2"),
+        ]);
+        let p = cash_position(&s, TaxAccount::Cto, Some(utc("2025-02-01T00:00:00Z")));
+
+        assert!(approx(p.cash_eur, 1_000.0));
+        assert!(approx(p.net_contributions_eur, 1_000.0));
+    }
+
+    #[test]
+    fn cto_and_pea_are_separated_and_the_total_is_their_sum() {
+        let s = store(vec![
+            op(CTO_FILE, Deposit, ExternalDeposit, 1_000.0, "2025-01-01T09:00:00Z", "1"),
+            op(PEA_FILE, Deposit, ExternalDeposit, 200.0, "2025-01-02T09:00:00Z", "2"),
+        ]);
+        let c = cash_summary(&s, None);
+
+        assert!(approx(c.cto.cash_eur, 1_000.0));
+        assert!(approx(c.pea.cash_eur, 200.0));
+        assert!(approx(c.total.cash_eur, 1_200.0));
+        assert!(approx(c.total.net_contributions_eur, 1_200.0));
+    }
+
+    #[test]
+    fn non_xtb_cash_is_ignored() {
+        // `tx` crée une transaction Manual : hors périmètre.
+        let mut manual = tx(Deposit, "EUR", AssetKind::Cash, 999.0, 999.0, "2025-01-01T09:00:00Z", "m1");
+        manual.amount = Some(999.0);
+        manual.cash_flow = Some(ExternalDeposit);
+
+        assert_eq!(cash_summary(&store(vec![manual]), None), CashSummary::default());
     }
 }
 
@@ -811,11 +848,12 @@ mod tests {
 //! (`AssetKind::Stock`) comptent, comme dans `main.rs` : les WITHDRAW crypto
 //! sont vus comme des ventes FIFO et fausseraient le résultat.
 //!
-//! Le cash (EUR, USDC, USD...) est EXCLU de l'historique : ses dépôts
+//! Le cash (EUR, USDC, USD...) est EXCLU de `total_value_eur` : ses dépôts
 //! créent des lots à coût de revient plein alors que les achats ne le
 //! consomment pas toujours (jambes cash non tracées), ce qui gonfle le
 //! cost basis et fabrique un P&L négatif fictif. Seuls les actifs
-//! Crypto/Stock sont valorisés.
+//! Crypto/Stock sont valorisés. Le cash XTB est porté à part par `cash_eur` et
+//! `net_contributions_eur` (voir `ledger/cash.rs`).
 //!
 //! Chaque entrée contient le snapshot de chaque actif (quantité, prix EUR,
 //! valeur EUR, cost basis, fiabilité du prix) et pas seulement les totaux :
@@ -839,6 +877,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 
+use crate::ledger::cash::cash_summary;
 use crate::ledger::cost_basis::compute_fifo;
 use crate::ledger::periods::{first_monday, is_first_monday, months_between, sundays_from};
 use crate::ledger::portfolio::{portfolio_snapshot_with, AssetSnapshot, PriceFn};
@@ -869,7 +908,9 @@ impl Frequency {
     }
 }
 
-pub const HISTORY_ENTRY_VERSION: u32 = 3;
+// 4 : ajout de cash_eur / net_contributions_eur. Les entrées v3 sont recalculées au prochain run
+// (les prix sont en cache, donc rapide).
+pub const HISTORY_ENTRY_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -903,6 +944,12 @@ pub struct HistoryEntry {
     pub unrealized_pnl_eur: f64,
     #[serde(default)]
     pub realized_pnl_eur: f64,
+    /// Cash XTB (CTO + PEA) à la date. `total_value_eur` reste HORS cash.
+    #[serde(default)]
+    pub cash_eur: f64,
+    /// Apports nets XTB cumulés à la date (virements externes).
+    #[serde(default)]
+    pub net_contributions_eur: f64,
     #[serde(default)]
     pub version: u32,
     #[serde(default)]
@@ -1013,6 +1060,7 @@ fn build_entry(
     last_known: &mut HashMap<String, f64>,
 ) -> Result<HistoryEntry> {
     let at = Utc.from_utc_datetime(&target.and_hms_opt(23, 59, 59).unwrap());
+    let cash = cash_summary(tx_store, Some(at)).total;
 
     let mut snapshot = portfolio_snapshot_with(tx_store, Some(at), price_fn);
     snapshot.assets.retain(|a| a.kind != AssetKind::Cash);
@@ -1049,6 +1097,8 @@ fn build_entry(
         total_pnl_eur: unrealized_pnl_eur + realized_pnl_eur,
         unrealized_pnl_eur,
         realized_pnl_eur,
+        cash_eur: cash.cash_eur,
+        net_contributions_eur: cash.net_contributions_eur,
         version: HISTORY_ENTRY_VERSION,
         complete,
         assets,
@@ -1142,7 +1192,6 @@ pub fn record_history_with(
 
     Ok(computed)
 }
-
 
 ################################################################################
 # Dossier : portfolio-rs/core/src/ledger
@@ -1599,6 +1648,7 @@ pub mod positions;
 pub mod realized;
 pub mod trades;
 pub mod holding;
+pub mod cash; 
 
 
 ################################################################################
@@ -2473,6 +2523,7 @@ use chrono::Utc;
 use serde::Serialize;
 
 use core::devtools;
+use core::ledger::cash::cash_summary;
 use core::ledger::cost_basis::{compute_fifo, CostBasisResult, RealizedGain};
 use core::ledger::history::record_weekly_history;
 use core::ledger::holding::{closed_sales, holding_stats};
@@ -2483,7 +2534,7 @@ use core::ledger::trades::{build_trade_frequency, build_trades};
 use core::market::MarketDataClient; // <-- NOUVEAU SERVICE INJECTÉ
 use core::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
 use core::parse::{binance, manual, xtb};
-use core::schema::{AssetKind, ClosedSale, DashboardAsset, DashboardData, HoldingStats, TransactionKind};
+use core::schema::{AssetKind, CashSummary, ClosedSale, DashboardAsset, DashboardData, HoldingStats, TransactionKind};
 use core::store::serialize::{save_wallet, TxStore};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
@@ -2533,6 +2584,8 @@ fn main() -> Result<()> {
         realized_summary(&tx_store, TaxAccount::Cto)?
             .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
     );
+
+    print_cash(&cash_summary(&tx_store, None));
 
     // Durée de détention (lots FIFO) et ventes de titres
     let (holdings, sales) = compute_holdings(&tx_store, &cost_basis, &snapshot);
@@ -2662,6 +2715,14 @@ fn print_valuation(snapshot: &PortfolioSnapshot, cost_basis: &CostBasisResult) -
     total_pnl
 }
 
+fn print_cash(c: &CashSummary) {
+    println!("\n=== CASH XTB ===");
+    for (label, p) in [("CTO", c.cto), ("PEA", c.pea), ("Total", c.total)] {
+        println!("  {label:<6} cash {:>10.2} EUR   apports nets {:>10.2} EUR", p.cash_eur, p.net_contributions_eur);
+    }
+    println!("  Compare avec le solde XTB : un écart indique un type d'opération ignoré (ex. PEA deposit).");
+}
+
 fn print_performance(latent_pnl: f64, realized_pnl: f64) {
     println!("P&L réalisé total (actions uniquement) : {realized_pnl:>+.2} EUR");
     println!("\n=== PERFORMANCE GLOBALE (latent + réalisé actions) ===");
@@ -2720,6 +2781,7 @@ fn dashboard_asset(asset: &AssetSnapshot, cost_basis: &CostBasisResult) -> Dashb
         pnl_eur,
         pnl_pct,
         realized_pnl_eur: cost_basis.total_realized_pnl(Some(&asset.symbol)),
+        realized_cost_eur: cost_basis.total_realized_cost(Some(&asset.symbol)),
     }
 }
 
@@ -2733,9 +2795,16 @@ fn build_dashboard(
 ) -> DashboardData {
     let assets: Vec<DashboardAsset> = snapshot.assets.iter().map(|a| dashboard_asset(a, cost_basis)).collect();
     let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
+    let stocks_value_eur: f64 = snapshot
+        .assets
+        .iter()
+        .filter(|a| a.kind == AssetKind::Stock)
+        .map(|a| a.value_eur)
+        .sum();
 
     DashboardData {
         total_value_eur: snapshot.total_value_eur,
+        stocks_value_eur,
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
         realized_pnl_eur: cost_basis.total_realized_pnl_stocks(tx_store),
@@ -2745,6 +2814,7 @@ fn build_dashboard(
         correlation_matrices,
         holdings,
         closed_sales: sales,
+        cash: cash_summary(tx_store, None),
     }
 }
 
@@ -2793,7 +2863,6 @@ fn print_holdings(stats: &[HoldingStats]) {
         );
     }
 }
-
 
 ################################################################################
 # Dossier : portfolio-rs/core/src/market
@@ -3982,11 +4051,16 @@ pub struct DashboardAsset {
     pub pnl_eur: f64,
     pub pnl_pct: f64,
     pub realized_pnl_eur: f64,
+    /// Coût de revient des lots déjà vendus (pour le rendement total = latent + réalisé).
+    pub realized_cost_eur: f64,
 }
 
 #[derive(serde::Serialize)]
 pub struct DashboardData {
+    /// Inclut déjà les avoirs cash issus de `holdings_at` (EUR, USDC...) : NE PAS y ajouter `cash`.
     pub total_value_eur: f64,
+    /// Valeur des titres seuls (kind = Stock), hors crypto et hors cash.
+    pub stocks_value_eur: f64,
     pub total_cost_basis_eur: f64,
     pub total_pnl_eur: f64,
     pub realized_pnl_eur: f64,
@@ -3996,7 +4070,7 @@ pub struct DashboardData {
     pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
     pub holdings: Vec<HoldingStats>,
     pub closed_sales: Vec<ClosedSale>,
-
+    pub cash: CashSummary,
 }
 
 #[derive(serde::Serialize)]
@@ -4076,6 +4150,22 @@ pub struct ClosedSale {
     pub incomplete: bool,
 }
 
+/// Cash disponible et apports nets d'un compte (EUR).
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CashPosition {
+    /// Somme des montants signés des opérations de cash du compte.
+    pub cash_eur: f64,
+    /// Virements externes entrants - sortants (hors dividendes, intérêts, jambes de trade).
+    pub net_contributions_eur: f64,
+}
+
+/// XTB : un bloc par compte fiscal + le total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CashSummary {
+    pub total: CashPosition,
+    pub cto: CashPosition,
+    pub pea: CashPosition,
+}
 
 ################################################################################
 # Dossier : portfolio-rs/model/src/schema

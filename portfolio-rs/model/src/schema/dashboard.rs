@@ -14,12 +14,16 @@ pub struct DashboardAsset {
     pub pnl_eur: f64,
     pub pnl_pct: f64,
     pub realized_pnl_eur: f64,
+    /// Coût de revient des lots déjà vendus (pour le rendement total = latent + réalisé).
     pub realized_cost_eur: f64,
 }
 
 #[derive(serde::Serialize)]
 pub struct DashboardData {
+    /// Inclut déjà les avoirs cash issus de `holdings_at` (EUR, USDC...) : NE PAS y ajouter `cash`.
     pub total_value_eur: f64,
+    /// Valeur des titres seuls (kind = Stock), hors crypto et hors cash.
+    pub stocks_value_eur: f64,
     pub total_cost_basis_eur: f64,
     pub total_pnl_eur: f64,
     pub realized_pnl_eur: f64,
@@ -29,7 +33,7 @@ pub struct DashboardData {
     pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
     pub holdings: Vec<HoldingStats>,
     pub closed_sales: Vec<ClosedSale>,
-
+    pub cash: CashSummary,
 }
 
 #[derive(serde::Serialize)]
@@ -107,4 +111,21 @@ pub struct ClosedSale {
     pub pnl_eur: f64,
     pub pnl_pct: Option<f64>,
     pub incomplete: bool,
+}
+
+/// Cash disponible et apports nets d'un compte (EUR).
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CashPosition {
+    /// Somme des montants signés des opérations de cash du compte.
+    pub cash_eur: f64,
+    /// Virements externes entrants - sortants (hors dividendes, intérêts, jambes de trade).
+    pub net_contributions_eur: f64,
+}
+
+/// XTB : un bloc par compte fiscal + le total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CashSummary {
+    pub total: CashPosition,
+    pub cto: CashPosition,
+    pub pea: CashPosition,
 }

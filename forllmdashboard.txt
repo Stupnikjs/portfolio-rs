@@ -12,7 +12,7 @@ import streamlit as st
 from theme import apply_theme
 from config import MIN_POSITION_VALUE_EUR
 from data import (
-    load_data, build_assets_df, compute_kpis, yfinance_ticker_for, CASH_KIND,
+    load_data, build_assets_df, compute_kpis, compute_global_kpis, yfinance_ticker_for, CASH_KIND,
     filter_small_positions, small_positions_summary,
 )
 from charts import render_kpis, render_allocation_and_pnl, render_positions_table
@@ -60,14 +60,14 @@ df = filter_small_positions(df_all, MIN_POSITION_VALUE_EUR)
 
 # --- NOUVEAU : TABLEAU D'AGRÉGATION GLOBAL PAR TAG ---
 # On explode les tags : si un actif a 2 tags, il compte dans les 2 lignes du tableau
-df_global = df.copy()
+df_global = df_all.copy()
 if not df_global.empty and "tags" in df_global.columns:
     df_exploded = df_global.explode("tags").dropna(subset=["tags"])
     if not df_exploded.empty:
         tag_summary = df_exploded.groupby("tags").agg(
             Valeur=("value_eur", "sum"),
-            Cout=("cost_basis_eur", "sum"),
-            PnL=("pnl_eur", "sum")
+            Cout=("invested_eur", "sum"),
+            PnL=("pnl_total_eur", "sum"),
         ).reset_index()
         
         tag_summary["PnL %"] = tag_summary.apply(lambda r: (r["PnL"]/r["Cout"]*100) if r["Cout"] > 0 else 0.0, axis=1)
@@ -85,14 +85,15 @@ if not df_global.empty and "tags" in df_global.columns:
         st.dataframe(tag_display.rename(columns={
             "tags": "Tag",
             "Valeur": "Valeur Totale",
-            "Cout": "Cost Basis Total",
-            "PnL": "P&L (€)",
-            "PnL %": "P&L (%)"
+            "Cout": "Capital engagé",
+            "PnL": "P&L total (€)",
+            "PnL %": "Perf. totale (%)"
         }), use_container_width=True, hide_index=True)
         st.divider()
 
 # --- FILTRAGE PAR TAGS ---
 all_tags = sorted(set(tag for tags in df["tags"] for tag in tags))
+selected_tags: list[str] = []
 
 if all_tags:
     st.sidebar.subheader("🏷️ Filtrer par Tag")
@@ -110,8 +111,10 @@ if n_dust:
     )
 
 kpis = compute_kpis(df_all)
+# Le cash n'a pas de tag : on ne l'ajoute que sur le portefeuille complet.
+global_kpis = None if selected_tags else compute_global_kpis(df_all, data)
 
-render_kpis(kpis)
+render_kpis(kpis, global_kpis)
 
 st.divider()
 
@@ -119,11 +122,13 @@ if df.empty:
     st.info(f"Aucune position d'au moins {MIN_POSITION_VALUE_EUR:.0f} €.")
     st.stop()
 
-render_allocation_and_pnl(df)
+# Vue par actif : positions détenues + positions soldées qui portent du P&L réalisé.
+df_perf = df_all[(df_all["value_eur"] >= MIN_POSITION_VALUE_EUR) | (df_all["realized_pnl_eur"].abs() > 0.01)].copy()
+
+render_allocation_and_pnl(df, df_perf)  # camembert : df ; barres de P&L : df_perf
 
 st.divider()
-render_positions_table(df)
-
+render_positions_table(df_perf)
 
 ################################################################################
 # Dossier : dashboard
@@ -1192,6 +1197,75 @@ def compute_monthly_capacity(
 
 ################################################################################
 # Dossier : dashboard
+# Fichier : cash_perf.py
+# Chemin relatif : cash_perf.py
+################################################################################
+
+"""Performance incluant le cash disponible (XTB). Lecture seule de history.json / dashboard.json."""
+from __future__ import annotations
+
+import pandas as pd
+
+COLUMNS = ["date", "stocks", "cash", "contrib", "equity", "gain_eur", "cash_share", "twr_index"]
+
+
+def equity_frame(history: list[dict]) -> pd.DataFrame:
+    """Une ligne par snapshot : titres, cash, apports nets, gain total, indice TWR."""
+    rows = []
+    for e in history:
+        stocks = sum(a["value_eur"] for a in e.get("assets", []) if a["kind"] == "Stock")
+        rows.append(
+            {
+                "date": pd.to_datetime(e["date"]),
+                "stocks": stocks,
+                "cash": e.get("cash_eur", 0.0),
+                "contrib": e.get("net_contributions_eur", 0.0),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=COLUMNS)
+
+    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    df["equity"] = df["stocks"] + df["cash"]
+    df["gain_eur"] = df["equity"] - df["contrib"]
+    df["cash_share"] = (df["cash"] / df["equity"]).where(df["equity"] > 0, 0.0)
+    df["twr_index"] = _twr_index(df)
+    return df
+
+
+def _twr_index(df: pd.DataFrame) -> pd.Series:
+    """Valeur de la part (base 1.0) : seuls les flux externes sont neutralisés.
+
+    Hypothèse : un apport arrive en fin de semaine, donc le rendement de la
+    semaine t est (equity_t - flux_t) / equity_{t-1} - 1. Approximation correcte
+    à pas hebdomadaire, un peu pessimiste si l'apport est investi en début de semaine.
+    """
+    nav, out = 1.0, []
+    for i in range(len(df)):
+        if i > 0 and df.at[i - 1, "equity"] > 0:
+            flow = df.at[i, "contrib"] - df.at[i - 1, "contrib"]
+            nav *= (df.at[i, "equity"] - flow) / df.at[i - 1, "equity"]
+        out.append(nav)
+    return pd.Series(out, index=df.index)
+
+
+def current_kpis(dashboard: dict) -> dict:
+    """Valeur totale, cash, gain et rendement simple à date (depuis dashboard.json)."""
+    cash = dashboard["cash"]["total"]
+    equity = dashboard["stocks_value_eur"] + cash["cash_eur"]
+    contrib = cash["net_contributions_eur"]
+    gain = equity - contrib
+    return {
+        "equity_eur": equity,
+        "cash_eur": cash["cash_eur"],
+        "cash_share": cash["cash_eur"] / equity if equity > 0 else 0.0,
+        "net_contributions_eur": contrib,
+        "gain_eur": gain,
+        "return_pct": gain / contrib * 100 if contrib > 0 else None,
+    }
+
+################################################################################
+# Dossier : dashboard
 # Fichier : charts.py
 # Chemin relatif : charts.py
 ################################################################################
@@ -1207,7 +1281,7 @@ from data import format_display_df
 from theme import GAIN_COLOR, LOSS_COLOR
 
 
-def render_kpis(kpis: dict) -> None:
+def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
     st.title("📈 Mon Portefeuille")
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -1221,13 +1295,30 @@ def render_kpis(kpis: dict) -> None:
         help="Latent + réalisé",
     )
 
-    pnl_pct_global = (
-        kpis["total_pnl_eur"] / kpis["total_cost_basis_eur"] * 100
-        if kpis["total_cost_basis_eur"] > 0 else 0
-    )
-    st.metric("Performance Globale", f"{pnl_pct_global:+.2f} %")
+    if global_kpis is not None:
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Titres + crypto + cash", f"{global_kpis['equity_eur']:,.2f} €")
+        g2.metric(
+            "Cash XTB disponible",
+            f"{global_kpis['cash_eur']:,.2f} €",
+            f"{global_kpis['cash_share'] * 100:.0f} % du total",
+            delta_color="off",
+        )
+        ret = global_kpis["return_pct"]
+        g3.metric(
+            "Performance globale (cash inclus)",
+            f"{ret:+.2f} %" if ret is not None else "n/a",
+            f"{global_kpis['gain_eur']:+,.2f} €",
+            help="XTB : (titres + cash) - apports nets. Crypto : P&L latent + réalisé / capital engagé "
+                 "(cash Binance non suivi : estimation basse).",
+        )
+    else:
+        invested = kpis.get("total_invested_eur") or kpis["total_cost_basis_eur"]
+        pnl_pct_global = kpis["total_pnl_eur"] / invested * 100 if invested > 0 else 0
+        st.metric("Performance Globale (hors cash)", f"{pnl_pct_global:+.2f} %")
 
-def render_allocation_and_pnl(df: pd.DataFrame) -> None:
+def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = None) -> None:
+    df_perf = df if df_perf is None else df_perf
     col_left, col_right = st.columns(2)
 
     with col_left:
@@ -1264,14 +1355,14 @@ def render_allocation_and_pnl(df: pd.DataFrame) -> None:
         )
 
     with col_right:
-        st.subheader("📊 P&L par Actif (EUR)")
+        st.subheader("📊 P&L total par Actif (EUR, latent + réalisé)")
         fig_bar = px.bar(
-            df,
+            df_perf,
             x="symbol",
-            y="pnl_eur",
+            y="pnl_total_eur",
             color="pnl_color",
             color_discrete_map={"Gain": GAIN_COLOR, "Perte": LOSS_COLOR},
-            labels={"pnl_eur": "P&L (€)", "symbol": "Actif"},
+            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"},
         )
         fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
         st.plotly_chart(fig_bar, use_container_width=True)
@@ -1280,11 +1371,11 @@ def render_positions_table(df: pd.DataFrame) -> None:
     st.subheader("📋 Détail des positions")
     df_display = format_display_df(df)
     st.dataframe(
-        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis", "P&L (EUR)", "P&L (%)"]],
+        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis",
+                    "P&L latent", "P&L réalisé", "P&L total", "Perf. totale (%)"]],
         use_container_width=True,
         hide_index=True,
     )
-
 
 ################################################################################
 # Dossier : dashboard
@@ -1803,6 +1894,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from cash_perf import current_kpis
 from config import DATA_PATH, HISTORY_PATH, MIN_POSITION_VALUE_EUR
 
 
@@ -1817,14 +1909,50 @@ def compute_kpis(df: pd.DataFrame, exclude_cash: bool = True) -> dict:
     
     # On récupère le P&L réalisé par actif (s'il existe dans le df)
     total_pnl_realized = float(scope["realized_pnl_eur"].sum()) if "realized_pnl_eur" in scope.columns else 0.0
+    total_realized_cost = float(scope["realized_cost_eur"].sum()) if "realized_cost_eur" in scope.columns else 0.0
 
     return {
         "total_value_eur": total_value,
         "total_cost_basis_eur": total_cost,
+        # Capital engagé : cost basis des lots ouverts + coût des lots déjà vendus.
+        "total_invested_eur": total_cost + total_realized_cost,
         "total_pnl_latent_eur": total_pnl_latent,
         "total_pnl_realized_eur": total_pnl_realized,
         "total_pnl_eur": total_pnl_latent + total_pnl_realized,
     }
+
+def compute_global_kpis(df_all: pd.DataFrame, data: dict) -> dict | None:
+    """Performance globale cash inclus.
+
+    - XTB : (titres + cash) - apports nets (voir cash_perf.current_kpis). Intègre déjà
+      plus-values réalisées, dividendes, taxes et frais.
+    - Crypto : P&L latent + réalisé, rapporté au capital engagé (cost basis ouvert + coût
+      des lots vendus). Le cash Binance n'est pas suivi, donc ce % est une estimation basse.
+
+    Renvoie None si dashboard.json n'a pas encore les champs du patch cash (pas de crash).
+    """
+    if "cash" not in data or "stocks_value_eur" not in data:
+        return None
+
+    xtb = current_kpis(data)
+    crypto = df_all[df_all["kind"] == "Crypto"]
+    crypto_value = float(crypto["value_eur"].sum())
+    crypto_gain = float((crypto["pnl_eur"] + crypto["realized_pnl_eur"]).sum())
+    crypto_capital = float((crypto["cost_basis_eur"] + crypto["realized_cost_eur"]).sum())
+
+    equity = xtb["equity_eur"] + crypto_value
+    gain = xtb["gain_eur"] + crypto_gain
+    base = xtb["net_contributions_eur"] + crypto_capital
+    return {
+        "equity_eur": equity,
+        "cash_eur": xtb["cash_eur"],
+        "cash_share": xtb["cash_eur"] / equity if equity > 0 else 0.0,
+        "gain_eur": gain,
+        "return_pct": gain / base * 100 if base > 0 else None,
+        "xtb": xtb,
+        "crypto_gain_eur": crypto_gain,
+    }
+
 
 def filter_small_positions(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> pd.DataFrame:
     """Écarte les lignes dont la valeur actuelle est inférieure au seuil (>= seuil conservé).
@@ -1856,7 +1984,13 @@ def load_data(path: Path = DATA_PATH) -> dict:
 def build_assets_df(data: dict) -> pd.DataFrame:
     """Construit le DataFrame des positions à partir du JSON brut."""
     df = pd.DataFrame(data["assets"])
-    df["pnl_color"] = df["pnl_eur"].apply(lambda x: "Gain" if x >= 0 else "Perte")
+    for col in ("realized_pnl_eur", "realized_cost_eur"):  # absents d'un ancien dashboard.json
+        if col not in df.columns:
+            df[col] = 0.0
+    df["pnl_total_eur"] = df["pnl_eur"] + df["realized_pnl_eur"]
+    df["invested_eur"] = df["cost_basis_eur"] + df["realized_cost_eur"]
+    df["pnl_total_pct"] = (df["pnl_total_eur"] / df["invested_eur"] * 100).where(df["invested_eur"] > 0, 0.0)
+    df["pnl_color"] = df["pnl_total_eur"].apply(lambda x: "Gain" if x >= 0 else "Perte")
     return df
 
 
@@ -1879,6 +2013,9 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
     df_display["cost_basis_eur"] = df_display["cost_basis_eur"].apply(lambda x: f"{x:,.2f} €")
     df_display["pnl_eur"] = df_display["pnl_eur"].apply(lambda x: f"{x:+,.2f} €")
     df_display["pnl_pct"] = df_display["pnl_pct"].apply(lambda x: f"{x:+.2f} %")
+    df_display["realized_pnl_eur"] = df_display["realized_pnl_eur"].apply(lambda x: f"{x:+,.2f} €")
+    df_display["pnl_total_eur"] = df_display["pnl_total_eur"].apply(lambda x: f"{x:+,.2f} €")
+    df_display["pnl_total_pct"] = df_display["pnl_total_pct"].apply(lambda x: f"{x:+.2f} %")
 
     return df_display.rename(columns={
         "symbol": "Symbole",
@@ -1887,8 +2024,11 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "price_eur": "Prix",
         "value_eur": "Valeur",
         "cost_basis_eur": "Cost Basis",
-        "pnl_eur": "P&L (EUR)",
-        "pnl_pct": "P&L (%)",
+        "pnl_eur": "P&L latent",
+        "pnl_pct": "Latent (%)",
+        "realized_pnl_eur": "P&L réalisé",
+        "pnl_total_eur": "P&L total",
+        "pnl_total_pct": "Perf. totale (%)",
     })
 
 
