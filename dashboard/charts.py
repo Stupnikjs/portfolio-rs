@@ -9,7 +9,7 @@ from data import format_display_df
 from theme import GAIN_COLOR, LOSS_COLOR
 
 
-def render_kpis(kpis: dict) -> None:
+def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
     st.title("📈 Mon Portefeuille")
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -23,13 +23,30 @@ def render_kpis(kpis: dict) -> None:
         help="Latent + réalisé",
     )
 
-    pnl_pct_global = (
-        kpis["total_pnl_eur"] / kpis["total_cost_basis_eur"] * 100
-        if kpis["total_cost_basis_eur"] > 0 else 0
-    )
-    st.metric("Performance Globale", f"{pnl_pct_global:+.2f} %")
+    if global_kpis is not None:
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Titres + crypto + cash", f"{global_kpis['equity_eur']:,.2f} €")
+        g2.metric(
+            "Cash XTB disponible",
+            f"{global_kpis['cash_eur']:,.2f} €",
+            f"{global_kpis['cash_share'] * 100:.0f} % du total",
+            delta_color="off",
+        )
+        ret = global_kpis["return_pct"]
+        g3.metric(
+            "Performance globale (cash inclus)",
+            f"{ret:+.2f} %" if ret is not None else "n/a",
+            f"{global_kpis['gain_eur']:+,.2f} €",
+            help="XTB : (titres + cash) - apports nets. Crypto : P&L latent + réalisé / capital engagé "
+                 "(cash Binance non suivi : estimation basse).",
+        )
+    else:
+        invested = kpis.get("total_invested_eur") or kpis["total_cost_basis_eur"]
+        pnl_pct_global = kpis["total_pnl_eur"] / invested * 100 if invested > 0 else 0
+        st.metric("Performance Globale (hors cash)", f"{pnl_pct_global:+.2f} %")
 
-def render_allocation_and_pnl(df: pd.DataFrame) -> None:
+def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = None) -> None:
+    df_perf = df if df_perf is None else df_perf
     col_left, col_right = st.columns(2)
 
     with col_left:
@@ -66,14 +83,14 @@ def render_allocation_and_pnl(df: pd.DataFrame) -> None:
         )
 
     with col_right:
-        st.subheader("📊 P&L par Actif (EUR)")
+        st.subheader("📊 P&L total par Actif (EUR, latent + réalisé)")
         fig_bar = px.bar(
-            df,
+            df_perf,
             x="symbol",
-            y="pnl_eur",
+            y="pnl_total_eur",
             color="pnl_color",
             color_discrete_map={"Gain": GAIN_COLOR, "Perte": LOSS_COLOR},
-            labels={"pnl_eur": "P&L (€)", "symbol": "Actif"},
+            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"},
         )
         fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
         st.plotly_chart(fig_bar, use_container_width=True)
@@ -82,7 +99,8 @@ def render_positions_table(df: pd.DataFrame) -> None:
     st.subheader("📋 Détail des positions")
     df_display = format_display_df(df)
     st.dataframe(
-        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis", "P&L (EUR)", "P&L (%)"]],
+        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis",
+                    "P&L latent", "P&L réalisé", "P&L total", "Perf. totale (%)"]],
         use_container_width=True,
         hide_index=True,
     )

@@ -14,20 +14,26 @@ pub struct DashboardAsset {
     pub pnl_eur: f64,
     pub pnl_pct: f64,
     pub realized_pnl_eur: f64,
+    /// Coût de revient des lots déjà vendus (pour le rendement total = latent + réalisé).
+    pub realized_cost_eur: f64,
 }
 
 #[derive(serde::Serialize)]
 pub struct DashboardData {
+    /// Inclut déjà les avoirs cash issus de `holdings_at` (EUR, USDC...) : NE PAS y ajouter `cash`.
     pub total_value_eur: f64,
+    /// Valeur des titres seuls (kind = Stock), hors crypto et hors cash.
+    pub stocks_value_eur: f64,
     pub total_cost_basis_eur: f64,
     pub total_pnl_eur: f64,
     pub realized_pnl_eur: f64,
     pub trades: Vec<DashboardTrade>,
     pub trade_frequency: TradeFrequency,
-    /// Retour par tranche de cash apportée (aujourd'hui un seul rapport : CTO + PEA regroupés).
-    pub tranches: Vec<TrancheReport>,
     pub assets: Vec<DashboardAsset>,
     pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
+    pub holdings: Vec<HoldingStats>,
+    pub closed_sales: Vec<ClosedSale>,
+    pub cash: CashSummary,
 }
 
 #[derive(serde::Serialize)]
@@ -65,29 +71,61 @@ pub struct TradeFrequency {
     pub by_week: Vec<PeriodCount>,
 }
 
-/// Une tranche de cash apportée (voir `ledger/tranches.rs`).
+
+
+/// Un lot encore détenu (voir `ledger/holding.rs`).
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct Tranche {
-    pub date: String,                 // "YYYY-MM-DD" de l'apport
-    pub invested_eur: f64,            // montant apporté
-    pub nav_at_entry: f64,            // valeur de la part ce jour-là
-    pub current_value_eur: f64,       // valeur actuelle des parts restantes
-    pub unrealized_gain_eur: f64,
-    pub realized_gain_eur: f64,       // gain déjà encaissé via des retraits
-    pub roi_pct: f64,                 // retour depuis l'apport
-    pub annualized_pct: Option<f64>,  // null si < 30 jours
-    pub inferred: bool,               // capital déduit, apports antérieurs non exportés
+pub struct OpenLotStat {
+    pub days: f64,
+    pub cost_eur: f64,
+    /// Valeur actuelle du lot ; None si le prix de l'actif est inconnu.
+    pub value_eur: Option<f64>,
 }
 
-/// Rapport d'un compte : totaux + une ligne par tranche.
+/// Durée de détention d'un actif (voir `ledger/holding.rs`). Durées en jours.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct TrancheReport {
-    pub account: String,              // ex. "XTB (CTO + PEA)"
-    pub net_contributions_eur: f64,   // apports - retraits
-    pub current_value_eur: f64,
-    pub total_gain_eur: f64,          // valeur - apports nets
-    pub time_weighted_return_pct: f64,
-    pub nav_now: f64,
-    pub tranches: Vec<Tranche>,
-    pub warnings: Vec<String>,
+pub struct HoldingStats {
+    pub symbol: String,
+    pub kind: String,
+    pub first_acquired: Option<String>,
+    pub open_quantity: f64,
+    pub open_cost_eur: f64,
+    pub open_avg_days: Option<f64>,
+    pub open_oldest_days: Option<f64>,
+    pub open_lots: Vec<OpenLotStat>,
+    pub closed_lots: u32,
+    pub closed_avg_days: Option<f64>,
+    pub closed_min_days: Option<f64>,
+    pub closed_max_days: Option<f64>,
+    pub closed_incomplete: bool,
+}
+
+/// Une vente de titres rapprochée de ses lots FIFO (une ligne par vente).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClosedSale {
+    pub symbol: String,
+    pub sell_date: String, // "YYYY-MM-DD"
+    pub days: Option<f64>,
+    pub cost_eur: f64,
+    pub proceeds_eur: f64,
+    pub pnl_eur: f64,
+    pub pnl_pct: Option<f64>,
+    pub incomplete: bool,
+}
+
+/// Cash disponible et apports nets d'un compte (EUR).
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CashPosition {
+    /// Somme des montants signés des opérations de cash du compte.
+    pub cash_eur: f64,
+    /// Virements externes entrants - sortants (hors dividendes, intérêts, jambes de trade).
+    pub net_contributions_eur: f64,
+}
+
+/// XTB : un bloc par compte fiscal + le total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct CashSummary {
+    pub total: CashPosition,
+    pub cto: CashPosition,
+    pub pea: CashPosition,
 }

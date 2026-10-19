@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from cash_perf import current_kpis
 from config import DATA_PATH, HISTORY_PATH, MIN_POSITION_VALUE_EUR
 
 
@@ -21,14 +22,50 @@ def compute_kpis(df: pd.DataFrame, exclude_cash: bool = True) -> dict:
     
     # On récupère le P&L réalisé par actif (s'il existe dans le df)
     total_pnl_realized = float(scope["realized_pnl_eur"].sum()) if "realized_pnl_eur" in scope.columns else 0.0
+    total_realized_cost = float(scope["realized_cost_eur"].sum()) if "realized_cost_eur" in scope.columns else 0.0
 
     return {
         "total_value_eur": total_value,
         "total_cost_basis_eur": total_cost,
+        # Capital engagé : cost basis des lots ouverts + coût des lots déjà vendus.
+        "total_invested_eur": total_cost + total_realized_cost,
         "total_pnl_latent_eur": total_pnl_latent,
         "total_pnl_realized_eur": total_pnl_realized,
         "total_pnl_eur": total_pnl_latent + total_pnl_realized,
     }
+
+def compute_global_kpis(df_all: pd.DataFrame, data: dict) -> dict | None:
+    """Performance globale cash inclus.
+
+    - XTB : (titres + cash) - apports nets (voir cash_perf.current_kpis). Intègre déjà
+      plus-values réalisées, dividendes, taxes et frais.
+    - Crypto : P&L latent + réalisé, rapporté au capital engagé (cost basis ouvert + coût
+      des lots vendus). Le cash Binance n'est pas suivi, donc ce % est une estimation basse.
+
+    Renvoie None si dashboard.json n'a pas encore les champs du patch cash (pas de crash).
+    """
+    if "cash" not in data or "stocks_value_eur" not in data:
+        return None
+
+    xtb = current_kpis(data)
+    crypto = df_all[df_all["kind"] == "Crypto"]
+    crypto_value = float(crypto["value_eur"].sum())
+    crypto_gain = float((crypto["pnl_eur"] + crypto["realized_pnl_eur"]).sum())
+    crypto_capital = float((crypto["cost_basis_eur"] + crypto["realized_cost_eur"]).sum())
+
+    equity = xtb["equity_eur"] + crypto_value
+    gain = xtb["gain_eur"] + crypto_gain
+    base = xtb["net_contributions_eur"] + crypto_capital
+    return {
+        "equity_eur": equity,
+        "cash_eur": xtb["cash_eur"],
+        "cash_share": xtb["cash_eur"] / equity if equity > 0 else 0.0,
+        "gain_eur": gain,
+        "return_pct": gain / base * 100 if base > 0 else None,
+        "xtb": xtb,
+        "crypto_gain_eur": crypto_gain,
+    }
+
 
 def filter_small_positions(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> pd.DataFrame:
     """Écarte les lignes dont la valeur actuelle est inférieure au seuil (>= seuil conservé).
@@ -60,7 +97,13 @@ def load_data(path: Path = DATA_PATH) -> dict:
 def build_assets_df(data: dict) -> pd.DataFrame:
     """Construit le DataFrame des positions à partir du JSON brut."""
     df = pd.DataFrame(data["assets"])
-    df["pnl_color"] = df["pnl_eur"].apply(lambda x: "Gain" if x >= 0 else "Perte")
+    for col in ("realized_pnl_eur", "realized_cost_eur"):  # absents d'un ancien dashboard.json
+        if col not in df.columns:
+            df[col] = 0.0
+    df["pnl_total_eur"] = df["pnl_eur"] + df["realized_pnl_eur"]
+    df["invested_eur"] = df["cost_basis_eur"] + df["realized_cost_eur"]
+    df["pnl_total_pct"] = (df["pnl_total_eur"] / df["invested_eur"] * 100).where(df["invested_eur"] > 0, 0.0)
+    df["pnl_color"] = df["pnl_total_eur"].apply(lambda x: "Gain" if x >= 0 else "Perte")
     return df
 
 
@@ -83,6 +126,9 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
     df_display["cost_basis_eur"] = df_display["cost_basis_eur"].apply(lambda x: f"{x:,.2f} €")
     df_display["pnl_eur"] = df_display["pnl_eur"].apply(lambda x: f"{x:+,.2f} €")
     df_display["pnl_pct"] = df_display["pnl_pct"].apply(lambda x: f"{x:+.2f} %")
+    df_display["realized_pnl_eur"] = df_display["realized_pnl_eur"].apply(lambda x: f"{x:+,.2f} €")
+    df_display["pnl_total_eur"] = df_display["pnl_total_eur"].apply(lambda x: f"{x:+,.2f} €")
+    df_display["pnl_total_pct"] = df_display["pnl_total_pct"].apply(lambda x: f"{x:+.2f} %")
 
     return df_display.rename(columns={
         "symbol": "Symbole",
@@ -91,8 +137,11 @@ def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
         "price_eur": "Prix",
         "value_eur": "Valeur",
         "cost_basis_eur": "Cost Basis",
-        "pnl_eur": "P&L (EUR)",
-        "pnl_pct": "P&L (%)",
+        "pnl_eur": "P&L latent",
+        "pnl_pct": "Latent (%)",
+        "realized_pnl_eur": "P&L réalisé",
+        "pnl_total_eur": "P&L total",
+        "pnl_total_pct": "Perf. totale (%)",
     })
 
 

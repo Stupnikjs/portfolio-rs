@@ -466,6 +466,14 @@ impl CostBasisResult {
             .map(|g| g.pnl_eur)
             .sum()
     }
+     /// Coût de revient (EUR) des lots déjà vendus : dénominateur du rendement réalisé.
+    pub fn total_realized_cost(&self, symbol: Option<&str>) -> f64 {
+        self.realized_gains
+            .iter()
+            .filter(|g| symbol.map_or(true, |s| g.symbol == s))
+            .map(|g| g.cost_eur)
+            .sum()
+    }
 
     pub fn total_fees(&self, symbol: Option<&str>) -> f64 {
         match symbol {

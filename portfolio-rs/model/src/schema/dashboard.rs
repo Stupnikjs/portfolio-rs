@@ -14,6 +14,7 @@ pub struct DashboardAsset {
     pub pnl_eur: f64,
     pub pnl_pct: f64,
     pub realized_pnl_eur: f64,
+    pub realized_cost_eur: f64,
 }
 
 #[derive(serde::Serialize)]

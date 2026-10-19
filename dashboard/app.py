@@ -6,7 +6,7 @@ import streamlit as st
 from theme import apply_theme
 from config import MIN_POSITION_VALUE_EUR
 from data import (
-    load_data, build_assets_df, compute_kpis, yfinance_ticker_for, CASH_KIND,
+    load_data, build_assets_df, compute_kpis, compute_global_kpis, yfinance_ticker_for, CASH_KIND,
     filter_small_positions, small_positions_summary,
 )
 from charts import render_kpis, render_allocation_and_pnl, render_positions_table
@@ -54,14 +54,14 @@ df = filter_small_positions(df_all, MIN_POSITION_VALUE_EUR)
 
 # --- NOUVEAU : TABLEAU D'AGRÉGATION GLOBAL PAR TAG ---
 # On explode les tags : si un actif a 2 tags, il compte dans les 2 lignes du tableau
-df_global = df.copy()
+df_global = df_all.copy()
 if not df_global.empty and "tags" in df_global.columns:
     df_exploded = df_global.explode("tags").dropna(subset=["tags"])
     if not df_exploded.empty:
         tag_summary = df_exploded.groupby("tags").agg(
             Valeur=("value_eur", "sum"),
-            Cout=("cost_basis_eur", "sum"),
-            PnL=("pnl_eur", "sum")
+            Cout=("invested_eur", "sum"),
+            PnL=("pnl_total_eur", "sum"),
         ).reset_index()
         
         tag_summary["PnL %"] = tag_summary.apply(lambda r: (r["PnL"]/r["Cout"]*100) if r["Cout"] > 0 else 0.0, axis=1)
@@ -79,14 +79,15 @@ if not df_global.empty and "tags" in df_global.columns:
         st.dataframe(tag_display.rename(columns={
             "tags": "Tag",
             "Valeur": "Valeur Totale",
-            "Cout": "Cost Basis Total",
-            "PnL": "P&L (€)",
-            "PnL %": "P&L (%)"
+            "Cout": "Capital engagé",
+            "PnL": "P&L total (€)",
+            "PnL %": "Perf. totale (%)"
         }), use_container_width=True, hide_index=True)
         st.divider()
 
 # --- FILTRAGE PAR TAGS ---
 all_tags = sorted(set(tag for tags in df["tags"] for tag in tags))
+selected_tags: list[str] = []
 
 if all_tags:
     st.sidebar.subheader("🏷️ Filtrer par Tag")
@@ -104,8 +105,10 @@ if n_dust:
     )
 
 kpis = compute_kpis(df_all)
+# Le cash n'a pas de tag : on ne l'ajoute que sur le portefeuille complet.
+global_kpis = None if selected_tags else compute_global_kpis(df_all, data)
 
-render_kpis(kpis)
+render_kpis(kpis, global_kpis)
 
 st.divider()
 
@@ -113,7 +116,10 @@ if df.empty:
     st.info(f"Aucune position d'au moins {MIN_POSITION_VALUE_EUR:.0f} €.")
     st.stop()
 
-render_allocation_and_pnl(df)
+# Vue par actif : positions détenues + positions soldées qui portent du P&L réalisé.
+df_perf = df_all[(df_all["value_eur"] >= MIN_POSITION_VALUE_EUR) | (df_all["realized_pnl_eur"].abs() > 0.01)].copy()
+
+render_allocation_and_pnl(df, df_perf)  # camembert : df ; barres de P&L : df_perf
 
 st.divider()
-render_positions_table(df)
+render_positions_table(df_perf)

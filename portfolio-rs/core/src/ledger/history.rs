@@ -20,11 +20,12 @@
 //! (`AssetKind::Stock`) comptent, comme dans `main.rs` : les WITHDRAW crypto
 //! sont vus comme des ventes FIFO et fausseraient le résultat.
 //!
-//! Le cash (EUR, USDC, USD...) est EXCLU de l'historique : ses dépôts
+//! Le cash (EUR, USDC, USD...) est EXCLU de `total_value_eur` : ses dépôts
 //! créent des lots à coût de revient plein alors que les achats ne le
 //! consomment pas toujours (jambes cash non tracées), ce qui gonfle le
 //! cost basis et fabrique un P&L négatif fictif. Seuls les actifs
-//! Crypto/Stock sont valorisés.
+//! Crypto/Stock sont valorisés. Le cash XTB est porté à part par `cash_eur` et
+//! `net_contributions_eur` (voir `ledger/cash.rs`).
 //!
 //! Chaque entrée contient le snapshot de chaque actif (quantité, prix EUR,
 //! valeur EUR, cost basis, fiabilité du prix) et pas seulement les totaux :
@@ -48,6 +49,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 
+use crate::ledger::cash::cash_summary;
 use crate::ledger::cost_basis::compute_fifo;
 use crate::ledger::periods::{first_monday, is_first_monday, months_between, sundays_from};
 use crate::ledger::portfolio::{portfolio_snapshot_with, AssetSnapshot, PriceFn};
@@ -78,7 +80,9 @@ impl Frequency {
     }
 }
 
-pub const HISTORY_ENTRY_VERSION: u32 = 3;
+// 4 : ajout de cash_eur / net_contributions_eur. Les entrées v3 sont recalculées au prochain run
+// (les prix sont en cache, donc rapide).
+pub const HISTORY_ENTRY_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +116,12 @@ pub struct HistoryEntry {
     pub unrealized_pnl_eur: f64,
     #[serde(default)]
     pub realized_pnl_eur: f64,
+    /// Cash XTB (CTO + PEA) à la date. `total_value_eur` reste HORS cash.
+    #[serde(default)]
+    pub cash_eur: f64,
+    /// Apports nets XTB cumulés à la date (virements externes).
+    #[serde(default)]
+    pub net_contributions_eur: f64,
     #[serde(default)]
     pub version: u32,
     #[serde(default)]
@@ -222,6 +232,7 @@ fn build_entry(
     last_known: &mut HashMap<String, f64>,
 ) -> Result<HistoryEntry> {
     let at = Utc.from_utc_datetime(&target.and_hms_opt(23, 59, 59).unwrap());
+    let cash = cash_summary(tx_store, Some(at)).total;
 
     let mut snapshot = portfolio_snapshot_with(tx_store, Some(at), price_fn);
     snapshot.assets.retain(|a| a.kind != AssetKind::Cash);
@@ -258,6 +269,8 @@ fn build_entry(
         total_pnl_eur: unrealized_pnl_eur + realized_pnl_eur,
         unrealized_pnl_eur,
         realized_pnl_eur,
+        cash_eur: cash.cash_eur,
+        net_contributions_eur: cash.net_contributions_eur,
         version: HISTORY_ENTRY_VERSION,
         complete,
         assets,

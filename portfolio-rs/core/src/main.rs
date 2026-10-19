@@ -17,6 +17,7 @@ use chrono::Utc;
 use serde::Serialize;
 
 use core::devtools;
+use core::ledger::cash::cash_summary;
 use core::ledger::cost_basis::{compute_fifo, CostBasisResult, RealizedGain};
 use core::ledger::history::record_weekly_history;
 use core::ledger::holding::{closed_sales, holding_stats};
@@ -27,7 +28,7 @@ use core::ledger::trades::{build_trade_frequency, build_trades};
 use core::market::MarketDataClient; // <-- NOUVEAU SERVICE INJECTÉ
 use core::market::correlation::{compute_correlation_matrices, CorrelationMatrices};
 use core::parse::{binance, manual, xtb};
-use core::schema::{AssetKind, ClosedSale, DashboardAsset, DashboardData, HoldingStats, TransactionKind};
+use core::schema::{AssetKind, CashSummary, ClosedSale, DashboardAsset, DashboardData, HoldingStats, TransactionKind};
 use core::store::serialize::{save_wallet, TxStore};
 
 const CORRELATION_MIN_VALUE_EUR: f64 = 10.0;
@@ -77,6 +78,8 @@ fn main() -> Result<()> {
         realized_summary(&tx_store, TaxAccount::Cto)?
             .report("PLUS-VALUES RÉALISÉES : COMPTE-TITRES (XTB, hors PEA et Binance)")
     );
+
+    print_cash(&cash_summary(&tx_store, None));
 
     // Durée de détention (lots FIFO) et ventes de titres
     let (holdings, sales) = compute_holdings(&tx_store, &cost_basis, &snapshot);
@@ -206,6 +209,14 @@ fn print_valuation(snapshot: &PortfolioSnapshot, cost_basis: &CostBasisResult) -
     total_pnl
 }
 
+fn print_cash(c: &CashSummary) {
+    println!("\n=== CASH XTB ===");
+    for (label, p) in [("CTO", c.cto), ("PEA", c.pea), ("Total", c.total)] {
+        println!("  {label:<6} cash {:>10.2} EUR   apports nets {:>10.2} EUR", p.cash_eur, p.net_contributions_eur);
+    }
+    println!("  Compare avec le solde XTB : un écart indique un type d'opération ignoré (ex. PEA deposit).");
+}
+
 fn print_performance(latent_pnl: f64, realized_pnl: f64) {
     println!("P&L réalisé total (actions uniquement) : {realized_pnl:>+.2} EUR");
     println!("\n=== PERFORMANCE GLOBALE (latent + réalisé actions) ===");
@@ -264,6 +275,7 @@ fn dashboard_asset(asset: &AssetSnapshot, cost_basis: &CostBasisResult) -> Dashb
         pnl_eur,
         pnl_pct,
         realized_pnl_eur: cost_basis.total_realized_pnl(Some(&asset.symbol)),
+        realized_cost_eur: cost_basis.total_realized_cost(Some(&asset.symbol)),
     }
 }
 
@@ -277,9 +289,16 @@ fn build_dashboard(
 ) -> DashboardData {
     let assets: Vec<DashboardAsset> = snapshot.assets.iter().map(|a| dashboard_asset(a, cost_basis)).collect();
     let total_cost_basis_eur: f64 = assets.iter().map(|a| a.cost_basis_eur).sum();
+    let stocks_value_eur: f64 = snapshot
+        .assets
+        .iter()
+        .filter(|a| a.kind == AssetKind::Stock)
+        .map(|a| a.value_eur)
+        .sum();
 
     DashboardData {
         total_value_eur: snapshot.total_value_eur,
+        stocks_value_eur,
         total_cost_basis_eur,
         total_pnl_eur: snapshot.total_value_eur - total_cost_basis_eur,
         realized_pnl_eur: cost_basis.total_realized_pnl_stocks(tx_store),
@@ -289,6 +308,7 @@ fn build_dashboard(
         correlation_matrices,
         holdings,
         closed_sales: sales,
+        cash: cash_summary(tx_store, None),
     }
 }
 
