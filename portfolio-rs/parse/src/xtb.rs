@@ -1,7 +1,7 @@
 //! Portage de src/parse/xtb.py -- positions ouvertes/fermées et
 //! opérations de cash XTB, lues depuis les exports xlsx.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -349,7 +349,8 @@ fn cash_kind_for(op_type: &str) -> Option<(TransactionKind, CashFlowKind)> {
     use CashFlowKind::*;
     use TransactionKind as K;
     match op_type {
-        "Deposit" => Some((K::Deposit, ExternalDeposit)),
+        // Sur le PEA, les versements portent ce libellé : ce sont des apports externes comme "Deposit".
+        "Deposit" | "PEA deposit" => Some((K::Deposit, ExternalDeposit)),
         "Withdrawal" => Some((K::Withdraw, ExternalWithdrawal)), // nom à confirmer sur ton export
         "Free funds interest" | "Dividend" => Some((K::Deposit, Income)),
         "Stock purchase" => Some((K::Withdraw, TradeLeg)),
@@ -359,7 +360,8 @@ fn cash_kind_for(op_type: &str) -> Option<(TransactionKind, CashFlowKind)> {
     }
 }
 
-const SKIP_CASH_TYPES: &[&str] = &["PEA deposit"];
+/// Types d'opérations ignorés à l'import (aucun : le solde doit être la somme de tout le relevé).
+const SKIP_CASH_TYPES: &[&str] = &[];
 
 pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transaction>> {
     let source_file = path.display().to_string();
@@ -367,6 +369,8 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
     let header_idx = find_header_row(&rows, "ID")?;
     let col_map = column_map(&rows[header_idx]);
     let mut out = Vec::new();
+    // Diagnostic : nombre d'opérations et somme signée par type (y compris les types ignorés).
+    let mut by_type: BTreeMap<String, (usize, f64)> = BTreeMap::new();
 
     let eur_asset = Asset {
         symbol: "EUR".to_string(),
@@ -382,12 +386,19 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
             continue;
         }
         if SKIP_CASH_TYPES.contains(&op_type.as_str()) {
+            let amount = cell_f64(col(row, &col_map, "Amount")?).unwrap_or(0.0);
+            let e = by_type.entry(op_type.clone()).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += amount;
             continue;
         }
 
         let (kind, cash_flow) = cash_kind_for(&op_type)
     .ok_or_else(|| anyhow!("Type d'opération Cash non géré: {op_type:?}"))?;
         let amount = cell_f64(col(row, &col_map, "Amount")?).unwrap_or(0.0);
+        let e = by_type.entry(op_type.clone()).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += amount;
         let op_id = cell_str(col(row, &col_map, "ID")?);
         let comment = if has_col(&col_map, "Comment") { cell_str(col(row, &col_map, "Comment")?) } else { String::new() };
 
@@ -409,7 +420,24 @@ pub fn parse_cash_operations(path: &Path, sheet_name: &str) -> Result<Vec<Transa
         });
     }
 
+    print_cash_diagnostic(&source_file, &by_type);
     Ok(out)
+}
+
+/// Récapitulatif des opérations de cash d'un export : à comparer au solde affiché par XTB.
+fn print_cash_diagnostic(source_file: &str, by_type: &BTreeMap<String, (usize, f64)>) {
+    println!("  [Cash XTB] {source_file}");
+    let (mut kept, mut ignored) = (0.0, 0.0);
+    for (op_type, (n, sum)) in by_type {
+        let skipped = SKIP_CASH_TYPES.contains(&op_type.as_str());
+        if skipped {
+            ignored += sum;
+        } else {
+            kept += sum;
+        }
+        println!("    {op_type:<22} {n:>5} ops {sum:>12.2} EUR{}", if skipped { "   <- IGNORÉ à l'import" } else { "" });
+    }
+    println!("    solde reconstruit {kept:>12.2} EUR   (montants ignorés : {ignored:.2} EUR)");
 }
 
 pub fn parse_xtb_file(path: &Path, market_client: &MarketDataClient) -> Vec<Transaction> {
@@ -516,7 +544,7 @@ mod tests {
                 ("1002", "Dividend", 12.5, When::Excel(2025, 3, 15, 9, 30, 0), ""),
                 ("1003", "Stock purchase", -500.0, When::Text("16/03/2025 11:00:00"), ""),
                 ("1004", "Withholding tax", -3.2, When::Text("16/03/2025 11:05:00"), ""),
-                ("1005", "PEA deposit", 200.0, When::Text("17/03/2025 08:00:00"), ""), // ignoré volontairement
+                ("1005", "PEA deposit", 200.0, When::Text("17/03/2025 08:00:00"), ""), // versement PEA : apport externe
                 ("", "Total", 0.0, When::Text("17/03/2025 08:00:00"), ""),              // ligne de total ignorée
             ],
         );
@@ -526,9 +554,12 @@ mod tests {
         let tx = parse_cash_operations(&path, &sheet).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(tx.len(), 4);
+        assert_eq!(tx.len(), 5);
         let kinds: Vec<_> = tx.iter().map(|t| t.kind).collect();
-        assert_eq!(kinds, [TransactionKind::Deposit, TransactionKind::Deposit, TransactionKind::Withdraw, TransactionKind::Fee]);
+        assert_eq!(
+            kinds,
+            [TransactionKind::Deposit, TransactionKind::Deposit, TransactionKind::Withdraw, TransactionKind::Fee, TransactionKind::Deposit]
+        );
         let flows: Vec<_> = tx.iter().map(|t| t.cash_flow).collect();
         assert_eq!(
             flows,
@@ -536,7 +567,8 @@ mod tests {
                 Some(CashFlowKind::ExternalDeposit),
                 Some(CashFlowKind::Income),
                 Some(CashFlowKind::TradeLeg),
-                Some(CashFlowKind::Tax)
+                Some(CashFlowKind::Tax),
+                Some(CashFlowKind::ExternalDeposit)
             ]
         );
 
@@ -593,8 +625,8 @@ mod tests {
         assert_eq!(cash_kind_for("Fractional shares"), Some((K::Deposit, TradeLeg)));
         assert_eq!(cash_kind_for("Withholding tax"), Some((K::Fee, Tax)));
         assert_eq!(cash_kind_for("Tax IFTT"), Some((K::Fee, Tax)));
-        assert_eq!(cash_kind_for("PEA deposit"), None); // géré à part (SKIP_CASH_TYPES)
-        assert!(SKIP_CASH_TYPES.contains(&"PEA deposit"));
+        assert_eq!(cash_kind_for("PEA deposit"), Some((K::Deposit, ExternalDeposit)));
+        assert!(SKIP_CASH_TYPES.is_empty());
         assert_eq!(cash_kind_for("anything else"), None);
     }
 

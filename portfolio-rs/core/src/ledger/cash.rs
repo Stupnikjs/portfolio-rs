@@ -4,8 +4,9 @@
 //! (`amount` signé, `cash_flow` posé par le parseur). Le cash Binance n'est
 //! pas suivi (pas de jambe cash sur les achats, dépôts non importés).
 //!
-//! Limite : les types listés dans `SKIP_CASH_TYPES` (ex. "PEA deposit") sont
-//! ignorés à l'import, donc absents ici : comparer avec le solde affiché par XTB.
+//! Tous les types d'opérations du relevé sont importés (`PEA deposit` compte comme un
+//! versement externe) : le cash doit égaler le solde affiché par XTB. Un écart pointe
+//! un export qui ne remonte pas à l'ouverture du compte.
 
 use chrono::{DateTime, Utc};
 

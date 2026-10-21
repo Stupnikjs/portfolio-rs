@@ -1539,7 +1539,7 @@ HISTORY_PATH = ROOT_DIR / "data" / "history.json"
 # Les positions détenues dont la valeur actuelle est inférieure à ce seuil (EUR) sont masquées
 # des tableaux et graphiques. Les totaux (KPIs, historique) les incluent toujours.
 MIN_POSITION_VALUE_EUR = 30.0
-
+WEEKLY_TRADE_QUOTA = 4
 # --- Fenêtres de corrélation ---
 # Mapping label de fenêtre (côté Rust) -> période acceptée par yfinance
 WINDOW_TO_YF_PERIOD = {"90d": "3mo", "6m": "6mo", "1y": "1y"}
@@ -2994,6 +2994,150 @@ def render_holding_page() -> None:
         )
 
 ################################################################################
+# Dossier : dashboard
+# Fichier : intentions.py
+# Chemin relatif : intentions.py
+################################################################################
+
+"""Intentions de trade : on note l'idée d'abord, on n'exécute qu'après un délai de réflexion.
+
+Persistant dans data/intentions.json (écrit par le dashboard, jamais par le pipeline Rust).
+Le rapprochement avec les vrais trades (dashboard.json) est recalculé à chaque affichage :
+l'état « exécutée » n'est jamais stocké.
+
+Une intention : {id, created_at (UTC, ISO), symbol, kind ("Buy"|"Sell"), reason,
+delay_hours, cancelled_at (None ou ISO)}.
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+
+from config import INTENTION_MAX_AGE_DAYS, ROOT_DIR
+
+INTENTIONS_PATH = ROOT_DIR / "data" / "intentions.json"
+
+DONE_ON_TIME = "Exécutée à temps"
+DONE_TOO_EARLY = "Exécutée trop tôt"
+WAITING = "En attente"
+READY = "Prête"
+CANCELLED = "Annulée"
+EXPIRED = "Expirée"
+
+
+# --- Persistance ---------------------------------------------------------------------------
+
+def load_intentions(path: Path = INTENTIONS_PATH) -> list[dict]:
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_intentions(items: list[dict], path: Path = INTENTIONS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(items, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def add_intention(items: list[dict], symbol: str, kind: str, reason: str, delay_hours: int,
+                  now: datetime | None = None) -> dict:
+    symbol, reason = symbol.strip(), reason.strip()
+    if not symbol:
+        raise ValueError("Choisis un actif.")
+    if kind not in ("Buy", "Sell"):
+        raise ValueError(f"Sens inconnu : {kind!r}")
+    if not reason:
+        raise ValueError("Une raison est obligatoire : c'est elle que tu relis avant d'exécuter.")
+    item = {
+        "id": uuid.uuid4().hex[:8],
+        "created_at": (now or datetime.now(timezone.utc)).isoformat(),
+        "symbol": symbol,
+        "kind": kind,
+        "reason": reason,
+        "delay_hours": int(delay_hours),
+        "cancelled_at": None,
+    }
+    items.append(item)
+    return item
+
+
+def cancel_intention(items: list[dict], intention_id: str, now: datetime | None = None) -> None:
+    for it in items:
+        if it["id"] == intention_id:
+            it["cancelled_at"] = (now or datetime.now(timezone.utc)).isoformat()
+            return
+    raise ValueError(f"Intention {intention_id} introuvable.")
+
+
+# --- Rapprochement intentions / trades réels -----------------------------------------------
+
+def reconcile(items: list[dict], trades: pd.DataFrame, now: datetime | None = None,
+              max_age_days: int = INTENTION_MAX_AGE_DAYS) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rapproche un pour un les intentions et les trades réels.
+
+    `trades` : colonnes time (datetime avec fuseau), symbol, kind ("Buy"|"Sell").
+    Un trade est rattaché à la plus ancienne intention non annulée et encore libre, de même actif et
+    même sens, créée avant lui et au plus `max_age_days` jours plus tôt.
+    Le suivi commence à la première intention : les trades antérieurs ne sont pas jugés.
+
+    Renvoie (intentions avec statut, trades sans intention).
+    """
+    now_ts = pd.Timestamp(now or datetime.now(timezone.utc))
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize("UTC")
+    max_age = pd.Timedelta(days=max_age_days)
+
+    rows = []
+    for it in items:
+        created = pd.Timestamp(it["created_at"])
+        rows.append({
+            **it,
+            "created": created,
+            "unlock": created + pd.Timedelta(hours=it["delay_hours"]),
+            "executed_at": None,
+            "status": "",
+        })
+    rows.sort(key=lambda r: r["created"])
+
+    unplanned = []
+    if rows:
+        start = rows[0]["created"]
+        for _, t in trades.sort_values("time").iterrows():
+            if t["time"] < start:
+                continue
+            match = next(
+                (r for r in rows
+                 if r["executed_at"] is None and not r["cancelled_at"]
+                 and r["symbol"].upper() == str(t["symbol"]).upper() and r["kind"] == t["kind"]
+                 and r["created"] <= t["time"] <= r["created"] + max_age),
+                None,
+            )
+            if match is not None:
+                match["executed_at"] = t["time"]
+            else:
+                unplanned.append(t)
+
+    for r in rows:
+        if r["cancelled_at"]:
+            r["status"] = CANCELLED
+        elif r["executed_at"] is not None:
+            r["status"] = DONE_ON_TIME if r["executed_at"] >= r["unlock"] else DONE_TOO_EARLY
+        elif now_ts < r["unlock"]:
+            r["status"] = WAITING
+        elif now_ts <= r["created"] + max_age:
+            r["status"] = READY
+        else:
+            r["status"] = EXPIRED
+
+    table = pd.DataFrame(rows)
+    unplanned_df = pd.DataFrame(unplanned) if unplanned else trades.iloc[0:0]
+    return table, unplanned_df
+
+
+################################################################################
 # Dossier : dashboard/pages
 # Fichier : 3_📊_Activite.py
 # Chemin relatif : pages/3_📊_Activite.py
@@ -3427,6 +3571,148 @@ from holding_view import render_holding_page
  
 render_holding_page()
  
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : Discipline.py
+# Chemin relatif : pages/Discipline.py
+################################################################################
+
+"""Page Discipline : quota de trades par semaine (à placer dans dashboard/pages/)."""
+from __future__ import annotations
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from theme import apply_theme
+from config import WEEKLY_TRADE_QUOTA
+from data import load_data
+
+TZ = "Europe/Paris"
+GREEN, RED = "#2ecc71", "#e74c3c"
+QUOTA = WEEKLY_TRADE_QUOTA
+
+apply_theme()  # même en-tête que les autres pages
+st.title("🎯 Discipline : quota de trades")
+
+data = load_data()
+raw = pd.DataFrame(data.get("trades", []))
+if raw.empty:
+    st.info("Aucun trade dans dashboard.json.")
+    st.stop()
+
+# --- Trades : heure locale, semaines du lundi au dimanche ------------------------------------
+st.sidebar.subheader("🎯 Discipline")
+group_fills = st.sidebar.checkbox(
+    "Regrouper les exécutions d'un même ordre",
+    value=True,
+    help="Même actif, même sens, même minute = 1 trade (ex. une vente qui ferme plusieurs lots XTB).",
+)
+
+df = raw.copy()
+df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert(TZ)
+if group_fills:
+    key = df["symbol"] + "|" + df["kind"] + "|" + df["time"].dt.floor("min").astype(str)
+    df = df.loc[~key.duplicated()]
+
+since = st.sidebar.date_input(
+    "Compter à partir du",
+    value=df["time"].min().date(),
+    help="Mets la date du jour pour ne juger que les semaines à venir.",
+)
+df = df[df["time"].dt.date >= since].copy()
+df["week"] = df["time"].dt.tz_localize(None).dt.to_period("W-SUN").dt.start_time  # lundi
+
+# --- Série hebdomadaire complète (semaines sans trade = 0) -----------------------------------
+current_week = pd.Timestamp.now(tz=TZ).tz_localize(None).to_period("W-SUN").start_time
+start = df["week"].min() if not df.empty else current_week
+weeks = pd.date_range(start, current_week, freq="7D")
+counts = df.groupby("week").size().reindex(weeks, fill_value=0)
+
+# --- Décompte de la semaine en cours ---------------------------------------------------------
+used = int(counts.iloc[-1])
+left = QUOTA - used
+
+c1, c2, c3, c4 = st.columns(4)
+if left >= 0:
+    c1.metric("Restants cette semaine", f"{left} / {QUOTA}", f"{used} fait(s)", delta_color="off")
+else:
+    c1.metric("Quota dépassé", f"{used} / {QUOTA}", f"+{-left}", delta_color="inverse")
+
+done = counts.iloc[:-1]  # semaines terminées
+respected = (done <= QUOTA).tolist()
+streak = 0
+for ok in reversed(respected):
+    if not ok:
+        break
+    streak += 1
+
+c2.metric(
+    "Semaines respectées",
+    f"{sum(respected)} / {len(done)}" if len(done) else "—",
+    f"{sum(respected) / len(done) * 100:.0f} %" if len(done) else None,
+    delta_color="off",
+)
+c3.metric("Série en cours", f"{streak} sem.")
+c4.metric("Moyenne / semaine", f"{done.mean():.1f}" if len(done) else "—")
+
+st.progress(min(used / QUOTA, 1.0))
+if left > 0:
+    st.success(f"Il te reste {left} trade(s) cette semaine.")
+elif left == 0:
+    st.warning("Quota atteint : plus de trade cette semaine.")
+else:
+    st.error(f"Quota dépassé de {-left} trade(s) cette semaine.")
+
+# --- Graphique : rouge si dépassé, vert sinon ------------------------------------------------
+colors = [RED if n > QUOTA else GREEN for n in counts]
+outline = [0] * (len(counts) - 1) + [2]  # contour sur la semaine en cours
+
+fig = go.Figure(
+    go.Bar(
+        x=counts.index,
+        y=counts.values,
+        marker=dict(color=colors, line=dict(width=outline, color="#888888")),
+        hovertemplate="Semaine du %{x|%d/%m/%Y}<br>%{y} trade(s)<extra></extra>",
+    )
+)
+empty = counts[counts == 0]
+if not empty.empty:  # un point vert pour les semaines sans trade (sinon aucune barre visible)
+    fig.add_trace(
+        go.Scatter(
+            x=empty.index,
+            y=[0] * len(empty),
+            mode="markers",
+            marker=dict(color=GREEN, size=8),
+            hovertemplate="Semaine du %{x|%d/%m/%Y}<br>0 trade<extra></extra>",
+        )
+    )
+fig.add_hline(y=QUOTA, line_dash="dash", annotation_text=f"Quota : {QUOTA}")
+fig.update_layout(showlegend=False, bargap=0.25, xaxis_title=None, yaxis_title="Trades")
+fig.update_yaxes(dtick=1, rangemode="tozero")
+st.plotly_chart(fig, use_container_width=True)
+st.caption(
+    "Vert : quota respecté. Rouge : dépassé. Contour : semaine en cours. "
+    "Un trade = achat ou vente d'un actif hors cash ; un convert Binance compte pour 2."
+)
+
+# --- Détail des semaines dépassées -----------------------------------------------------------
+over_weeks = counts[counts > QUOTA].index
+if len(over_weeks):
+    with st.expander(f"Trades des {len(over_weeks)} semaine(s) dépassée(s)"):
+        detail = df[df["week"].isin(over_weeks)].sort_values("time", ascending=False)
+        table = pd.DataFrame(
+            {
+                "Semaine du": detail["week"].dt.strftime("%d/%m/%Y"),
+                "Date": detail["time"].dt.strftime("%d/%m %H:%M"),
+                "Actif": detail["symbol"],
+                "Sens": detail["kind"],
+                "Montant (€)": detail["value_eur"].round(2),
+            }
+        )
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
 
 ################################################################################
 # Dossier : dashboard
