@@ -1894,7 +1894,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from cash_perf import current_kpis
 from config import DATA_PATH, HISTORY_PATH, MIN_POSITION_VALUE_EUR
 
 
@@ -1922,35 +1921,34 @@ def compute_kpis(df: pd.DataFrame, exclude_cash: bool = True) -> dict:
     }
 
 def compute_global_kpis(df_all: pd.DataFrame, data: dict) -> dict | None:
-    """Performance globale cash inclus.
+    """Performance globale cash inclus (titres + crypto + cash XTB).
 
-    - XTB : (titres + cash) - apports nets (voir cash_perf.current_kpis). Intègre déjà
-      plus-values réalisées, dividendes, taxes et frais.
-    - Crypto : P&L latent + réalisé, rapporté au capital engagé (cost basis ouvert + coût
-      des lots vendus). Le cash Binance n'est pas suivi, donc ce % est une estimation basse.
+    Gain = P&L latent + P&L réalisé (titres et crypto) + dividendes/intérêts nets des taxes.
+    Base = cost basis des lots ouverts + cash disponible : le cash dormant dilue la performance.
+
+    Volontairement indépendant des apports nets : (valeur + cash - apports) n'est juste que si
+    TOUT l'historique des versements est dans les exports (positions transférées, export qui ne
+    remonte pas à l'ouverture du compte... faussent le résultat).
 
     Renvoie None si dashboard.json n'a pas encore les champs du patch cash (pas de crash).
     """
-    if "cash" not in data or "stocks_value_eur" not in data:
+    cash = (data.get("cash") or {}).get("total")
+    if cash is None:
         return None
 
-    xtb = current_kpis(data)
-    crypto = df_all[df_all["kind"] == "Crypto"]
-    crypto_value = float(crypto["value_eur"].sum())
-    crypto_gain = float((crypto["pnl_eur"] + crypto["realized_pnl_eur"]).sum())
-    crypto_capital = float((crypto["cost_basis_eur"] + crypto["realized_cost_eur"]).sum())
-
-    equity = xtb["equity_eur"] + crypto_value
-    gain = xtb["gain_eur"] + crypto_gain
-    base = xtb["net_contributions_eur"] + crypto_capital
+    k = compute_kpis(df_all)
+    cash_eur = float(cash["cash_eur"])
+    income = float(cash.get("income_net_eur", 0.0))
+    equity = k["total_value_eur"] + cash_eur
+    gain = k["total_pnl_eur"] + income
+    base = k["total_cost_basis_eur"] + cash_eur
     return {
         "equity_eur": equity,
-        "cash_eur": xtb["cash_eur"],
-        "cash_share": xtb["cash_eur"] / equity if equity > 0 else 0.0,
+        "cash_eur": cash_eur,
+        "cash_share": cash_eur / equity if equity > 0 else 0.0,
         "gain_eur": gain,
         "return_pct": gain / base * 100 if base > 0 else None,
-        "xtb": xtb,
-        "crypto_gain_eur": crypto_gain,
+        "income_net_eur": income,
     }
 
 
