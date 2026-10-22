@@ -27,8 +27,10 @@ pub fn cash_position(tx_store: &TxStore, account: TaxAccount, at: Option<DateTim
     for tx in tx_store.transactions.iter().filter(in_scope) {
         let signed = tx.amount.unwrap_or(0.0);
         pos.cash_eur += signed;
-        if matches!(tx.cash_flow, Some(CashFlowKind::ExternalDeposit | CashFlowKind::ExternalWithdrawal)) {
-            pos.net_contributions_eur += signed;
+        match tx.cash_flow {
+            Some(CashFlowKind::ExternalDeposit | CashFlowKind::ExternalWithdrawal) => pos.net_contributions_eur += signed,
+            Some(CashFlowKind::Income | CashFlowKind::Tax) => pos.income_net_eur += signed,
+            _ => {}
         }
     }
     pos
@@ -40,6 +42,7 @@ pub fn cash_summary(tx_store: &TxStore, at: Option<DateTime<Utc>>) -> CashSummar
     let total = CashPosition {
         cash_eur: cto.cash_eur + pea.cash_eur,
         net_contributions_eur: cto.net_contributions_eur + pea.net_contributions_eur,
+        income_net_eur: cto.income_net_eur + pea.income_net_eur,
     };
     CashSummary { total, cto, pea }
 }
@@ -80,6 +83,7 @@ mod tests {
 
         assert!(approx(p.cash_eur, 609.5));
         assert!(approx(p.net_contributions_eur, 1_000.0));
+        assert!(approx(p.income_net_eur, 9.5)); // dividende 12.5 - taxe 3.0
     }
 
     #[test]

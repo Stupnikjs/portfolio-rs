@@ -120,6 +120,8 @@ pub struct CashPosition {
     pub cash_eur: f64,
     /// Virements externes entrants - sortants (hors dividendes, intérêts, jambes de trade).
     pub net_contributions_eur: f64,
+    /// Dividendes + intérêts - retenues et taxes (flux `Income` et `Tax`), déjà inclus dans `cash_eur`.
+    pub income_net_eur: f64,
 }
 
 /// XTB : un bloc par compte fiscal + le total.

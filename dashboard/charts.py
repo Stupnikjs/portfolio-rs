@@ -37,8 +37,8 @@ def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
             "Performance globale (cash inclus)",
             f"{ret:+.2f} %" if ret is not None else "n/a",
             f"{global_kpis['gain_eur']:+,.2f} €",
-            help="XTB : (titres + cash) - apports nets. Crypto : P&L latent + réalisé / capital engagé "
-                 "(cash Binance non suivi : estimation basse).",
+            help="(P&L latent + réalisé + dividendes nets) / (cost basis des lots ouverts + cash XTB). "
+                 "Le cash Binance n'est pas suivi.",
         )
     else:
         invested = kpis.get("total_invested_eur") or kpis["total_cost_basis_eur"]
