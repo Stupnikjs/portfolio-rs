@@ -4,103 +4,44 @@
 # Chemin relatif : app.py
 ################################################################################
 
-"""Point d'entrée du dashboard. Lancer avec : streamlit run app.py"""
+"""Page d'accueil du dashboard. Lancer avec : streamlit run app.py"""
 from __future__ import annotations
 
 import streamlit as st
 
-from theme import apply_theme
-from config import MIN_POSITION_VALUE_EUR
-from data import (
-    load_data, build_assets_df, compute_kpis, compute_global_kpis, yfinance_ticker_for, CASH_KIND,
-    filter_small_positions, small_positions_summary,
+from portfolio.assets import attach_tags, load_synced_assets
+from portfolio.config import MIN_POSITION_VALUE_EUR
+from portfolio.data import (
+    compute_global_kpis, compute_kpis, filter_small_positions, load_portfolio, small_positions_summary,
 )
-from charts import render_kpis, render_allocation_and_pnl, render_positions_table
-from correlation import render_correlation_section
-from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio  # <-- NOUVELLE LIGNE
+from portfolio.home import render_allocation_and_pnl, render_kpis, render_positions_table, render_tag_summary
+from portfolio.theme import apply_theme
 
 apply_theme()  # doit être appelé avant tout autre st.* ou px.*
 
-data = load_data()
-df = build_assets_df(data)
-df = df[~((df["kind"] == CASH_KIND) & (df["symbol"] == "EUR"))].copy()
+data, df_all = load_portfolio()
+assets_data, _ = load_synced_assets(df_all)  # ajoute les nouveaux actifs détenus à la watchlist
+df_all = attach_tags(df_all, assets_data)
 
-# --- SYNCHRONISATION ET FUSION DES TAGS ---
-assets_data = load_assets_data()
-
-def resolver(symbol):
-    row = df[df["symbol"] == symbol]
-    if not row.empty:
-        return yfinance_ticker_for(row.iloc[0])
-    return symbol
-
-added = sync_watchlist_with_portfolio(assets_data, df, ticker_resolver=resolver)
-if added > 0:
-    save_assets_data(assets_data)
-
-tag_map = {a["ticker"]: a.get("tags", []) for a in assets_data["assets"]}
-
-def get_tags(row):
-    if row.get("ticker") in tag_map:
-        return tag_map[row["ticker"]]
-    elif row.get("symbol") in tag_map:
-        return tag_map[row["symbol"]]
-    return []
-
-df["tags"] = df.apply(get_tags, axis=1)
-
-# --- POSITIONS DE POUSSIÈRE ---
+# --- Positions de poussière ---
 # `df_all` garde toutes les positions pour les totaux : une position soldée (valeur 0) porte du
-# P&L réalisé qu'il ne faut pas perdre. `df` ne sert qu'à l'affichage (tableaux, graphiques,
-# corrélations). Le filtre vient APRÈS la synchro watchlist : tout actif détenu y est ajouté.
-df_all = df.copy()
+# P&L réalisé qu'il ne faut pas perdre. `df` ne sert qu'à l'affichage (tableaux, graphiques).
+# Le filtre vient APRÈS la synchro watchlist : tout actif détenu y est ajouté.
 n_dust, dust_value = small_positions_summary(df_all, MIN_POSITION_VALUE_EUR)
 df = filter_small_positions(df_all, MIN_POSITION_VALUE_EUR)
 
+render_tag_summary(df_all)
 
-# --- NOUVEAU : TABLEAU D'AGRÉGATION GLOBAL PAR TAG ---
-# On explode les tags : si un actif a 2 tags, il compte dans les 2 lignes du tableau
-df_global = df_all.copy()
-if not df_global.empty and "tags" in df_global.columns:
-    df_exploded = df_global.explode("tags").dropna(subset=["tags"])
-    if not df_exploded.empty:
-        tag_summary = df_exploded.groupby("tags").agg(
-            Valeur=("value_eur", "sum"),
-            Cout=("invested_eur", "sum"),
-            PnL=("pnl_total_eur", "sum"),
-        ).reset_index()
-        
-        tag_summary["PnL %"] = tag_summary.apply(lambda r: (r["PnL"]/r["Cout"]*100) if r["Cout"] > 0 else 0.0, axis=1)
-        tag_summary = tag_summary.sort_values("Valeur", ascending=False)
-        
-        st.subheader("📊 Vue d'ensemble : Performance par Tag")
-        
-        # Formatage pour l'affichage
-        tag_display = tag_summary.copy()
-        tag_display["Valeur"] = tag_display["Valeur"].apply(lambda x: f"{x:,.2f} €")
-        tag_display["Cout"] = tag_display["Cout"].apply(lambda x: f"{x:,.2f} €")
-        tag_display["PnL"] = tag_display["PnL"].apply(lambda x: f"{x:+,.2f} €")
-        tag_display["PnL %"] = tag_display["PnL %"].apply(lambda x: f"{x:+.2f} %")
-        
-        st.dataframe(tag_display.rename(columns={
-            "tags": "Tag",
-            "Valeur": "Valeur Totale",
-            "Cout": "Capital engagé",
-            "PnL": "P&L total (€)",
-            "PnL %": "Perf. totale (%)"
-        }), use_container_width=True, hide_index=True)
-        st.divider()
-
-# --- FILTRAGE PAR TAGS ---
-all_tags = sorted(set(tag for tags in df["tags"] for tag in tags))
+# --- Filtrage par tags ---
+all_tags = sorted({tag for tags in df["tags"] for tag in tags})
 selected_tags: list[str] = []
 
 if all_tags:
     st.sidebar.subheader("🏷️ Filtrer par Tag")
     selected_tags = st.sidebar.multiselect("Sélectionner un ou plusieurs tags", all_tags)
-    
+
     if selected_tags:
-        has_selected_tag = lambda x: any(t in x for t in selected_tags)
+        has_selected_tag = lambda tags: any(t in tags for t in selected_tags)
         df = df[df["tags"].apply(has_selected_tag)].copy()
         df_all = df_all[df_all["tags"].apply(has_selected_tag)].copy()
 
@@ -130,38 +71,509 @@ render_allocation_and_pnl(df, df_perf)  # camembert : df ; barres de P&L : df_pe
 st.divider()
 render_positions_table(df_perf)
 
+
 ################################################################################
-# Dossier : dashboard
-# Fichier : assets_data.py
-# Chemin relatif : assets_data.py
+# Dossier : dashboard/pages
+# Fichier : 3_📊_Activite.py
+# Chemin relatif : pages/3_📊_Activite.py
 ################################################################################
 
-"""Modèle Asset : un actif suivi (en DCA actif ou en watchlist), avec son
-analyse associée. Persistant dans data/assets/<TICKER>.json (un fichier
-JSON par actif) -- séparé de dashboard.json (pipeline Rust, lecture seule).
+"""Page Activité : activité de trading -- fréquence des achats/ventes (par mois ou
+par semaine) et historique filtrable des trades.
 
-Le DCA est piloté par une QUANTITÉ (ex. 0.01 ETH/mois, 2 parts/mois) et non
-par un montant en euros saisi à la main : le montant mensuel se déduit en
-multipliant cette quantité par le prix courant (get_price_eur), recalculé à
-chaque affichage.
+Lit uniquement `trades` et `trade_frequency` dans dashboard.json (pipeline
+Rust, lecture seule). Aucune persistance propre à cette page."""
+from __future__ import annotations
 
-La thèse d'investissement (texte, scénario d'invalidation, données financières,
-avis analystes) est stockée directement dans l'Asset, donc dans son fichier JSON."""
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from portfolio.data import load_data
+from portfolio.theme import PASTEL_DARK_SEQUENCE, apply_theme
+
+apply_theme()
+
+BUY_COLOR = PASTEL_DARK_SEQUENCE[0]   # bleu
+SELL_COLOR = PASTEL_DARK_SEQUENCE[2]  # orange
+WEEKS_DEFAULT = 52
+
+st.title("📊 Activité")
+
+data = load_data()
+trades = data.get("trades") or []
+freq = data.get("trade_frequency") or {}
+
+if not trades:
+    st.info("Aucun trade dans dashboard.json.")
+    st.stop()
+
+df = pd.DataFrame(trades)
+df["time"] = pd.to_datetime(df["time"], utc=True)
+df = df.sort_values("time", ascending=False).reset_index(drop=True)
+df["date"] = df["time"].dt.date
+
+# --- KPIs ---------------------------------------------------------------------
+buys_eur = float(df.loc[df["kind"] == "Buy", "value_eur"].sum())
+sells_eur = float(df.loc[df["kind"] == "Sell", "value_eur"].sum())
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Trades", f"{freq.get('total_trades', len(df)):,}")
+c2.metric("Moyenne / mois", f"{freq.get('avg_per_month', 0.0):.1f}")
+c3.metric("Moyenne / semaine", f"{freq.get('avg_per_week', 0.0):.1f}")
+c4.metric("Total acheté", f"{buys_eur:,.0f} €")
+c5.metric("Total vendu", f"{sells_eur:,.0f} €")
+
+st.divider()
+
+# --- Fréquence ----------------------------------------------------------------
+st.subheader("Fréquence")
+
+granularity = st.radio("Période", ["Mois", "Semaine"], horizontal=True, label_visibility="collapsed")
+rows = freq.get("by_month" if granularity == "Mois" else "by_week") or []
+periods = pd.DataFrame(rows)
+
+if periods.empty:
+    st.info("Pas de données de fréquence.")
+else:
+    if granularity == "Semaine":
+        show_all = st.checkbox("Afficher toute la période", value=False)
+        if not show_all:
+            periods = periods.tail(WEEKS_DEFAULT)
+            st.caption(f"{WEEKS_DEFAULT} dernières semaines (la période est la fin de semaine, dimanche).")
+
+    left, right = st.columns(2)
+
+    fig_count = go.Figure()
+    fig_count.add_bar(x=periods["period"], y=periods["buys"], name="Achats", marker_color=BUY_COLOR)
+    fig_count.add_bar(x=periods["period"], y=periods["sells"], name="Ventes", marker_color=SELL_COLOR)
+    fig_count.update_layout(
+        barmode="stack", title="Nombre de trades", height=360,
+        margin=dict(l=10, r=10, t=50, b=10), xaxis=dict(type="category"),
+        legend=dict(orientation="h", y=1.1, x=0),
+    )
+    left.plotly_chart(fig_count, use_container_width=True)
+
+    fig_vol = go.Figure()
+    fig_vol.add_bar(x=periods["period"], y=periods["volume_eur"], name="Volume", marker_color=BUY_COLOR)
+    fig_vol.update_layout(
+        title="Volume échangé (€)", height=360,
+        margin=dict(l=10, r=10, t=50, b=10), xaxis=dict(type="category"),
+        yaxis=dict(ticksuffix=" €"), showlegend=False,
+    )
+    right.plotly_chart(fig_vol, use_container_width=True)
+
+st.divider()
+
+# --- Historique filtrable -------------------------------------------------------
+st.subheader("Historique")
+
+f1, f2, f3, f4 = st.columns([2, 1, 1, 2])
+symbols = f1.multiselect("Actif", sorted(df["symbol"].unique()))
+kinds = f2.multiselect("Type", sorted(df["kind"].unique()))
+platforms = f3.multiselect("Plateforme", sorted(df["platform"].unique()))
+date_range = f4.date_input("Dates", value=(df["date"].min(), df["date"].max()))
+
+mask = pd.Series(True, index=df.index)
+if symbols:
+    mask &= df["symbol"].isin(symbols)
+if kinds:
+    mask &= df["kind"].isin(kinds)
+if platforms:
+    mask &= df["platform"].isin(platforms)
+# date_input renvoie un tuple d'un élément tant que la plage n'est pas complète
+if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+    mask &= (df["date"] >= date_range[0]) & (df["date"] <= date_range[1])
+
+view = df[mask]
+
+st.caption(
+    f"{len(view)} trades — achats {view.loc[view['kind'] == 'Buy', 'value_eur'].sum():,.0f} €, "
+    f"ventes {view.loc[view['kind'] == 'Sell', 'value_eur'].sum():,.0f} €"
+)
+
+st.dataframe(
+    view[["time", "symbol", "kind", "platform", "quantity", "unit_price_eur", "value_eur"]],
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "time": st.column_config.DatetimeColumn("Date", format="DD/MM/YYYY HH:mm"),
+        "symbol": "Actif",
+        "kind": "Type",
+        "platform": "Plateforme",
+        "quantity": st.column_config.NumberColumn("Quantité", format="%.4f"),
+        "unit_price_eur": st.column_config.NumberColumn("Prix unitaire", format="%.2f €"),
+        "value_eur": st.column_config.NumberColumn("Valeur", format="%.2f €"),
+    },
+)
+
+# --- Récap par actif (sur la sélection) ----------------------------------------
+if not view.empty:
+    st.subheader("Par actif")
+    recap = (
+        view.assign(
+            achete=view["value_eur"].where(view["kind"] == "Buy", 0.0),
+            vendu=view["value_eur"].where(view["kind"] == "Sell", 0.0),
+        )
+        .groupby("symbol")
+        .agg(trades=("symbol", "size"), achete=("achete", "sum"), vendu=("vendu", "sum"), dernier=("time", "max"))
+        .sort_values("trades", ascending=False)
+        .reset_index()
+    )
+    st.dataframe(
+        recap,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "symbol": "Actif",
+            "trades": "Trades",
+            "achete": st.column_config.NumberColumn("Acheté", format="%.0f €"),
+            "vendu": st.column_config.NumberColumn("Vendu", format="%.0f €"),
+            "dernier": st.column_config.DatetimeColumn("Dernier trade", format="DD/MM/YYYY"),
+        },
+    )
+
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : 4_🏷️_Gestion_Tags.py
+# Chemin relatif : pages/4_🏷️_Gestion_Tags.py
+################################################################################
+
+"""Page Tags : gestion et assignation des Tags aux actifs du portefeuille."""
+from __future__ import annotations
+
+import streamlit as st
+
+from portfolio.assets import load_synced_assets, save_assets_data, update_asset
+from portfolio.data import build_assets_df, load_data
+from portfolio.theme import apply_theme
+
+apply_theme()
+st.title("🏷️ Gestion des Tags")
+
+# Positions (dashboard.json) + actifs suivis (où sont stockés les tags), nouveaux actifs ajoutés
+df_portfolio = build_assets_df(load_data())
+assets_data, added = load_synced_assets(df_portfolio)
+if added > 0:
+    st.toast(f"{added} nouvel(s) actif(s) ajouté(s) pour taggage.", icon="✅")
+
+# --- Récupérer tous les tags existants ---
+all_tags = sorted(set(tag for a in assets_data["assets"] for tag in a.get("tags", [])))
+
+# ==========================================
+# NOUVEAU : GESTION GLOBALE (SUPPRESSION)
+# ==========================================
+st.subheader("🧹 Gestion globale des tags")
+if not all_tags:
+    st.info("Aucun tag n'existe encore dans le système.")
+else:
+    col1, col2 = st.columns([3, 1])
+    tag_to_delete = col1.selectbox("Sélectionner un tag à supprimer de TOUS les actifs", all_tags)
+    if col2.button("🗑️ Supprimer définitivement", type="primary"):
+        if tag_to_delete:
+            count = 0
+            # On boucle sur tous les actifs pour retirer ce tag s'il est présent
+            for a in assets_data["assets"]:
+                if tag_to_delete in a.get("tags", []):
+                    a["tags"].remove(tag_to_delete)
+                    count += 1
+            
+            save_assets_data(assets_data)
+            st.success(f"Le tag '{tag_to_delete}' a été retiré de {count} actif(s).")
+            st.rerun() # Rafraîchit la page pour mettre à jour la liste des tags
+
+st.divider()
+
+# ==========================================
+# GESTION PAR ACTIF (INCHANGÉE + CORRIGÉE)
+# ==========================================
+st.subheader("✏️ Tags par actif")
+
+# On priorise les actifs réellement détenus
+current_tickers = set()
+for _, row in df_portfolio.iterrows():
+    if row["value_eur"] > 0:
+        tk = row.get("ticker") or row["symbol"]
+        current_tickers.add(tk)
+
+assets_list = assets_data["assets"]
+# Trier : détenus en premier, puis par ordre alphabétique
+assets_list_sorted = sorted(assets_list, key=lambda x: (x["ticker"] not in current_tickers, x["name"]))
+
+# Créer une liste de labels pour le selectbox
+asset_options = [f"{a['name']} ({a['ticker']})" for a in assets_list_sorted]
+
+selected_label = st.selectbox("Choisir un actif à tagger", options=asset_options)
+selected_index = asset_options.index(selected_label)
+selected_asset = assets_list_sorted[selected_index]
+
+st.markdown(f"##### Configuration pour {selected_asset['name']}")
+current_tags = selected_asset.get("tags", [])
+
+# 1. Multiselect avec les tags existants (SUGGESTION)
+chosen_existing = st.multiselect(
+    "Sélectionner des tags existants", 
+    options=all_tags, 
+    default=[t for t in current_tags if t in all_tags]
+)
+
+# 2. Option pour créer un nouveau tag (AUTRE)
+st.markdown("**Ou créer un nouveau tag :**")
+new_tag = st.text_input("Nouveau tag (laisser vide pour ignorer)", placeholder="Ex: Tech, Dividende...")
+
+# Combiner les tags existants choisis et le nouveau tag
+new_tags_list = list(dict.fromkeys(chosen_existing))  # sans doublons, ordre conservé
+if new_tag.strip():
+    new_tags_list.append(new_tag.strip())
+
+st.write("**Tags actuels pour cet actif :**", ", ".join(new_tags_list) if new_tags_list else "Aucun")
+
+if st.button("💾 Sauvegarder les tags", type="primary"):
+    # Mettre à jour
+    update_asset(assets_data, selected_asset["ticker"], tags=new_tags_list)
+    save_assets_data(assets_data)
+    st.success("Tags sauvegardés avec succès !")
+    st.rerun()
+
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : 5_Historique.py
+# Chemin relatif : pages/5_Historique.py
+################################################################################
+
+"""Page Historique : valeur totale et cost basis dans le temps (data/history.json)."""
+from portfolio.history import render_history_page
+from portfolio.theme import apply_theme
+
+apply_theme()
+render_history_page()
+
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : 6_🔗_Correlation.py
+# Chemin relatif : pages/6_🔗_Correlation.py
+################################################################################
+
+"""Page Corrélation : par actif, groupes automatiques et variation selon la fenêtre."""
+from portfolio.correlation import render_correlation_page
+from portfolio.theme import apply_theme
+
+apply_theme()
+render_correlation_page()
+
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : 7_Holding.py
+# Chemin relatif : pages/7_Holding.py
+################################################################################
+
+"""Page Détention : durée de détention par actif (data/dashboard.json -> `holdings`)."""
+from portfolio.holding import render_holding_page
+from portfolio.theme import apply_theme
+
+apply_theme()
+render_holding_page()
+
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : Discipline.py
+# Chemin relatif : pages/Discipline.py
+################################################################################
+
+"""Page Discipline : quota de trades par semaine."""
+from __future__ import annotations
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from portfolio.config import WEEKLY_TRADE_QUOTA
+from portfolio.data import load_data
+from portfolio.theme import apply_theme
+
+TZ = "Europe/Paris"
+GREEN, RED = "#2ecc71", "#e74c3c"
+QUOTA = WEEKLY_TRADE_QUOTA
+
+apply_theme()
+st.title("🎯 Discipline : quota de trades")
+
+data = load_data()
+raw = pd.DataFrame(data.get("trades", []))
+if raw.empty:
+    st.info("Aucun trade dans dashboard.json.")
+    st.stop()
+
+# --- Trades : heure locale, semaines du lundi au dimanche ------------------------------------
+st.sidebar.subheader("🎯 Discipline")
+group_fills = st.sidebar.checkbox(
+    "Regrouper les exécutions d'un même ordre",
+    value=True,
+    help="Même actif, même sens, même minute = 1 trade (ex. une vente qui ferme plusieurs lots XTB).",
+)
+
+df = raw.copy()
+df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert(TZ)
+if group_fills:
+    key = df["symbol"] + "|" + df["kind"] + "|" + df["time"].dt.floor("min").astype(str)
+    df = df.loc[~key.duplicated()]
+
+since = st.sidebar.date_input(
+    "Compter à partir du",
+    value=df["time"].min().date(),
+    help="Mets la date du jour pour ne juger que les semaines à venir.",
+)
+df = df[df["time"].dt.date >= since].copy()
+df["week"] = df["time"].dt.tz_localize(None).dt.to_period("W-SUN").dt.start_time  # lundi
+
+# --- Série hebdomadaire complète (semaines sans trade = 0) -----------------------------------
+current_week = pd.Timestamp.now(tz=TZ).tz_localize(None).to_period("W-SUN").start_time
+start = df["week"].min() if not df.empty else current_week
+weeks = pd.date_range(start, current_week, freq="7D")
+counts = df.groupby("week").size().reindex(weeks, fill_value=0)
+
+# --- Décompte de la semaine en cours ---------------------------------------------------------
+used = int(counts.iloc[-1])
+left = QUOTA - used
+
+c1, c2, c3, c4 = st.columns(4)
+if left >= 0:
+    c1.metric("Restants cette semaine", f"{left} / {QUOTA}", f"{used} fait(s)", delta_color="off")
+else:
+    c1.metric("Quota dépassé", f"{used} / {QUOTA}", f"+{-left}", delta_color="inverse")
+
+done = counts.iloc[:-1]  # semaines terminées
+respected = (done <= QUOTA).tolist()
+streak = 0
+for ok in reversed(respected):
+    if not ok:
+        break
+    streak += 1
+
+c2.metric(
+    "Semaines respectées",
+    f"{sum(respected)} / {len(done)}" if len(done) else "—",
+    f"{sum(respected) / len(done) * 100:.0f} %" if len(done) else None,
+    delta_color="off",
+)
+c3.metric("Série en cours", f"{streak} sem.")
+c4.metric("Moyenne / semaine", f"{done.mean():.1f}" if len(done) else "—")
+
+st.progress(min(used / QUOTA, 1.0))
+if left > 0:
+    st.success(f"Il te reste {left} trade(s) cette semaine.")
+elif left == 0:
+    st.warning("Quota atteint : plus de trade cette semaine.")
+else:
+    st.error(f"Quota dépassé de {-left} trade(s) cette semaine.")
+
+# --- Graphique : rouge si dépassé, vert sinon ------------------------------------------------
+colors = [RED if n > QUOTA else GREEN for n in counts]
+outline = [0] * (len(counts) - 1) + [2]  # contour sur la semaine en cours
+
+fig = go.Figure(
+    go.Bar(
+        x=counts.index,
+        y=counts.values,
+        marker=dict(color=colors, line=dict(width=outline, color="#888888")),
+        hovertemplate="Semaine du %{x|%d/%m/%Y}<br>%{y} trade(s)<extra></extra>",
+    )
+)
+empty = counts[counts == 0]
+if not empty.empty:  # un point vert pour les semaines sans trade (sinon aucune barre visible)
+    fig.add_trace(
+        go.Scatter(
+            x=empty.index,
+            y=[0] * len(empty),
+            mode="markers",
+            marker=dict(color=GREEN, size=8),
+            hovertemplate="Semaine du %{x|%d/%m/%Y}<br>0 trade<extra></extra>",
+        )
+    )
+fig.add_hline(y=QUOTA, line_dash="dash", annotation_text=f"Quota : {QUOTA}")
+fig.update_layout(showlegend=False, bargap=0.25, xaxis_title=None, yaxis_title="Trades")
+fig.update_yaxes(dtick=1, rangemode="tozero")
+st.plotly_chart(fig, use_container_width=True)
+st.caption(
+    "Vert : quota respecté. Rouge : dépassé. Contour : semaine en cours. "
+    "Un trade = achat ou vente d'un actif hors cash ; un convert Binance compte pour 2."
+)
+
+# --- Détail des semaines dépassées -----------------------------------------------------------
+over_weeks = counts[counts > QUOTA].index
+if len(over_weeks):
+    with st.expander(f"Trades des {len(over_weeks)} semaine(s) dépassée(s)"):
+        detail = df[df["week"].isin(over_weeks)].sort_values("time", ascending=False)
+        table = pd.DataFrame(
+            {
+                "Semaine du": detail["week"].dt.strftime("%d/%m/%Y"),
+                "Date": detail["time"].dt.strftime("%d/%m %H:%M"),
+                "Actif": detail["symbol"],
+                "Sens": detail["kind"],
+                "Montant (€)": detail["value_eur"].round(2),
+            }
+        )
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+################################################################################
+# Dossier : dashboard/portfolio
+# Fichier : __init__.py
+# Chemin relatif : portfolio/__init__.py
+################################################################################
+
+"""Dashboard portefeuille : carte du code.
+
+Flux de données (lecture seule, produites par le pipeline Rust `cargo run`) :
+    data/dashboard.json  -> positions, trades, ventes, corrélations, cash
+    data/history.json    -> valeur et cost basis par semaine
+Persistance propre au dashboard : data/assets/<TICKER>.json (tags, thèse, DCA).
+
+Modules (chacun ne dépend que de ceux de la liste au-dessus) :
+    config       constantes et chemins
+    theme        palette, template Plotly sombre, apply_theme() (à appeler en 1er sur chaque page)
+    data         chargement de dashboard.json, DataFrame des positions, KPIs
+    assets       actifs suivis et tags (data/assets/*.json)
+    home         page d'accueil : KPIs, allocation, P&L par actif, tableau par tag
+    history      page Historique (logique pure + rendu)
+    holding      page Détention (logique pure + rendu)
+    correlation  page Corrélation : matrice, groupes (clustering), variation par fenêtre
+
+Pages Streamlit (dossier pages/) : soit un script autonome (Activité, Tags, Discipline),
+soit un appel à `render_<page>_page()` du package (Historique, Détention, Corrélation).
+Convention : logique pure (DataFrames, figures) séparée du rendu `st.*`, pour pouvoir la tester.
+"""
+
+
+################################################################################
+# Dossier : dashboard/portfolio
+# Fichier : assets.py
+# Chemin relatif : portfolio/assets.py
+################################################################################
+
+"""Actifs suivis (tags, thèse, DCA) : un fichier JSON par actif dans data/assets/<TICKER>.json.
+
+Séparé de dashboard.json (pipeline Rust, lecture seule). Le dashboard ne modifie que les tags
+et l'ajout automatique des actifs détenus ; les autres champs (thèse, données financières, DCA)
+sont préservés tels quels à chaque sauvegarde.
+"""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-from config import ROOT_DIR
-
-ASSETS_DIR = ROOT_DIR / "data" / "assets"                  # un fichier JSON par actif
-LEGACY_ASSETS_PATH = ROOT_DIR / "data" / "assets.json"     # ancien format (tous les actifs dans un fichier)
+from portfolio.config import ASSETS_DIR, LEGACY_ASSETS_PATH
+from portfolio.data import yfinance_ticker_for
 
 
 # --- Schéma FIXE des blocs de données --------------------------------------
@@ -255,35 +667,24 @@ class Asset:
     name: str
     ticker: str
     in_dca: bool
-    analysis_path: str = ""            
-    last_analysis_update: str = ""     
+    analysis_path: str = ""
+    last_analysis_update: str = ""
     quantite_dca_mensuelle: float = 0.0
     thesis: str = ""
     invalidation_scenario: str = ""
     donnees_financieres: dict = field(default_factory=lambda: empty_block(FINANCIAL_SCHEMA))
     avis_analystes: dict = field(default_factory=lambda: empty_block(ANALYST_SCHEMA))
-    tags: list = field(default_factory=list)  # <-- Ligne obligatoire
+    tags: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
-    @staticmethod
-    def from_dict(d: dict) -> "Asset":
-        # Les champs absents (ancien assets.json) prennent leur valeur par défaut.
-        return Asset(**{k: d[k] for k in Asset.__dataclass_fields__ if k in d and d[k] is not None})
-
-
-DEFAULT_ASSETS_DATA = {"assets": []}
-
 
 # --- Chargement / sauvegarde -------------------------------------------------
 # Un actif = un fichier data/assets/<TICKER>.json (le contenu de Asset.to_dict()).
-# `data` garde en mémoire deux clés techniques, jamais écrites sur disque :
-#   "_files"   : ticker -> fichier d'origine (un fichier renommé à la main
-#                est donc réécrit sous son nom, pas dupliqué)
-#   "_removed" : tickers retirés, dont le fichier est supprimé à la sauvegarde.
-# Rien d'autre n'est jamais supprimé : un fichier illisible ou ajouté à la main
-# entre-temps n'est pas touché.
+# `data` garde en mémoire une clé technique "_files" (ticker -> fichier d'origine), jamais écrite
+# sur disque : un fichier renommé à la main est réécrit sous son nom, pas dupliqué.
+# Rien n'est jamais supprimé : un fichier illisible ou ajouté à la main entre-temps n'est pas touché.
 
 def _asset_file(ticker: str, directory: Path) -> Path:
     return directory / f"{re.sub(r'[^A-Za-z0-9._-]', '_', ticker)}.json"
@@ -350,30 +751,19 @@ def load_assets_data(directory: Path = ASSETS_DIR, legacy_path: Path = LEGACY_AS
         _normalize_and_warn(a, p.name)
         assets.append(a)
         files[ticker] = p
-    return {"assets": assets, "_files": files, "_removed": []}
+    return {"assets": assets, "_files": files}
 
 
 def save_assets_data(data: dict, directory: Path = ASSETS_DIR) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     files: dict = data.setdefault("_files", {})
-
-    for ticker in data.get("_removed", []):
-        f = files.pop(ticker, None) or _asset_file(ticker, directory)
-        if f.exists():
-            f.unlink()
-    data["_removed"] = []
-
     for a in data["assets"]:
         f = files.get(a["ticker"]) or _asset_file(a["ticker"], directory)
         _write_if_changed(f, a)
         files[a["ticker"]] = f
 
 
-# --- Accès aux objets Asset ---------------------------------------------------
-
-def _assets(data: dict) -> list[Asset]:
-    return [Asset.from_dict(a) for a in data["assets"]]
-
+# --- Accès aux actifs ---------------------------------------------------------
 
 def _find(data: dict, ticker: str) -> dict | None:
     for a in data["assets"]:
@@ -399,1016 +789,145 @@ def update_asset(data: dict, ticker: str, **changes) -> None:
     raw.update(changes)
 
 
-THESIS_FIELDS = ("thesis", "invalidation_scenario", "donnees_financieres", "avis_analystes")
+def sync_watchlist_with_portfolio(data: dict, portfolio_df: pd.DataFrame) -> int:
+    """Ajoute en watchlist tout actif détenu (df issu de build_assets_df) absent de data/assets/.
 
-
-def update_thesis(data: dict, ticker: str, payload: dict) -> None:
-    """Met à jour la thèse d'un actif à partir d'un dict (saisie manuelle ou
-    JSON importé). Seuls les champs présents dans `payload` sont modifiés ;
-    pour les deux blocs de données, seules les clés fournies changent (fusion
-    clé par clé) et elles doivent appartenir au schéma fixe. last_analysis_update
-    passe à la date du jour."""
-    unknown = set(payload) - set(THESIS_FIELDS)
-    if unknown:
-        raise ValueError(f"Champs inconnus : {sorted(unknown)} (attendus : {list(THESIS_FIELDS)})")
-    for k in ("thesis", "invalidation_scenario"):
-        if k in payload and not isinstance(payload[k], str):
-            raise ValueError(f"« {k} » doit être un texte.")
-
-    raw = _find(data, ticker)
-    if raw is None:
-        raise ValueError(f"{ticker} introuvable.")
-    payload = dict(payload)
-    for name, schema in BLOCK_SCHEMAS.items():
-        if name not in payload:
-            continue
-        if not isinstance(payload[name], dict):
-            raise ValueError(f"« {name} » doit être un objet JSON.")
-        check_block(name, payload[name], schema)
-        merged = {**normalize_block(raw.get(name), schema), **payload[name]}
-        payload[name] = normalize_block(merged, schema)
-
-    update_asset(data, ticker, last_analysis_update=date.today().isoformat(), **payload)
-
-
-def remove_asset(data: dict, ticker: str) -> None:
-    data["assets"] = [a for a in data["assets"] if a["ticker"] != ticker]
-    data.setdefault("_removed", []).append(ticker)  # le fichier est supprimé à la prochaine sauvegarde
-
-
-def promote_to_dca(data: dict, ticker: str, quantite_dca_mensuelle: float) -> None:
-    """Passe un candidat de la watchlist au panier DCA actif."""
-    update_asset(data, ticker, in_dca=True, quantite_dca_mensuelle=quantite_dca_mensuelle)
-
-
-def demote_to_watchlist(data: dict, ticker: str) -> None:
-    """Sort un actif du DCA sans le supprimer -- il redevient un candidat suivi."""
-    update_asset(data, ticker, in_dca=False, quantite_dca_mensuelle=0.0)
-
-
-def get_dca_assets(data: dict) -> list[Asset]:
-    return [a for a in _assets(data) if a.in_dca]
-
-
-def get_watchlist_assets(data: dict) -> list[Asset]:
-    return [a for a in _assets(data) if not a.in_dca]
-
-
-def sync_watchlist_with_portfolio(data: dict, portfolio_df, ticker_resolver=None) -> int:
-    """Ajoute automatiquement en watchlist tout actif détenu dans le
-    portefeuille (df issu de build_assets_df) mais absent de assets.json.
-    Ne touche jamais aux actifs déjà présents -- statut DCA, quantité,
-    analyse restent tels quels, y compris si l'actif a été vendu depuis.
-    `ticker_resolver` (ex. data.yfinance_ticker_for) convertit le symbole
-    du portefeuille en ticker yfinance si les deux diffèrent.
-    Renvoie le nombre d'actifs ajoutés."""
+    Ne touche jamais aux actifs déjà présents (DCA, quantité, analyse restent tels quels, y compris
+    si l'actif a été vendu depuis). Renvoie le nombre d'actifs ajoutés.
+    """
     if portfolio_df is None or portfolio_df.empty:
         return 0
 
     existing_tickers = {a["ticker"] for a in data["assets"]}
     added = 0
-    for symbol in portfolio_df["symbol"]:
-        ticker = ticker_resolver(symbol) if ticker_resolver else symbol
+    for _, row in portfolio_df.iterrows():
+        ticker = yfinance_ticker_for(row)
         if ticker in existing_tickers:
             continue
-        add_asset(data, Asset(name=symbol, ticker=ticker, in_dca=False))
+        add_asset(data, Asset(name=row["symbol"], ticker=ticker, in_dca=False))
         existing_tickers.add(ticker)
         added += 1
     return added
 
 
-# --- Prix en EUR (yfinance) --------------------------------------------------
+def load_synced_assets(portfolio_df: pd.DataFrame) -> tuple[dict, int]:
+    """Charge les actifs suivis, y ajoute les nouveaux actifs détenus et sauvegarde si besoin.
 
-def _yahoo_symbol(ticker: str) -> str:
-    """Ticker de l'actif -> symbole Yahoo Finance. Le suffixe ".US" (convention
-    courtier : BSX.US) n'existe pas chez Yahoo, où les actions US n'ont pas de
-    suffixe : BSX.US -> BSX. Les autres tickers (SAN.PA, ETH-USD...) passent tels quels."""
-    return ticker[:-3] if ticker.endswith(".US") else ticker
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fx_rate_to_eur(currency: str) -> float | None:
-    if currency == "EUR":
-        return 1.0
-    try:
-        hist = yf.Ticker(f"{currency}EUR=X").history(period="5d", interval="1d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-    except Exception:
-        pass
-    return None
+    Renvoie (données, nombre d'actifs ajoutés).
+    """
+    assets_data = load_assets_data()
+    added = sync_watchlist_with_portfolio(assets_data, portfolio_df)
+    if added:
+        save_assets_data(assets_data)
+    return assets_data, added
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_price_eur(ticker: str) -> float | None:
-    """Dernier prix connu, converti en EUR. None si indisponible."""
-    try:
-        t = yf.Ticker(_yahoo_symbol(ticker))
-        fast = t.fast_info
-        price = fast.get("lastPrice") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        currency = (fast.get("currency") if hasattr(fast, "get") else getattr(fast, "currency", None)) or "USD"
-        if price is None:
-            hist = t.history(period="5d", interval="1d")
-            if hist.empty:
-                return None
-            price = float(hist["Close"].iloc[-1])
-        rate = _fx_rate_to_eur(currency)
-        if rate is None:
-            return None
-        return float(price) * rate
-    except Exception:
-        return None
+def attach_tags(df: pd.DataFrame, assets_data: dict) -> pd.DataFrame:
+    """Copie de `df` avec une colonne `tags` (liste), recherchée par ticker puis par symbole."""
+    tag_map = {a["ticker"]: a.get("tags", []) for a in assets_data["assets"]}
+
+    def tags_for(row: pd.Series) -> list:
+        for key in (row.get("ticker"), row.get("symbol")):
+            if key in tag_map:
+                return tag_map[key]
+        return []
+
+    out = df.copy()
+    out["tags"] = [tags_for(row) for _, row in out.iterrows()]
+    return out
+
 
 ################################################################################
-# Dossier : dashboard
-# Fichier : assets_view.py
-# Chemin relatif : assets_view.py
+# Dossier : dashboard/portfolio
+# Fichier : config.py
+# Chemin relatif : portfolio/config.py
 ################################################################################
 
-"""Section Streamlit Actifs : DCA actif + Watchlist. À appeler depuis app.py :
-
-    from assets_data import load_assets_data
-    from assets_view import render_assets_section
-    ...
-    assets_data_ = load_assets_data()
-    render_assets_section(assets_data_)
-"""
+"""Constantes et chemins partagés par tout le dashboard."""
 from __future__ import annotations
 
-import hashlib
-import json
-import re
 from pathlib import Path
 
-import pandas as pd
-import streamlit as st
-
-from assets_data import (
-    ANALYST_SCHEMA,
-    FINANCIAL_SCHEMA,
-    Asset,
-    add_asset,
-    demote_to_watchlist,
-    get_dca_assets,
-    get_price_eur,
-    get_watchlist_assets,
-    promote_to_dca,
-    remove_asset,
-    save_assets_data,
-    update_asset,
-    update_thesis,
-)
-
-
-def render_assets_section(assets_data: dict) -> None:
-    _render_dca_section(assets_data)
-    st.divider()
-    _render_watchlist_section(assets_data)
-    st.divider()
-    _render_add_form(assets_data)
-
-
-# --- Carte par actif --------------------------------------------------------
-
-def _load_thesis(analysis_path: str) -> tuple[dict | None, str | None]:
-    """Charge la thèse pointée par analysis_path. Renvoie (json_dict, None)
-    si un .json structuré (généré par md_to_thesis_json.py) est trouvé --
-    soit directement, soit à côté d'un .md de même nom -- sinon
-    (None, texte_markdown_brut), sinon (None, None) si rien n'est lisible."""
-    if not analysis_path:
-        return None, None
-    path = Path(analysis_path)
-
-    json_path = path if path.suffix == ".json" else path.with_suffix(".json")
-    if json_path.exists():
-        try:
-            return json.loads(json_path.read_text(encoding="utf-8")), None
-        except Exception:
-            pass
-
-    if path.exists():
-        try:
-            return None, path.read_text(encoding="utf-8")
-        except Exception:
-            pass
-
-    return None, None
-
-
-def _has_content(block: dict | None) -> bool:
-    """Un bloc au schéma fixe existe toujours : il a du contenu si une valeur est non nulle."""
-    return any(v is not None for v in (block or {}).values())
-
-
-def _thesis_for(a: Asset) -> tuple[dict | None, str | None]:
-    """Thèse stockée dans assets.json en priorité ; sinon repli sur l'ancien
-    fichier pointé par analysis_path (JSON généré ou markdown)."""
-    own = {
-        "thesis": a.thesis,
-        "invalidation_scenario": a.invalidation_scenario,
-        "donnees_financieres": a.donnees_financieres,
-        "avis_analystes": a.avis_analystes,
-    }
-    if a.thesis or a.invalidation_scenario or _has_content(a.donnees_financieres) or _has_content(a.avis_analystes):
-        return own, None
-    return _load_thesis(a.analysis_path)
-
-
-_EMPTY = "—"
-
-
-def _num(v, dec: int = 1, suffix: str = "", signed: bool = False) -> str:
-    """Format français : 1 234,5 — et « — » si la valeur est absente."""
-    if v is None:
-        return _EMPTY
-    if isinstance(v, str):
-        return v
-    txt = f"{v:+,.{dec}f}" if signed else f"{v:,.{dec}f}"
-    return txt.replace(",", "\u202f").replace(".", ",") + suffix
-
-
-def _table(rows: list[dict], columns: list[str]) -> None:
-    """Affiche un tableau en ignorant les lignes entièrement vides."""
-    rows = [r for r in rows if any(r[c] != _EMPTY for c in columns[1:])]
-    if rows:
-        st.dataframe(pd.DataFrame(rows, columns=columns), hide_index=True, use_container_width=True)
-
-
-def _render_financial_data(d: dict) -> None:
-    dev = d.get("devise_cours") or ""
-    md = f" Md {dev}".rstrip()
-
-    if d.get("date_donnees"):
-        st.caption(f"Données au {d['date_donnees']}")
-
-    left, right = st.columns(2)
-
-    # --- Gauche : valorisation / rentabilité cash + comptes ------------------
-    with left:
-        st.markdown("**Valorisation & rentabilité cash**")
-        cols = ["Indicateur", "12 derniers mois", "2026 (prév.)", "2027 (prév.)"]
-        cap = d.get("capitalisation_md")
-
-        def _fcf_yield(fcf):
-            return fcf / cap * 100 if fcf is not None and cap else None
-
-        def _conversion(fcf, net):
-            return fcf / net * 100 if fcf is not None and net else None
-
-        fcf = {"ttm": d.get("fcf_ttm_md"), "2026": d.get("fcf_2026_md"), "2027": d.get("fcf_2027_md")}
-        val = [
-            ("P/E", d.get("pe_ttm"), d.get("pe_2026"), d.get("pe_2027"), 1, "x"),
-            ("EV / EBITDA", d.get("ev_ebitda_ttm"), d.get("ev_ebitda_2026"), d.get("ev_ebitda_2027"), 1, "x"),
-            ("EV / CA", None, d.get("ev_ca_2026"), d.get("ev_ca_2027"), 2, "x"),
-            ("Free cash flow", fcf["ttm"], fcf["2026"], fcf["2027"], 1, md),
-            ("Rendement FCF", _fcf_yield(fcf["ttm"]), _fcf_yield(fcf["2026"]), _fcf_yield(fcf["2027"]), 1, " %"),
-            ("FCF / résultat net", None,
-             _conversion(fcf["2026"], d.get("resultat_net_2026_md")),
-             _conversion(fcf["2027"], d.get("resultat_net_2027_md")), 0, " %"),
-        ]
-        _table(
-            [{"Indicateur": lbl, cols[1]: _num(t, dec, unit), cols[2]: _num(y1, dec, unit), cols[3]: _num(y2, dec, unit)}
-             for lbl, t, y1, y2, dec, unit in val],
-            cols,
-        )
-        st.caption("Rendement FCF = free cash flow / capitalisation. Conversion = free cash flow / résultat net.")
-
-        st.markdown("**Comptes**")
-        yearly = [
-            ("Résultat net", "resultat_net_{y}_md", 1, md),
-            ("Dette nette", "endettement_net_{y}_md", 1, md),
-        ]
-        years = ("2026", "2027")
-        _table(
-            [{"Indicateur": lbl, **{y: _num(d.get(k.format(y=y)), dec, unit) for y in years}}
-             for lbl, k, dec, unit in yearly],
-            ["Indicateur", *years],
-        )
-
-    # --- Droite : performance vs pairs + profil ----------------------------
-    with right:
-        st.markdown("**Performance**")
-        perf = []
-        for lbl, k in (("1 an", "perf_1an"), ("3 ans", "perf_3ans")):
-            a, p = d.get(f"{k}_pct"), d.get(f"{k}_moyenne_pairs_pct")
-            perf.append({
-                "Période": lbl,
-                "Actif": _num(a, 1, " %", signed=True),
-                "Moy. pairs": _num(p, 1, " %", signed=True),
-                "Écart": _num(a - p, 1, " pts", signed=True) if a is not None and p is not None else _EMPTY,
-            })
-        _table(perf, ["Période", "Actif", "Moy. pairs", "Écart"])
-
-        st.markdown("**Profil**")
-        prod = d.get("produit_principal")
-        profile = [
-            ("Valeur d'entreprise", _num(d.get("valeur_entreprise_md"), 1, md)),
-            ("Flottant", _num(d.get("flottant_pct"), 1, " %")),
-            ("Produit principal", prod or _EMPTY),
-            ("… part du CA", _num(d.get("part_produit_principal_ca_pct"), 1, " %")),
-            ("… croissance dernier trim.", _num(d.get("croissance_produit_principal_dernier_trimestre_cer_pct"), 1, " %", signed=True)),
-            ("Part USD du CA", _num(d.get("part_usd_ca_pct"), 1, " %")),
-            ("Croissance CA dernier trim.", _num(d.get("croissance_ca_dernier_trimestre_cer_pct"), 1, " %", signed=True)),
-            ("Croissance BNPA dernier trim.", _num(d.get("croissance_bnpa_dernier_trimestre_cer_pct"), 1, " %", signed=True)),
-            ("Guidance croissance 2026", d.get("guidance_croissance_2026") or _EMPTY),
-        ]
-        _table([{"Indicateur": a, "Valeur": b} for a, b in profile], ["Indicateur", "Valeur"])
-
-
-def _render_analysts(avis: dict) -> None:
-    if not any(v is not None for v in avis.values()):
-        return
-    st.markdown("**Avis analystes**")
-    cols = ["Recommandation", "Objectif de cours", "Potentiel", "Nb d'analystes"]
-    _table(
-        [{
-            cols[0]: avis.get("recommandation") or _EMPTY,
-            cols[1]: _num(avis.get("objectif_cours"), 2),
-            cols[2]: _num(avis.get("potentiel_pct"), 1, " %", signed=True),
-            cols[3]: _num(avis.get("nb_analystes"), 0),
-        }],
-        cols,
-    )
-
-
-def _render_thesis_json(thesis: dict) -> None:
-    donnees = thesis.get("donnees_financieres") or {}
-    if any(v is not None for v in donnees.values()):
-        st.markdown("**Données financières**")
-        _render_financial_data(donnees)
-
-    _render_analysts(thesis.get("avis_analystes") or {})
-
-    if thesis.get("thesis"):
-        st.markdown("**Thèse**")
-        st.markdown(thesis["thesis"])
-
-    if thesis.get("invalidation_scenario"):
-        st.markdown("**🚩 Scénario d'invalidation**")
-        st.markdown(thesis["invalidation_scenario"])
-
-
-def _parse_field(raw: str, kind: str):
-    """Champ vide -> None ; texte -> texte ; nombre -> int ou float
-    (virgule décimale acceptée). Lève ValueError si le nombre est invalide."""
-    raw = raw.strip()
-    if raw == "":
-        return None
-    if kind == "str":
-        return raw
-    cleaned = raw.replace(",", ".").replace(" ", "").replace("\u202f", "")
-    if re.fullmatch(r"-?\d+", cleaned):
-        return int(cleaned)
-    return float(cleaned)
-
-
-def _block_inputs(prefix: str, schema: dict, values: dict, ticker: str, ver: str) -> dict:
-    """Un champ par clé du schéma (3 colonnes). Renvoie les textes saisis."""
-    raw = {}
-    cols = st.columns(3)
-    for i, (key, kind) in enumerate(schema.items()):
-        v = values.get(key)
-        raw[key] = cols[i % 3].text_input(
-            key.replace("_", " "),
-            value="" if v is None else str(v),
-            key=f"{prefix}_{ticker}_{key}_{ver}",
-            help=("texte" if kind == "str" else "nombre") + " -- vide = non renseigné",
-        )
-    return raw
-
-
-def _render_thesis_editor(assets_data: dict, a: Asset) -> None:
-    """Édition d'un actif depuis sa carte : thèse, données financières et avis
-    analystes (champs du schéma fixe), ou import d'un JSON. Tout est écrit
-    dans le fichier JSON de l'actif."""
-    base, _ = _thesis_for(a)
-    base = base or {}
-
-    # Les clés de widgets changent quand le contenu stocké change : les champs
-    # se rafraîchissent après un import / une édition du fichier à la main.
-    ver_thesis = hashlib.md5(
-        (base.get("thesis", "") + base.get("invalidation_scenario", "")).encode("utf-8")
-    ).hexdigest()[:8]
-    ver_data = hashlib.md5(
-        json.dumps([a.name, a.donnees_financieres, a.avis_analystes], sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()[:8]
-
-    with st.expander("✏️ Éditer", expanded=False):
-        tab_thesis, tab_data, tab_import = st.tabs(["Thèse", "Données", "Import JSON"])
-
-        # --- Thèse + scénario d'invalidation ---
-        with tab_thesis:
-            with st.form(f"thesis_form_{a.ticker}"):
-                thesis = st.text_area(
-                    "Thèse d'investissement (markdown accepté)",
-                    value=base.get("thesis", ""),
-                    height=220,
-                    key=f"thesis_txt_{a.ticker}_{ver_thesis}",
-                )
-                invalidation = st.text_area(
-                    "🚩 Scénario d'invalidation",
-                    value=base.get("invalidation_scenario", ""),
-                    height=110,
-                    key=f"thesis_inv_{a.ticker}_{ver_thesis}",
-                    help="Ce qui te ferait sortir de la position / abandonner la thèse.",
-                )
-                thesis_submitted = st.form_submit_button("💾 Enregistrer la thèse")
-            if thesis_submitted:
-                payload = {"thesis": thesis, "invalidation_scenario": invalidation}
-                # Migration douce : on reprend données/avis de l'ancien fichier
-                # d'analyse (clés du schéma uniquement) si l'actif n'en a pas encore.
-                for name, schema in (("donnees_financieres", FINANCIAL_SCHEMA), ("avis_analystes", ANALYST_SCHEMA)):
-                    if not _has_content(getattr(a, name)) and isinstance(base.get(name), dict):
-                        legacy = {k: v for k, v in base[name].items() if k in schema}
-                        if legacy:
-                            payload[name] = legacy
-                update_thesis(assets_data, a.ticker, payload)
-                save_assets_data(assets_data)
-                st.rerun()
-
-        # --- Nom + données financières + avis analystes (schéma fixe) ---
-        with tab_data:
-            with st.form(f"data_form_{a.ticker}"):
-                new_name = st.text_input("Nom", value=a.name, key=f"name_{a.ticker}_{ver_data}")
-                st.markdown("**Données financières**")
-                raw_fin = _block_inputs("fin", FINANCIAL_SCHEMA, a.donnees_financieres, a.ticker, ver_data)
-                st.markdown("**Avis analystes**")
-                raw_avis = _block_inputs("avis", ANALYST_SCHEMA, a.avis_analystes, a.ticker, ver_data)
-                data_submitted = st.form_submit_button("💾 Enregistrer les données")
-            if data_submitted:
-                errors, parsed = [], {}
-                for name, schema, raw in (
-                    ("donnees_financieres", FINANCIAL_SCHEMA, raw_fin),
-                    ("avis_analystes", ANALYST_SCHEMA, raw_avis),
-                ):
-                    parsed[name] = {}
-                    for key, kind in schema.items():
-                        try:
-                            parsed[name][key] = _parse_field(raw[key], kind)
-                        except ValueError:
-                            errors.append(f"- **{key}** : nombre invalide (« {raw[key]} »)")
-                if not new_name.strip():
-                    errors.append("- **Nom** : ne peut pas être vide")
-                if errors:
-                    st.error("Rien n'a été enregistré :\n" + "\n".join(errors))
-                else:
-                    update_asset(assets_data, a.ticker, name=new_name.strip())
-                    update_thesis(assets_data, a.ticker, parsed)
-                    save_assets_data(assets_data)
-                    st.rerun()
-
-        # --- Import d'un JSON complet ---
-        with tab_import:
-            st.caption("Colle un JSON (thesis, invalidation_scenario, donnees_financieres, avis_analystes) : "
-                       "seules les clés fournies sont modifiées.")
-            raw_json = st.text_area("JSON", height=140, key=f"thesis_import_{a.ticker}_{ver_data}_{ver_thesis}",
-                                    label_visibility="collapsed")
-            if st.button("📥 Importer le JSON", key=f"thesis_import_btn_{a.ticker}"):
-                try:
-                    update_thesis(assets_data, a.ticker, json.loads(raw_json))
-                except (ValueError, json.JSONDecodeError) as e:
-                    st.error(f"Import impossible : {e}")
-                else:
-                    save_assets_data(assets_data)
-                    st.rerun()
-
-
-def _render_asset_card(assets_data: dict, a: Asset, price: float | None, montant: float | None = None) -> None:
-    """Une carte par actif : nom/ticker, prix bien visible, éventuellement
-    le montant DCA/mois, et la thèse d'investissement dépliable."""
-    with st.container(border=True):
-        col_head, col_price = st.columns([3, 1])
-        with col_head:
-            st.markdown(f"**{a.name}** · `{a.ticker}`")
-            if montant is not None:
-                st.caption(f"{a.quantite_dca_mensuelle:g} / mois ≈ {montant:,.2f} €/mois")
-            elif a.in_dca:
-                st.caption(f"{a.quantite_dca_mensuelle:g} / mois -- montant non estimable")
-        with col_price:
-            if price is not None:
-                st.markdown(f"### {price:,.2f} €")
-            else:
-                st.markdown("### —")
-                st.caption("prix indisponible")
-
-        thesis_json, thesis_md = _thesis_for(a)
-        label = "📄 Thèse d'investissement"
-        if a.last_analysis_update:
-            label += f" (màj {a.last_analysis_update})"
-        with st.expander(label, expanded=False):
-            if thesis_json:
-                _render_thesis_json(thesis_json)
-            elif thesis_md:
-                st.markdown(thesis_md)
-            elif a.analysis_path:
-                st.caption(f"Fichier introuvable : {a.analysis_path}")
-            else:
-                st.caption("Aucune thèse renseignée.")
-
-        _render_thesis_editor(assets_data, a)
-
-
-# --- DCA actif ----------------------------------------------------------------
-
-def _render_dca_section(assets_data: dict) -> None:
-    st.subheader("💶 DCA actif")
-    dca_assets = get_dca_assets(assets_data)
-
-    if not dca_assets:
-        st.info("Aucun actif en DCA pour l'instant.")
-        return
-
-    priced = []
-    for a in dca_assets:
-        price = get_price_eur(a.ticker)
-        montant = a.quantite_dca_mensuelle * price if price is not None else None
-        priced.append((a, price, montant))
-
-    total = sum(m for _, _, m in priced if m is not None)
-    if any(m is None for _, _, m in priced):
-        st.caption("⚠️ Prix indisponible pour au moins un actif -- total calculé hors actifs concernés.")
-    st.metric("Total DCA mensuel", f"{total:,.0f} €")
-
-    for a, price, montant in priced:
-        _render_asset_card(assets_data, a, price, montant)
-
-    with st.expander("Gérer les positions DCA"):
-        ticker = st.selectbox("Actif", options=[a.ticker for a in dca_assets], key="dca_manage_select")
-        current_qty = next(a.quantite_dca_mensuelle for a in dca_assets if a.ticker == ticker)
-        current_price = get_price_eur(ticker)
-
-        col1, col2 = st.columns(2)
-        new_qty = col1.number_input(
-            "Nouvelle quantité mensuelle",
-            min_value=0.0, step=0.0001, format="%.6f",
-            value=current_qty,
-            key="dca_manage_qty",
-        )
-        if current_price is not None:
-            col1.caption(f"≈ {new_qty * current_price:,.2f} € au prix actuel ({current_price:,.2f} €)")
-        else:
-            col1.caption("Prix actuel indisponible -- montant non estimable.")
-
-        if col1.button("Mettre à jour la quantité"):
-            update_asset(assets_data, ticker, quantite_dca_mensuelle=new_qty)
-            save_assets_data(assets_data)
-            st.rerun()
-        if col2.button("↩️ Repasser en watchlist"):
-            demote_to_watchlist(assets_data, ticker)
-            save_assets_data(assets_data)
-            st.rerun()
-
-
-# --- Watchlist ------------------------------------------------------------
-
-def _render_watchlist_section(assets_data: dict) -> None:
-    st.subheader("👀 Watchlist")
-    candidates = get_watchlist_assets(assets_data)
-
-    if not candidates:
-        st.caption("Aucun candidat en watchlist.")
-        return
-
-    for a in candidates:
-        price = get_price_eur(a.ticker)
-        _render_asset_card(assets_data, a, price)
-
-    with st.expander("Promouvoir un candidat vers le DCA"):
-        ticker = st.selectbox("Candidat", options=[a.ticker for a in candidates], key="watchlist_promote_select")
-        price = get_price_eur(ticker)
-        quantite = st.number_input(
-            "Quantité DCA mensuelle", min_value=0.0, step=0.0001, format="%.6f",
-            key="watchlist_promote_qty",
-        )
-        if price is not None:
-            st.caption(f"≈ {quantite * price:,.2f} € au prix actuel ({price:,.2f} €)")
-        else:
-            st.caption("Prix actuel indisponible -- montant non estimable.")
-
-        col1, col2 = st.columns(2)
-        if col1.button("✅ Ajouter au DCA"):
-            promote_to_dca(assets_data, ticker, quantite)
-            save_assets_data(assets_data)
-            st.rerun()
-        if col2.button("🗑️ Retirer de la watchlist"):
-            remove_asset(assets_data, ticker)
-            save_assets_data(assets_data)
-            st.rerun()
-
-
-# --- Ajout d'un nouvel actif ---------------------------------------------
-
-def _render_add_form(assets_data: dict) -> None:
-    st.markdown("##### ➕ Ajouter un actif")
-    with st.form("asset_add_form", clear_on_submit=True):
-        name = st.text_input("Nom")
-        ticker = st.text_input("Ticker (format yfinance)").strip().upper()
-        in_dca = st.radio("Destination", options=["Watchlist", "DCA actif"], horizontal=True) == "DCA actif"
-        quantite = (
-            st.number_input("Quantité DCA mensuelle", min_value=0.0, step=0.0001, format="%.6f")
-            if in_dca else 0.0
-        )
-        analysis_path = st.text_input("Chemin de l'analyse (optionnel)")
-        thesis = st.text_area("Thèse d'investissement (optionnel)", height=160)
-        invalidation = st.text_area("🚩 Scénario d'invalidation (optionnel)", height=90)
-        submitted = st.form_submit_button("Ajouter")
-
-    if submitted:
-        if not name or not ticker:
-            st.error("Nom et ticker sont obligatoires.")
-            return
-        try:
-            add_asset(assets_data, Asset(
-                name=name,
-                ticker=ticker,
-                in_dca=in_dca,
-                analysis_path=analysis_path,
-                quantite_dca_mensuelle=quantite,
-            ))
-            if thesis.strip() or invalidation.strip():
-                update_thesis(assets_data, ticker, {"thesis": thesis, "invalidation_scenario": invalidation})
-            save_assets_data(assets_data)
-            st.success(f"{ticker} ajouté.")
-            st.rerun()
-        except ValueError as e:
-            st.error(str(e))
-
-################################################################################
-# Dossier : dashboard
-# Fichier : cash_data.py
-# Chemin relatif : cash_data.py
-################################################################################
-
-"""Chargement/sauvegarde du cashflow personnel (salaire, dépenses fixes et
-ponctuelles, soldes réels de compte), persistant dans data/cash.json --
-séparé de dashboard.json qui, lui, est en lecture seule (pipeline Rust)."""
-from __future__ import annotations
-
-
-from datetime import date
-
-import pandas as pd
-
-import json
-from pathlib import Path
-
-from config import ROOT_DIR
-
-CASH_PATH = ROOT_DIR / "data" / "cash.json"
-
-DEFAULT_CASH_DATA = {
-    "salaire_net_mensuel": 0.0,
-    "depenses_fixes": [],       # [{"nom": str, "montant": float}]
-    "depenses_ponctuelles": [], # [{"nom": str, "montant": float, "date": "YYYY-MM-DD"}]
-    "soldes_reels": [],         # [{"mois": "YYYY-MM", "solde": float}] -- saisi à la main chaque mois
+# --- Chemins ---
+# dashboard/portfolio/ (ce fichier) -> dashboard/ -> racine du projet, où vivent data/ et .env.
+# On part de l'emplacement du fichier plutôt que du cwd : ça marche d'où que `streamlit run` soit lancé.
+DASHBOARD_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = DASHBOARD_DIR.parent
+
+DATA_PATH = ROOT_DIR / "data" / "dashboard.json"
+HISTORY_PATH = ROOT_DIR / "data" / "history.json"
+ASSETS_DIR = ROOT_DIR / "data" / "assets"                # un fichier JSON par actif
+LEGACY_ASSETS_PATH = ROOT_DIR / "data" / "assets.json"   # ancien format (tous les actifs dans un fichier)
+
+# --- Positions de poussière ---
+# Les positions détenues dont la valeur actuelle est inférieure à ce seuil (EUR) sont masquées
+# des tableaux et graphiques. Les totaux (KPIs, historique) les incluent toujours.
+MIN_POSITION_VALUE_EUR = 30.0
+
+# --- Discipline ---
+WEEKLY_TRADE_QUOTA = 4
+
+# --- Fenêtres de corrélation (labels côté Rust) ---
+DEFAULT_WINDOW_ORDER = ["90d", "6m", "1y"]
+WINDOW_LABELS = {"90d": "3 mois (90j)", "6m": "6 mois (180j)", "1y": "1 an (365j)"}
+
+# --- Benchmarks toujours affichés dans la corrélation ---
+BENCHMARK_TICKERS = {
+    "MSCI China": "MCHI",
+    "CAC 40": "^FCHI",
+    "S&P 500": "^GSPC",
+    "Or": "GC=F",
+    "Argent": "SI=F",
+    "NVIDIA": "NDVA",
+    "Indice Dollar": "DX-Y.NYB",
+    "NASDAQ": "^NDX",
+    "SU.FR": "SU.PA",
 }
+BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())
 
 
-def load_cash_data(path: Path = CASH_PATH) -> dict:
-    if not path.exists():
-        return {k: (v.copy() if isinstance(v, list) else v) for k, v in DEFAULT_CASH_DATA.items()}
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for key, default in DEFAULT_CASH_DATA.items():
-        data.setdefault(key, default if not isinstance(default, list) else default.copy())
-    return data
+################################################################################
+# Dossier : dashboard/portfolio
+# Fichier : correlation.py
+# Chemin relatif : portfolio/correlation.py
+################################################################################
 
+"""Page Corrélation : matrices pré-calculées par le pipeline Rust (`correlation_matrices` de
+dashboard.json), corrélations par actif, regroupement automatique (clustering) et variation
+d'une paire d'actifs selon la fenêtre temporelle.
 
-def save_cash_data(data: dict, path: Path = CASH_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-
-
-"""Capacité d'investissement mensuelle.
-
-Pour chaque mois M :
-
-    flux(M)      = salaire net - dépenses fixes - dépenses ponctuelles(M)
-    solde_fin(M) = dernier checkpoint réel du mois si il y en a un,
-                   sinon solde_fin(M-1) + flux(M)   (projection)
-    capacité(M)  = solde_fin(M)  = épargne de départ + flux du mois
-
-Autrement dit : ce qu'il y a sur le compte au départ + ce que le mois
-rapporte net. Un checkpoint réel « recale » la chaîne, donc l'erreur des
-dépenses approximatives ne se cumule jamais au-delà du prochain checkpoint.
-
-Conventions (identiques à celles de la page Cashflow) :
-- le dernier checkpoint d'un mois vaut solde de fin de mois ;
-- pas de lissage : une capacité nulle ou négative reste affichée telle quelle ;
-- entre deux checkpoints, la projection suppose qu'aucun investissement
-  n'est sorti du compte (le checkpoint suivant le reflétera).
+Le clustering regroupe les actifs par similarité de comportement, sans classification a priori :
+deux actifs très corrélés finissent dans le même groupe peu importe leur type (Action/Crypto/...).
 """
-
-
-COLUMNS = [
-    "mois", "epargne_depart", "salaire", "fixes", "ponctuelles",
-    "flux", "capacite", "source", "ecart",
-]
-
-
-def _ponctuelles_par_mois(ponctuelles: pd.DataFrame | None) -> pd.Series:
-    if ponctuelles is None or ponctuelles.empty:
-        return pd.Series(dtype=float)
-    df = ponctuelles.dropna(subset=["date"]).copy()
-    df["montant"] = pd.to_numeric(df["montant"], errors="coerce").fillna(0.0)
-    df["mois"] = pd.to_datetime(df["date"]).dt.to_period("M")
-    return df.groupby("mois")["montant"].sum()
-
-
-def _checkpoints_par_mois(soldes: pd.DataFrame | None) -> pd.Series:
-    """Dernier checkpoint de chaque mois (valeur de fin de mois)."""
-    if soldes is None or soldes.empty:
-        return pd.Series(dtype=float)
-    df = soldes.dropna(subset=["date", "solde"]).copy()
-    if df.empty:
-        return pd.Series(dtype=float)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
-    df["mois"] = df["date"].dt.to_period("M")
-    return df.groupby("mois")["solde"].last().astype(float)
-
-
-def compute_monthly_capacity(
-    salaire: float,
-    total_fixes: float,
-    ponctuelles: pd.DataFrame | None,
-    soldes: pd.DataFrame | None,
-    horizon_mois: int = 3,
-    today: date | None = None,
-) -> pd.DataFrame:
-    """Une ligne par mois, du premier checkpoint jusqu'à `horizon_mois` mois
-    après le mois courant (ou uniquement à partir du mois courant s'il n'y a
-    aucun checkpoint).
-
-    Colonnes : mois, epargne_depart, salaire, fixes, ponctuelles, flux,
-    capacite, source ("Réel" | "Projeté" | "Flux seul"), ecart.
-    `ecart` = solde réel - solde estimé, uniquement pour les mois avec checkpoint
-    ayant un mois précédent connu.
-    """
-    current = pd.Timestamp(today or date.today()).to_period("M")
-    ponct = _ponctuelles_par_mois(ponctuelles)
-    checkpoints = _checkpoints_par_mois(soldes)
-
-    if checkpoints.empty:
-        start, end = current, current + horizon_mois
-    else:
-        start = checkpoints.index.min()
-        end = max(current + horizon_mois, checkpoints.index.max())
-
-    rows = []
-    prev_fin: float | None = None  # solde de fin du mois précédent (None = inconnu)
-
-    for m in pd.period_range(start, end, freq="M"):
-        depenses_ponct = float(ponct.get(m, 0.0))
-        flux = float(salaire) - float(total_fixes) - depenses_ponct
-
-        ecart = None
-        if m in checkpoints.index:
-            solde_fin = float(checkpoints[m])
-            source = "Réel"
-            if prev_fin is not None:
-                ecart = solde_fin - (prev_fin + flux)
-        elif prev_fin is not None:
-            solde_fin = prev_fin + flux
-            source = "Projeté"
-        else:  # aucun checkpoint du tout : on ne connaît que le flux
-            solde_fin = None
-            source = "Flux seul"
-
-        rows.append({
-            "mois": str(m),
-            "epargne_depart": prev_fin,
-            "salaire": float(salaire),
-            "fixes": float(total_fixes),
-            "ponctuelles": depenses_ponct,
-            "flux": flux,
-            "capacite": solde_fin if solde_fin is not None else flux,
-            "source": source,
-            "ecart": ecart,
-        })
-        prev_fin = solde_fin
-
-    df = pd.DataFrame(rows, columns=COLUMNS)
-    df[["epargne_depart", "ecart"]] = df[["epargne_depart", "ecart"]].astype(float)  # None -> NaN
-    return df
-
-################################################################################
-# Dossier : dashboard
-# Fichier : cash_perf.py
-# Chemin relatif : cash_perf.py
-################################################################################
-
-"""Performance incluant le cash disponible (XTB). Lecture seule de history.json / dashboard.json."""
-from __future__ import annotations
-
-import pandas as pd
-
-COLUMNS = ["date", "stocks", "cash", "contrib", "equity", "gain_eur", "cash_share", "twr_index"]
-
-
-def equity_frame(history: list[dict]) -> pd.DataFrame:
-    """Une ligne par snapshot : titres, cash, apports nets, gain total, indice TWR."""
-    rows = []
-    for e in history:
-        stocks = sum(a["value_eur"] for a in e.get("assets", []) if a["kind"] == "Stock")
-        rows.append(
-            {
-                "date": pd.to_datetime(e["date"]),
-                "stocks": stocks,
-                "cash": e.get("cash_eur", 0.0),
-                "contrib": e.get("net_contributions_eur", 0.0),
-            }
-        )
-    if not rows:
-        return pd.DataFrame(columns=COLUMNS)
-
-    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
-    df["equity"] = df["stocks"] + df["cash"]
-    df["gain_eur"] = df["equity"] - df["contrib"]
-    df["cash_share"] = (df["cash"] / df["equity"]).where(df["equity"] > 0, 0.0)
-    df["twr_index"] = _twr_index(df)
-    return df
-
-
-def _twr_index(df: pd.DataFrame) -> pd.Series:
-    """Valeur de la part (base 1.0) : seuls les flux externes sont neutralisés.
-
-    Hypothèse : un apport arrive en fin de semaine, donc le rendement de la
-    semaine t est (equity_t - flux_t) / equity_{t-1} - 1. Approximation correcte
-    à pas hebdomadaire, un peu pessimiste si l'apport est investi en début de semaine.
-    """
-    nav, out = 1.0, []
-    for i in range(len(df)):
-        if i > 0 and df.at[i - 1, "equity"] > 0:
-            flow = df.at[i, "contrib"] - df.at[i - 1, "contrib"]
-            nav *= (df.at[i, "equity"] - flow) / df.at[i - 1, "equity"]
-        out.append(nav)
-    return pd.Series(out, index=df.index)
-
-
-def current_kpis(dashboard: dict) -> dict:
-    """Valeur totale, cash, gain et rendement simple à date (depuis dashboard.json)."""
-    cash = dashboard["cash"]["total"]
-    equity = dashboard["stocks_value_eur"] + cash["cash_eur"]
-    contrib = cash["net_contributions_eur"]
-    gain = equity - contrib
-    return {
-        "equity_eur": equity,
-        "cash_eur": cash["cash_eur"],
-        "cash_share": cash["cash_eur"] / equity if equity > 0 else 0.0,
-        "net_contributions_eur": contrib,
-        "gain_eur": gain,
-        "return_pct": gain / contrib * 100 if contrib > 0 else None,
-    }
-
-################################################################################
-# Dossier : dashboard
-# Fichier : charts.py
-# Chemin relatif : charts.py
-################################################################################
-
-"""KPIs en en-tête + graphiques d'allocation/P&L + tableau détaillé."""
-from __future__ import annotations
-
-import pandas as pd
-import plotly.express as px
-import streamlit as st
-
-from data import format_display_df
-from theme import GAIN_COLOR, LOSS_COLOR
-
-
-def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
-    st.title("📈 Mon Portefeuille")
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Valeur Totale", f"{kpis['total_value_eur']:,.2f} €")
-    col2.metric("Cost Basis", f"{kpis['total_cost_basis_eur']:,.2f} €")
-    col3.metric("P&L Latent", f"{kpis['total_pnl_latent_eur']:,.2f} €")
-    col4.metric("P&L Réalisé", f"{kpis['total_pnl_realized_eur']:,.2f} €")
-    col5.metric(
-        "P&L Total",
-        f"{kpis['total_pnl_eur']:,.2f} €",
-        help="Latent + réalisé",
-    )
-
-    if global_kpis is not None:
-        g1, g2, g3 = st.columns(3)
-        g1.metric("Titres + crypto + cash", f"{global_kpis['equity_eur']:,.2f} €")
-        g2.metric(
-            "Cash XTB disponible",
-            f"{global_kpis['cash_eur']:,.2f} €",
-            f"{global_kpis['cash_share'] * 100:.0f} % du total",
-            delta_color="off",
-        )
-        ret = global_kpis["return_pct"]
-        g3.metric(
-            "Performance globale (cash inclus)",
-            f"{ret:+.2f} %" if ret is not None else "n/a",
-            f"{global_kpis['gain_eur']:+,.2f} €",
-            help="(P&L latent + réalisé + dividendes nets) / (cost basis des lots ouverts + cash XTB). "
-                 "Le cash Binance n'est pas suivi.",
-        )
-    else:
-        invested = kpis.get("total_invested_eur") or kpis["total_cost_basis_eur"]
-        pnl_pct_global = kpis["total_pnl_eur"] / invested * 100 if invested > 0 else 0
-        st.metric("Performance Globale (hors cash)", f"{pnl_pct_global:+.2f} %")
-
-def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = None) -> None:
-    df_perf = df if df_perf is None else df_perf
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("🥧 Allocation du Portefeuille")
-        fig_pie = px.pie(
-            df,
-            values="value_eur",
-            names="symbol",
-            hole=0.4,
-        )
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-        # --- Export CSV : ticker + % d'allocation uniquement (pas de prix) ---
-        total_value = float(df["value_eur"].sum())
-        alloc_df = (
-            df[["symbol", "value_eur"]]
-            .assign(allocation_pct=lambda d: d["value_eur"] / total_value * 100 if total_value > 0 else 0.0)
-            .drop(columns="value_eur")
-            .rename(columns={"symbol": "ticker"})
-            .sort_values("allocation_pct", ascending=False)
-            .reset_index(drop=True)
-        )
-        # Arrondi pour éviter les bruits flottants
-        alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)
-
-        st.download_button(
-            label="📥 Télécharger l'allocation (CSV)",
-            data=alloc_df.to_csv(index=False).encode("utf-8"),
-            file_name="allocation.csv",
-            mime="text/csv",
-            help="Ticker et pourcentage d'allocation uniquement — aucune donnée de prix.",
-        )
-
-    with col_right:
-        st.subheader("📊 P&L total par Actif (EUR, latent + réalisé)")
-        fig_bar = px.bar(
-            df_perf,
-            x="symbol",
-            y="pnl_total_eur",
-            color="pnl_color",
-            color_discrete_map={"Gain": GAIN_COLOR, "Perte": LOSS_COLOR},
-            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"},
-        )
-        fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-def render_positions_table(df: pd.DataFrame) -> None:
-    st.subheader("📋 Détail des positions")
-    df_display = format_display_df(df)
-    st.dataframe(
-        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis",
-                    "P&L latent", "P&L réalisé", "P&L total", "Perf. totale (%)"]],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-################################################################################
-# Dossier : dashboard
-# Fichier : clustering.py
-# Chemin relatif : clustering.py
-################################################################################
-
-"""Regroupement automatique des actifs par similarité de comportement
-(corrélation), sans classification a priori -- deux actifs très corrélés
-finissent dans le même groupe peu importe leur type (Action/Crypto/...)."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from scipy.spatial.distance import squareform
 
-import plotly.graph_objects as go
+from portfolio.config import BENCHMARK_LABELS, DEFAULT_WINDOW_ORDER, MIN_POSITION_VALUE_EUR, WINDOW_LABELS
+from portfolio.data import filter_small_positions, load_portfolio
+from portfolio.theme import BG_COLOR, GRID_COLOR, PASTEL_DARK_SEQUENCE
 
-from theme import PASTEL_DARK_SEQUENCE
 
+# --- Clustering (logique pure) ------------------------------------------------------
 
 def distance_matrix(corr_matrix: pd.DataFrame) -> np.ndarray:
     """d = sqrt(2 * (1 - corr)) -- vraie métrique, contrairement à 1 - corr
-    qui ne respecte pas l'inégalité triangulaire."""
-    # CORRECTION ICI : on remplace les NaN par 0 avant de clipper.
-    # Un NaN (données insuffisantes) est considéré comme "décorrélé" (0),
-    # ce qui donne la distance maximale (sqrt(2)) entre les deux actifs.
+    qui ne respecte pas l'inégalité triangulaire.
+
+    Un NaN (données insuffisantes) est traité comme « décorrélé » (0) : distance maximale
+    sqrt(2) entre les deux actifs.
+    """
     corr = corr_matrix.fillna(0).clip(-1, 1)
-    
     dist = np.sqrt(2 * (1 - corr.values))
     np.fill_diagonal(dist, 0.0)
     return (dist + dist.T) / 2  # symétrise (absorbe les arrondis flottants)
+
 
 def compute_linkage(corr_matrix: pd.DataFrame, method: str = "average") -> np.ndarray:
     """Linkage hiérarchique scipy à partir de la matrice de corrélation."""
@@ -1422,13 +941,7 @@ def assign_clusters(corr_matrix: pd.DataFrame, linkage_matrix: np.ndarray, n_clu
     return pd.Series(labels, index=corr_matrix.columns, name="cluster")
 
 
-def cluster_table(cluster_labels: pd.Series) -> pd.DataFrame:
-    """Une ligne par groupe, avec la liste des actifs qu'il contient."""
-    grouped = cluster_labels.groupby(cluster_labels).apply(lambda s: ", ".join(sorted(s.index)))
-    return pd.DataFrame({"Groupe": grouped.index, "Actifs": grouped.values})
-
-
-def render_dendrogram(corr_matrix: pd.DataFrame, linkage_matrix: np.ndarray) -> go.Figure:
+def dendrogram_figure(corr_matrix: pd.DataFrame, linkage_matrix: np.ndarray) -> go.Figure:
     """Dendrogramme interactif -- scipy calcule la géométrie, plotly l'affiche."""
     dendro = dendrogram(linkage_matrix, labels=corr_matrix.columns.tolist(), no_plot=True)
     icoord = np.array(dendro["icoord"])
@@ -1453,39 +966,26 @@ def render_dendrogram(corr_matrix: pd.DataFrame, linkage_matrix: np.ndarray) -> 
     return fig
 
 
-def cluster_summary(
-    cluster_labels: pd.Series,
-    df: pd.DataFrame,
-    total_portfolio_value: float,
-) -> pd.DataFrame:
-    """Une ligne par groupe contenant des actifs du portefeuille, avec :
-    - la liste des actifs détenus,
-    - la valeur totale, le cost basis, le P&L (€), le P&L (%),
-    - le poids du groupe dans le portefeuille global.
+def cluster_summary(cluster_labels: pd.Series, df: pd.DataFrame, total_portfolio_value: float) -> pd.DataFrame:
+    """Une ligne par groupe contenant des actifs du portefeuille, avec la liste des actifs
+    détenus, la valeur, le cost basis, le P&L (€ et %) et le poids dans le portefeuille global.
 
-    Les actifs non détenus (benchmarks comme les indices ou matières premières)
-    sont totalement ignorés. Les groupes ne contenant aucun actif réel
-    n'apparaissent pas dans le résumé."""
+    Les actifs non détenus (benchmarks : indices, matières premières) sont ignorés ; un groupe
+    sans actif réel n'apparaît pas dans le résumé.
+    """
     df_indexed = df.set_index("symbol")
     rows = []
 
     for cluster_id in sorted(cluster_labels.unique()):
         symbols_in_cluster = cluster_labels[cluster_labels == cluster_id].index.tolist()
-        
-        # On ne garde QUE les actifs qui sont réellement dans le portefeuille
         portfolio_assets = [s for s in symbols_in_cluster if s in df_indexed.index]
-
         if not portfolio_assets:
-            # Si le groupe ne contient que des benchmarks (hors portefeuille), on l'ignore
             continue
 
         sub = df_indexed.loc[portfolio_assets]
         value = float(sub["value_eur"].sum())
         cost = float(sub["cost_basis_eur"].sum())
         pnl = float(sub["pnl_eur"].sum())
-
-        pnl_pct = (pnl / cost * 100) if cost > 0 else 0.0
-        weight = (value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
 
         rows.append({
             "Groupe": int(cluster_id),
@@ -1494,11 +994,12 @@ def cluster_summary(
             "Valeur (€)": value,
             "Cost Basis (€)": cost,
             "P&L (€)": pnl,
-            "P&L (%)": pnl_pct,
-            "% Portefeuille": weight,
+            "P&L (%)": (pnl / cost * 100) if cost > 0 else 0.0,
+            "% Portefeuille": (value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0,
         })
 
     return pd.DataFrame(rows)
+
 
 def format_cluster_summary(summary: pd.DataFrame) -> pd.DataFrame:
     """Version formatée pour st.dataframe."""
@@ -1510,95 +1011,24 @@ def format_cluster_summary(summary: pd.DataFrame) -> pd.DataFrame:
     disp["% Portefeuille"] = disp["% Portefeuille"].apply(lambda x: f"{x:.2f} %")
     return disp
 
-################################################################################
-# Dossier : dashboard
-# Fichier : config.py
-# Chemin relatif : config.py
-################################################################################
 
-"""Constantes et chemins partagés par tout le dashboard."""
-from __future__ import annotations
+# --- Sélection ------------------------------------------------------------------
 
-from pathlib import Path
+def _has_window(correlation_matrices: dict, window: str) -> bool:
+    return bool(correlation_matrices) and window in correlation_matrices
 
 
-# --- Racine du projet ---
-# dashboard/ (ce fichier) est un sous-dossier de la racine, où vivent
-# data/ et .env. On part de l'emplacement du fichier plutôt que du cwd
-# pour que ça marche peu importe d'où `streamlit run` est lancé.
-DASHBOARD_DIR = Path(__file__).resolve().parent
-ROOT_DIR = DASHBOARD_DIR.parent
+def _correlation_subset(
+    correlation_matrices: dict, window: str, eligible_symbols: set[str], min_assets: int,
+) -> pd.DataFrame:
+    """Sous-matrice pré-calculée (Rust) restreinte aux symboles éligibles ; vide si < min_assets.
 
-
-
-# --- Chemins ---
-DATA_PATH = ROOT_DIR / "data" / "dashboard.json"
-HISTORY_PATH = ROOT_DIR / "data" / "history.json"
-
-# --- Positions de poussière ---
-# Les positions détenues dont la valeur actuelle est inférieure à ce seuil (EUR) sont masquées
-# des tableaux et graphiques. Les totaux (KPIs, historique) les incluent toujours.
-MIN_POSITION_VALUE_EUR = 30.0
-WEEKLY_TRADE_QUOTA = 4
-# --- Fenêtres de corrélation ---
-# Mapping label de fenêtre (côté Rust) -> période acceptée par yfinance
-WINDOW_TO_YF_PERIOD = {"90d": "3mo", "6m": "6mo", "1y": "1y"}
-DEFAULT_WINDOW_ORDER = ["90d", "6m", "1y"]
-
-# --- Benchmarks toujours affichés dans la corrélation ---
-BENCHMARK_TICKERS = {
-    "MSCI China": "MCHI",
-    "CAC 40": "^FCHI",
-    "S&P 500": "^GSPC",
-    "Or": "GC=F",
-    "Argent": "SI=F",
-    "NVIDIA": "NDVA",
-    "Indice Dollar" :"DX-Y.NYB",
-    "NASDAQ": "^NDX",
-    "SU.FR": "SU.PA",
-}
-BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())
-
-################################################################################
-# Dossier : dashboard
-# Fichier : correlation.py
-# Chemin relatif : correlation.py
-################################################################################
-
-"""Matrice de corrélation (pré-calculée côté Rust, ou recalculée en direct
-via Yahoo Finance quand l'utilisateur ajoute des tickers ad hoc), et vue
-par actif."""
-from __future__ import annotations
-
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-import streamlit as st
-import yfinance as yf
-from clustering import assign_clusters, cluster_summary, cluster_table, compute_linkage, format_cluster_summary, render_dendrogram
-from config import BENCHMARK_LABELS, BENCHMARK_TICKERS, DEFAULT_WINDOW_ORDER, WINDOW_TO_YF_PERIOD
-from data import yfinance_ticker_for
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_returns(tickers: tuple[str, ...], period: str = "3mo") -> pd.DataFrame:
-    """Télécharge les clôtures quotidiennes Yahoo Finance pour `tickers` et
-    renvoie les rendements journaliers (une colonne par ticker). Les
-    tickers introuvables sont simplement absents du résultat plutôt que
-    de faire échouer tout le calcul."""
-    prices = {}
-    for ticker in tickers:
-        try:
-            hist = yf.Ticker(ticker).history(period=period, interval="1d")
-            if not hist.empty:
-                prices[ticker] = hist["Close"]
-        except Exception:
-            continue
-    if not prices:
-        return pd.DataFrame()
-    price_df = pd.concat(prices, axis=1)
-    price_df.index = price_df.index.tz_localize(None)
-    return price_df.pct_change().dropna(how="all")
+    Les paires sans signal arrivent en `null` -> NaN pandas, pas en 0.0 : ne jamais les re-remplir
+    avec .fillna(0), sous peine de présenter une absence de données comme une décorrélation.
+    """
+    full_corr = pd.DataFrame(correlation_matrices[window])
+    kept = [s for s in full_corr.columns if s in eligible_symbols]
+    return full_corr.loc[kept, kept] if len(kept) >= min_assets else pd.DataFrame()
 
 
 def _select_window(correlation_matrices: dict) -> str:
@@ -1608,198 +1038,19 @@ def _select_window(correlation_matrices: dict) -> str:
             + [w for w in correlation_matrices if w not in DEFAULT_WINDOW_ORDER]
         )
         return st.selectbox("Fenêtre temporelle", options=available_windows, index=0)
-    return "90d"
+    return DEFAULT_WINDOW_ORDER[0]
 
 
-def _compute_corr_matrix(
-    df: pd.DataFrame,
-    correlation_matrices: dict,
-    selected_window: str,
-    eligible_symbols: set[str],
-    
-) -> tuple[pd.DataFrame, str | None]:
-    yf_period = WINDOW_TO_YF_PERIOD.get(selected_window, "3mo")
-
-    if correlation_matrices and selected_window in correlation_matrices:
-        # Cas nominal : on réutilise la matrice pré-calculée par le Rust pour
-        # la fenêtre sélectionnée, en filtrant selon le seuil de valeur.
-        # Les paires sans signal suffisant arrivent en `null` -> NaN pandas,
-        # pas en 0.0 : ne jamais les re-remplir avec .fillna(0), sous peine
-        # de recréer le bug (absence de données affichée comme décorrélation).
-        full_corr = pd.DataFrame(correlation_matrices[selected_window])
-        kept = [s for s in full_corr.columns if s in eligible_symbols]
-        corr_matrix = full_corr.loc[kept, kept] if len(kept) >= 2 else pd.DataFrame()
-        return corr_matrix, f"Corrélation pré-calculée (pipeline Rust, fenêtre={selected_window})"
-
-    return pd.DataFrame(), None
-
-
-def _render_full_matrix(corr_matrix: pd.DataFrame, source_note: str | None, selected_window: str) -> None:
-    if corr_matrix.empty or corr_matrix.shape[1] < 2:
-        st.info("Données insuffisantes pour calculer la corrélation (moins de 2 actifs après filtrage).")
-        return
-
-    st.caption(source_note)
-
-    fig_corr = px.imshow(
-        corr_matrix,
-        text_auto=".2f",
-        color_continuous_scale="RdBu_r",
-        zmin=-1, zmax=1,
-        title=f"Corrélation des rendements journaliers ({selected_window})",
-    )
-    fig_corr.update_layout(
-        height=600,
-        margin=dict(t=50, b=0, l=0, r=0),
-        xaxis_title="Actifs",
-        yaxis_title="Actifs",
-    )
-    st.plotly_chart(fig_corr, use_container_width=True)
-
-    n_missing = int(corr_matrix.isna().sum().sum())
-    if n_missing:
-        st.caption(f"⬜ Cases vides : {n_missing} paire(s) sans assez de données communes pour calculer un coefficient.")
-
-    st.markdown("""
-    **Comment lire cette matrice ?**
-    - 🔴 **Rouge (proche de 1)** : Les actifs bougent ensemble (mauvaise diversification).
-    - ⚪ **Blanc (proche de 0)** : Aucune corrélation (idéal pour stabiliser).
-    - 🔵 **Bleu (proche de -1)** : Corrélation négative (vrais couvre-risques).
-    - ▪️ **Case vide** : pas assez de données communes pour calculer un coefficient (à ne pas lire comme "décorrélé").
-    """)
-
-def _render_clusters(
-    correlation_matrices: dict,
-    selected_window: str,
-    eligible_symbols: set[str],
-    df: pd.DataFrame,
-    total_portfolio_value: float,
-) -> None:
-    st.subheader(f"🧩 Groupes automatiques ({selected_window})")
-
-    if not (correlation_matrices and selected_window in correlation_matrices):
-        st.info("Données insuffisantes pour calculer les groupes.")
-        return
-
-    full_corr = pd.DataFrame(correlation_matrices[selected_window])
-    kept = [s for s in full_corr.columns if s in eligible_symbols]
-    corr_matrix = full_corr.loc[kept, kept] if len(kept) >= 3 else pd.DataFrame()
-
-    if corr_matrix.empty:
-        st.info("Au moins 3 actifs sont nécessaires pour former des groupes.")
-        return
-
-    max_clusters = len(corr_matrix.columns) - 1
-    n_clusters = st.slider(
-        "Nombre de groupes",
-        min_value=2,
-        max_value=max_clusters,
-        value=min(4, max_clusters),
-    )
-
-    linkage_matrix = compute_linkage(corr_matrix)
-    cluster_labels = assign_clusters(corr_matrix, linkage_matrix, n_clusters)
-
-    st.plotly_chart(render_dendrogram(corr_matrix, linkage_matrix), use_container_width=True)
-    st.caption(
-        "Plus deux actifs fusionnent bas dans l'arbre, plus leur comportement "
-        "historique est proche -- indépendamment de leur type (Action/Crypto/...)."
-    )
-
-    # --- Récap par groupe avec métriques financières ---
-    summary = cluster_summary(cluster_labels, df, total_portfolio_value)
-
-    if summary.empty:
-        st.info("Aucun actif du portefeuille trouvé dans les groupes.")
-        return
-
-    # Multiselect pour agréger les groupes souhaités
-    group_options = summary["Groupe"].tolist()
-    selected_groups = st.multiselect(
-        "Sélectionner les groupes à agréger",
-        options=group_options,
-        default=group_options,
-        help="Les KPIs et graphiques ci-dessous ne prennent en compte que les groupes sélectionnés.",
-    )
-
-    st.markdown("##### Détail par groupe")
-    st.dataframe(
-        format_cluster_summary(summary),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    if not selected_groups:
-        st.info("Sélectionne au moins un groupe pour voir l'agrégat.")
-        return
-
-    sel = summary[summary["Groupe"].isin(selected_groups)].copy()
-    total_sel_value = float(sel["Valeur (€)"].sum())
-    total_sel_cost = float(sel["Cost Basis (€)"].sum())
-    total_sel_pnl = float(sel["P&L (€)"].sum())
-    sel_perf = (total_sel_pnl / total_sel_cost * 100) if total_sel_cost > 0 else 0.0
-    sel_weight = (total_sel_value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
-
-    # --- KPIs agrégés ---
-    st.markdown("##### 📊 Agrégat des groupes sélectionnés")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Valeur agrégée", f"{total_sel_value:,.2f} €")
-    c2.metric("Cost Basis agrégé", f"{total_sel_cost:,.2f} €")
-    c3.metric("P&L agrégé", f"{total_sel_pnl:+,.2f} €")
-    c4.metric("Performance agrégée", f"{sel_perf:+.2f} %")
-    c5.metric("% du portefeuille", f"{sel_weight:.2f} %")
-
-    # --- Graphiques : poids dans le portefeuille + performance par groupe ---
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.markdown("##### 🥧 Poids de chaque groupe dans le portefeuille")
-        fig_pie = px.pie(
-            sel,
-            values="Valeur (€)",
-            names="Groupe",
-            hole=0.4,
-        )
-        fig_pie.update_traces(
-            textposition="inside",
-            textinfo="percent+label",
-        )
-        fig_pie.update_layout(
-            showlegend=False,
-            margin=dict(t=0, b=0, l=0, r=0),
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    with col_right:
-        st.markdown("##### 📊 Performance par groupe (P&L %)")
-        fig_bar = px.bar(
-            sel,
-            x="Groupe",
-            y="P&L (%)",
-            color="P&L (%)",
-            color_continuous_scale="RdYlGn",
-            range_color=[-max(abs(sel["P&L (%)"].min()), abs(sel["P&L (%)"].max())) * 1.1,
-                         max(abs(sel["P&L (%)"].min()), abs(sel["P&L (%)"].max())) * 1.1],
-            text=sel["P&L (%)"].apply(lambda v: f"{v:+.2f} %"),
-        )
-        fig_bar.update_traces(textposition="outside")
-        fig_bar.update_layout(
-            margin=dict(t=0, b=0, l=0, r=0),
-            coloraxis_showscale=False,
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+# --- Rendu ----------------------------------------------------------------------
 
 def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible_symbols: set[str]) -> None:
     st.subheader(f"🔗 Corrélations par actif ({selected_window})")
 
-    if not (correlation_matrices and selected_window in correlation_matrices):
+    if not _has_window(correlation_matrices, selected_window):
         st.info("Données insuffisantes pour calculer la corrélation.")
         return
 
-    full_corr = pd.DataFrame(correlation_matrices[selected_window])
-    kept = [s for s in full_corr.columns if s in eligible_symbols]
-    corr_matrix_asset = full_corr.loc[kept, kept] if len(kept) >= 2 else pd.DataFrame()
-
+    corr_matrix_asset = _correlation_subset(correlation_matrices, selected_window, eligible_symbols, min_assets=2)
     if corr_matrix_asset.empty:
         st.info("Données insuffisantes après filtrage.")
         return
@@ -1807,9 +1058,7 @@ def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible
     selected_asset = st.selectbox("Choisir un actif", options=corr_matrix_asset.columns.tolist())
     full_series = corr_matrix_asset[selected_asset].drop(selected_asset)
 
-    # Avant le patch Rust, les paires sans données arrivaient en 0.0 --
-    # indiscernables d'une vraie décorrélation. Elles arrivent maintenant en
-    # NaN : on les retire du graphe plutôt que de les afficher comme des 0.
+    # Les paires sans données arrivent en NaN : on les retire du graphe plutôt que de les afficher comme des 0.
     corr_series = full_series.dropna().sort_values(ascending=True)
     missing = full_series[full_series.isna()].index.tolist()
 
@@ -1830,7 +1079,6 @@ def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible
         text=[f"{v:+.2f}" for v in corr_series.values],
         textposition="outside",
     ))
-
     fig_corr_asset.update_layout(
         title=f"Corrélation de {selected_asset} avec les autres actifs",
         xaxis_title="Coefficient de corrélation",
@@ -1849,8 +1097,105 @@ def _render_per_asset(correlation_matrices: dict, selected_window: str, eligible
         st.caption(f"⚠️ Non calculable (données insuffisantes) : {', '.join(sorted(missing))}")
 
 
+def _render_clusters(
+    correlation_matrices: dict,
+    selected_window: str,
+    eligible_symbols: set[str],
+    df: pd.DataFrame,
+    total_portfolio_value: float,
+) -> None:
+    st.subheader(f"🧩 Groupes automatiques ({selected_window})")
+
+    if not _has_window(correlation_matrices, selected_window):
+        st.info("Données insuffisantes pour calculer les groupes.")
+        return
+
+    corr_matrix = _correlation_subset(correlation_matrices, selected_window, eligible_symbols, min_assets=3)
+    if corr_matrix.empty:
+        st.info("Au moins 3 actifs sont nécessaires pour former des groupes.")
+        return
+
+    max_clusters = len(corr_matrix.columns) - 1
+    n_clusters = st.slider(
+        "Nombre de groupes",
+        min_value=2,
+        max_value=max_clusters,
+        value=min(4, max_clusters),
+    )
+
+    linkage_matrix = compute_linkage(corr_matrix)
+    cluster_labels = assign_clusters(corr_matrix, linkage_matrix, n_clusters)
+
+    st.plotly_chart(dendrogram_figure(corr_matrix, linkage_matrix), use_container_width=True)
+    st.caption(
+        "Plus deux actifs fusionnent bas dans l'arbre, plus leur comportement "
+        "historique est proche -- indépendamment de leur type (Action/Crypto/...)."
+    )
+
+    # --- Récap par groupe avec métriques financières ---
+    summary = cluster_summary(cluster_labels, df, total_portfolio_value)
+    if summary.empty:
+        st.info("Aucun actif du portefeuille trouvé dans les groupes.")
+        return
+
+    group_options = summary["Groupe"].tolist()
+    selected_groups = st.multiselect(
+        "Sélectionner les groupes à agréger",
+        options=group_options,
+        default=group_options,
+        help="Les KPIs et graphiques ci-dessous ne prennent en compte que les groupes sélectionnés.",
+    )
+
+    st.markdown("##### Détail par groupe")
+    st.dataframe(format_cluster_summary(summary), use_container_width=True, hide_index=True)
+
+    if not selected_groups:
+        st.info("Sélectionne au moins un groupe pour voir l'agrégat.")
+        return
+
+    sel = summary[summary["Groupe"].isin(selected_groups)].copy()
+    total_sel_value = float(sel["Valeur (€)"].sum())
+    total_sel_cost = float(sel["Cost Basis (€)"].sum())
+    total_sel_pnl = float(sel["P&L (€)"].sum())
+    sel_perf = (total_sel_pnl / total_sel_cost * 100) if total_sel_cost > 0 else 0.0
+    sel_weight = (total_sel_value / total_portfolio_value * 100) if total_portfolio_value > 0 else 0.0
+
+    st.markdown("##### 📊 Agrégat des groupes sélectionnés")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Valeur agrégée", f"{total_sel_value:,.2f} €")
+    c2.metric("Cost Basis agrégé", f"{total_sel_cost:,.2f} €")
+    c3.metric("P&L agrégé", f"{total_sel_pnl:+,.2f} €")
+    c4.metric("Performance agrégée", f"{sel_perf:+.2f} %")
+    c5.metric("% du portefeuille", f"{sel_weight:.2f} %")
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown("##### 🥧 Poids de chaque groupe dans le portefeuille")
+        fig_pie = px.pie(sel, values="Valeur (€)", names="Groupe", hole=0.4)
+        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+        fig_pie.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_right:
+        st.markdown("##### 📊 Performance par groupe (P&L %)")
+        bound = max(abs(sel["P&L (%)"].min()), abs(sel["P&L (%)"].max())) * 1.1
+        fig_bar = px.bar(
+            sel,
+            x="Groupe",
+            y="P&L (%)",
+            color="P&L (%)",
+            color_continuous_scale="RdYlGn",
+            range_color=[-bound, bound],
+            text=sel["P&L (%)"].apply(lambda v: f"{v:+.2f} %"),
+        )
+        fig_bar.update_traces(textposition="outside")
+        fig_bar.update_layout(margin=dict(t=0, b=0, l=0, r=0), coloraxis_showscale=False)
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+
 def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
-    """Point d'entrée appelé par app.py pour tout le bloc corrélation."""
+    """Corrélations par actif + groupes automatiques, sur les positions `df` et les benchmarks."""
     st.subheader("🔥 Matrice de corrélation")
 
     correlation_matrices = data.get("correlation_matrices", {})
@@ -1862,10 +1207,7 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
         help="Filtre uniquement tes positions -- les indices/matières premières de référence restent toujours affichés.",
     )
     eligible_symbols = set(df.loc[df["value_eur"] >= min_value_eur, "symbol"]) | BENCHMARK_LABELS
-    """
-    corr_matrix, source_note = _compute_corr_matrix(...)
-    _render_full_matrix(...)
-    """
+
     st.divider()
     _render_per_asset(correlation_matrices, selected_window, eligible_symbols)
 
@@ -1873,19 +1215,98 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
     _render_clusters(
         correlation_matrices,
         selected_window,
-        eligible_symbols - BENCHMARK_LABELS,   # <- clustering sur tes positions uniquement
+        eligible_symbols - BENCHMARK_LABELS,  # clustering sur les positions uniquement
         df,
         data["total_value_eur"],
     )
 
 
+def render_window_variation(correlation_matrices: dict) -> None:
+    """Évolution du coefficient de corrélation d'une paire d'actifs d'une fenêtre à l'autre."""
+    st.subheader("📈 Variation de corrélation entre deux actifs")
+    st.caption(
+        "Compare le coefficient de corrélation de deux actifs sur les différentes fenêtres temporelles "
+        "pour voir si leur relation se renforce ou s'affaiblit avec le temps."
+    )
+
+    windows = [w for w in DEFAULT_WINDOW_ORDER if w in correlation_matrices]
+    if not windows:
+        st.info("Données de corrélation indisponibles. Lance le pipeline Rust (`cargo run`).")
+        return
+
+    all_assets = sorted({asset for w in windows for asset in correlation_matrices[w]})
+    if len(all_assets) < 2:
+        st.info("Pas assez d'actifs pour comparer.")
+        return
+
+    col1, col2 = st.columns(2)
+    asset_a = col1.selectbox("Actif A", all_assets, index=0)
+    asset_b = col2.selectbox("Actif B", all_assets, index=1)
+
+    if asset_a == asset_b:
+        st.warning("Sélectionne deux actifs différents pour voir leur corrélation.")
+        return
+
+    # Structure d'une matrice : { "90d": { "BTC": { "ETH": 0.8 } } }
+    points = [
+        (WINDOW_LABELS[w], correlation_matrices[w].get(asset_a, {}).get(asset_b))
+        for w in windows
+    ]
+    points = [(label, v) for label, v in points if v is not None]
+    if not points:
+        st.info(f"Corrélation non calculable entre {asset_a} et {asset_b} (données historiques insuffisantes).")
+        return
+
+    labels, values = zip(*points)
+    fig = go.Figure(go.Scatter(
+        x=list(labels),
+        y=list(values),
+        mode="lines+markers+text",
+        text=[f"{v:.2f}" for v in values],
+        textposition="top center",
+        line=dict(color=PASTEL_DARK_SEQUENCE[0], width=3, shape="spline"),
+        marker=dict(size=10, color=PASTEL_DARK_SEQUENCE[2], line=dict(width=2, color=BG_COLOR)),
+    ))
+    fig.update_layout(
+        title=f"Évolution de la corrélation : {asset_a} vs {asset_b}",
+        xaxis_title="Fenêtre temporelle",
+        yaxis_title="Coefficient de corrélation",
+        yaxis=dict(range=[-1.1, 1.1], dtick=0.5),
+        height=450,
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+    fig.add_hline(y=0, line_color=GRID_COLOR, line_width=1, line_dash="dash")  # voir les décorrélations
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("""
+    **Comment l'interpréter ?**
+    - **Corrélation qui monte sur le long terme (1 an)** : Les actifs sont de plus en plus liés structurellement (ex: deux actions tech qui suivent le même secteur).
+    - **Corrélation qui baisse sur le long terme** : Les actifs se décorrelent, c'est excellent pour la diversification de ton portefeuille.
+    - **Corrélation négative** : L'actif B a tendance à monter quand l'actif A descend (couvre-risque).
+    """)
+
+
+def render_correlation_page() -> None:
+    st.title("🔗 Corrélations")
+
+    data, df = load_portfolio()
+    df = filter_small_positions(df, MIN_POSITION_VALUE_EUR)
+    if df.empty:
+        st.info(f"Aucune position d'au moins {MIN_POSITION_VALUE_EUR:.0f} €.")
+        st.stop()
+
+    render_correlation_section(df, data)
+    st.divider()
+    render_window_variation(data.get("correlation_matrices", {}))
+
+
 ################################################################################
-# Dossier : dashboard
+# Dossier : dashboard/portfolio
 # Fichier : data.py
-# Chemin relatif : data.py
+# Chemin relatif : portfolio/data.py
 ################################################################################
 
-"""Chargement du JSON généré par le pipeline Rust, et mise en forme."""
+"""Chargement de dashboard.json (pipeline Rust), DataFrame des positions et KPIs."""
 from __future__ import annotations
 
 import json
@@ -1894,80 +1315,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from config import DATA_PATH, HISTORY_PATH, MIN_POSITION_VALUE_EUR
+from portfolio.config import DATA_PATH, MIN_POSITION_VALUE_EUR
 
-
-CASH_KIND = "Cash"  # ajuste si besoin
-
-def compute_kpis(df: pd.DataFrame, exclude_cash: bool = True) -> dict:
-    """Recalcule les totaux globaux à partir du df filtré."""
-    scope = df[df["kind"] != CASH_KIND] if exclude_cash else df
-    total_value = float(scope["value_eur"].sum())
-    total_cost = float(scope["cost_basis_eur"].sum())
-    total_pnl_latent = float(scope["pnl_eur"].sum())
-    
-    # On récupère le P&L réalisé par actif (s'il existe dans le df)
-    total_pnl_realized = float(scope["realized_pnl_eur"].sum()) if "realized_pnl_eur" in scope.columns else 0.0
-    total_realized_cost = float(scope["realized_cost_eur"].sum()) if "realized_cost_eur" in scope.columns else 0.0
-
-    return {
-        "total_value_eur": total_value,
-        "total_cost_basis_eur": total_cost,
-        # Capital engagé : cost basis des lots ouverts + coût des lots déjà vendus.
-        "total_invested_eur": total_cost + total_realized_cost,
-        "total_pnl_latent_eur": total_pnl_latent,
-        "total_pnl_realized_eur": total_pnl_realized,
-        "total_pnl_eur": total_pnl_latent + total_pnl_realized,
-    }
-
-def compute_global_kpis(df_all: pd.DataFrame, data: dict) -> dict | None:
-    """Performance globale cash inclus (titres + crypto + cash XTB).
-
-    Gain = P&L latent + P&L réalisé (titres et crypto) + dividendes/intérêts nets des taxes.
-    Base = cost basis des lots ouverts + cash disponible : le cash dormant dilue la performance.
-
-    Volontairement indépendant des apports nets : (valeur + cash - apports) n'est juste que si
-    TOUT l'historique des versements est dans les exports (positions transférées, export qui ne
-    remonte pas à l'ouverture du compte... faussent le résultat).
-
-    Renvoie None si dashboard.json n'a pas encore les champs du patch cash (pas de crash).
-    """
-    cash = (data.get("cash") or {}).get("total")
-    if cash is None:
-        return None
-
-    k = compute_kpis(df_all)
-    cash_eur = float(cash["cash_eur"])
-    income = float(cash.get("income_net_eur", 0.0))
-    equity = k["total_value_eur"] + cash_eur
-    gain = k["total_pnl_eur"] + income
-    base = k["total_cost_basis_eur"] + cash_eur
-    return {
-        "equity_eur": equity,
-        "cash_eur": cash_eur,
-        "cash_share": cash_eur / equity if equity > 0 else 0.0,
-        "gain_eur": gain,
-        "return_pct": gain / base * 100 if base > 0 else None,
-        "income_net_eur": income,
-    }
-
-
-def filter_small_positions(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> pd.DataFrame:
-    """Écarte les lignes dont la valeur actuelle est inférieure au seuil (>= seuil conservé).
-
-    À réserver à l'AFFICHAGE : une position soldée (valeur 0) est aussi écartée, or elle porte
-    du P&L réalisé qui doit rester dans les totaux (voir `compute_kpis`).
-    """
-    return df[df["value_eur"] >= min_value_eur].copy()
-
-
-def small_positions_summary(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> tuple[int, float]:
-    """(nombre, valeur totale) des positions encore détenues mais sous le seuil.
-
-    Les positions soldées (valeur nulle) ne comptent pas : on ne les « possède » plus.
-    """
-    dust = df[(df["value_eur"] > 0) & (df["value_eur"] < min_value_eur)]
-    return int(len(dust)), float(dust["value_eur"].sum())
+CASH_KIND = "Cash"
 
 
 def load_data(path: Path = DATA_PATH) -> dict:
@@ -1992,8 +1342,15 @@ def build_assets_df(data: dict) -> pd.DataFrame:
     return df
 
 
+def load_portfolio() -> tuple[dict, pd.DataFrame]:
+    """(JSON brut, positions). La ligne de cash EUR est écartée : ni valeur de marché ni tags."""
+    data = load_data()
+    df = build_assets_df(data)
+    return data, df[~((df["kind"] == CASH_KIND) & (df["symbol"] == "EUR"))].copy()
+
+
 def yfinance_ticker_for(row: pd.Series) -> str:
-    """Résout le ticker Yahoo Finance à utiliser pour une position donnée."""
+    """Ticker Yahoo Finance d'une position (clé d'identification des actifs suivis)."""
     ticker = row.get("ticker")
     if isinstance(ticker, str) and ticker:
         return ticker
@@ -2002,33 +1359,118 @@ def yfinance_ticker_for(row: pd.Series) -> str:
     return row["symbol"]
 
 
-def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Renvoie une copie du DataFrame formatée pour l'affichage (st.dataframe)."""
-    df_display = df.copy()
-    df_display["quantity"] = df_display["quantity"].apply(lambda x: f"{x:,.4f}")
-    df_display["price_eur"] = df_display["price_eur"].apply(lambda x: f"{x:,.2f} €")
-    df_display["value_eur"] = df_display["value_eur"].apply(lambda x: f"{x:,.2f} €")
-    df_display["cost_basis_eur"] = df_display["cost_basis_eur"].apply(lambda x: f"{x:,.2f} €")
-    df_display["pnl_eur"] = df_display["pnl_eur"].apply(lambda x: f"{x:+,.2f} €")
-    df_display["pnl_pct"] = df_display["pnl_pct"].apply(lambda x: f"{x:+.2f} %")
-    df_display["realized_pnl_eur"] = df_display["realized_pnl_eur"].apply(lambda x: f"{x:+,.2f} €")
-    df_display["pnl_total_eur"] = df_display["pnl_total_eur"].apply(lambda x: f"{x:+,.2f} €")
-    df_display["pnl_total_pct"] = df_display["pnl_total_pct"].apply(lambda x: f"{x:+.2f} %")
+# --- KPIs ---------------------------------------------------------------------
 
-    return df_display.rename(columns={
-        "symbol": "Symbole",
-        "kind": "Type",
-        "quantity": "Quantité",
-        "price_eur": "Prix",
-        "value_eur": "Valeur",
-        "cost_basis_eur": "Cost Basis",
-        "pnl_eur": "P&L latent",
-        "pnl_pct": "Latent (%)",
-        "realized_pnl_eur": "P&L réalisé",
-        "pnl_total_eur": "P&L total",
-        "pnl_total_pct": "Perf. totale (%)",
-    })
+def compute_kpis(df: pd.DataFrame) -> dict:
+    """Totaux globaux (cash exclu) recalculés à partir du df, éventuellement filtré par tags."""
+    scope = df[df["kind"] != CASH_KIND]
+    total_value = float(scope["value_eur"].sum())
+    total_cost = float(scope["cost_basis_eur"].sum())
+    total_pnl_latent = float(scope["pnl_eur"].sum())
+    total_pnl_realized = float(scope["realized_pnl_eur"].sum())
+    total_realized_cost = float(scope["realized_cost_eur"].sum())
 
+    return {
+        "total_value_eur": total_value,
+        "total_cost_basis_eur": total_cost,
+        # Capital engagé : cost basis des lots ouverts + coût des lots déjà vendus.
+        "total_invested_eur": total_cost + total_realized_cost,
+        "total_pnl_latent_eur": total_pnl_latent,
+        "total_pnl_realized_eur": total_pnl_realized,
+        "total_pnl_eur": total_pnl_latent + total_pnl_realized,
+    }
+
+
+def compute_global_kpis(df_all: pd.DataFrame, data: dict) -> dict | None:
+    """Performance globale cash inclus (titres + crypto + cash XTB).
+
+    Gain = P&L latent + P&L réalisé (titres et crypto) + dividendes/intérêts nets des taxes.
+    Base = cost basis des lots ouverts + cash disponible : le cash dormant dilue la performance.
+
+    Volontairement indépendant des apports nets : (valeur + cash - apports) n'est juste que si
+    TOUT l'historique des versements est dans les exports (positions transférées, export qui ne
+    remonte pas à l'ouverture du compte... faussent le résultat).
+
+    Renvoie None si dashboard.json n'a pas encore les champs cash (pas de crash).
+    """
+    cash = (data.get("cash") or {}).get("total")
+    if cash is None:
+        return None
+
+    k = compute_kpis(df_all)
+    cash_eur = float(cash["cash_eur"])
+    income = float(cash.get("income_net_eur", 0.0))
+    equity = k["total_value_eur"] + cash_eur
+    gain = k["total_pnl_eur"] + income
+    base = k["total_cost_basis_eur"] + cash_eur
+    return {
+        "equity_eur": equity,
+        "cash_eur": cash_eur,
+        "cash_share": cash_eur / equity if equity > 0 else 0.0,
+        "gain_eur": gain,
+        "return_pct": gain / base * 100 if base > 0 else None,
+        "income_net_eur": income,
+    }
+
+
+# --- Positions de poussière -----------------------------------------------------
+
+def filter_small_positions(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> pd.DataFrame:
+    """Écarte les lignes dont la valeur actuelle est inférieure au seuil (>= seuil conservé).
+
+    À réserver à l'AFFICHAGE : une position soldée (valeur 0) est aussi écartée, or elle porte
+    du P&L réalisé qui doit rester dans les totaux (voir `compute_kpis`).
+    """
+    return df[df["value_eur"] >= min_value_eur].copy()
+
+
+def small_positions_summary(df: pd.DataFrame, min_value_eur: float = MIN_POSITION_VALUE_EUR) -> tuple[int, float]:
+    """(nombre, valeur totale) des positions encore détenues mais sous le seuil.
+
+    Les positions soldées (valeur nulle) ne comptent pas : on ne les « possède » plus.
+    """
+    dust = df[(df["value_eur"] > 0) & (df["value_eur"] < min_value_eur)]
+    return int(len(dust)), float(dust["value_eur"].sum())
+
+
+################################################################################
+# Dossier : dashboard/portfolio
+# Fichier : history.py
+# Chemin relatif : portfolio/history.py
+################################################################################
+
+"""Page Historique : courbe de la valeur totale et courbe du cost basis.
+
+Lit `data/history.json` (pipeline Rust, lecture seule). La logique pure
+(filtrage, stats, figure) est séparée du rendu Streamlit pour être testable.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from portfolio.config import DATA_PATH, HISTORY_PATH
+from portfolio.data import build_assets_df, compute_kpis, load_data
+from portfolio.theme import GAIN_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
+
+VALUE_COLOR = PASTEL_DARK_SEQUENCE[0]  # bleu
+COST_COLOR = PASTEL_DARK_SEQUENCE[2]   # jaune
+
+# Libellé -> nombre de jours affichés (None = tout l'historique).
+PERIODS: dict[str, int | None] = {
+    "1 mois": 31,
+    "3 mois": 92,
+    "6 mois": 183,
+    "1 an": 366,
+    "Tout": None,
+}
+
+
+# --- Chargement de history.json -------------------------------------------------
 
 HISTORY_REQUIRED_COLUMNS = {"date", "total_value_eur", "total_cost_basis_eur"}
 
@@ -2053,13 +1495,13 @@ def history_to_df(raw: list[dict]) -> pd.DataFrame:
         raise ValueError(f"history.json : colonne(s) manquante(s) : {', '.join(sorted(missing))}")
 
     df["date"] = pd.to_datetime(df["date"])
-    
+
     df["complete"] = df["complete"].fillna(True).astype(bool) if "complete" in df.columns else True
     if "total_pnl_eur" not in df.columns:
         df["total_pnl_eur"] = df["total_value_eur"] - df["total_cost_basis_eur"]
     if "assets" not in df.columns:
         df["assets"] = None
-       
+
     return (
         df.sort_values("date")
         .drop_duplicates(subset="date", keep="last")
@@ -2073,40 +1515,6 @@ def load_history(path: Path = HISTORY_PATH) -> pd.DataFrame | None:
         return None
     with open(path, "r", encoding="utf-8") as f:
         return history_to_df(json.load(f))
-
-################################################################################
-# Dossier : dashboard
-# Fichier : history_view.py
-# Chemin relatif : history_view.py
-################################################################################
-
-"""Page Historique : courbe de la valeur totale et courbe du cost basis.
-
-Lit `data/history.json` (pipeline Rust, lecture seule). La logique pure
-(filtrage, stats, figure) est séparée du rendu Streamlit pour être testable.
-"""
-from __future__ import annotations
-
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.io as pio
-import streamlit as st
-
-from config import DATA_PATH
-from data import build_assets_df, compute_kpis, load_data, load_history
-from theme import BG_COLOR, GAIN_COLOR, GRID_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE, TEXT_COLOR
-
-VALUE_COLOR = PASTEL_DARK_SEQUENCE[0]  # bleu
-COST_COLOR = PASTEL_DARK_SEQUENCE[2]   # jaune
-
-# Libellé -> nombre de jours affichés (None = tout l'historique).
-PERIODS: dict[str, int | None] = {
-    "1 mois": 31,
-    "3 mois": 92,
-    "6 mois": 183,
-    "1 an": 366,
-    "Tout": None,
-}
 
 
 # --- Logique pure ---------------------------------------------------------------
@@ -2212,17 +1620,6 @@ def asset_snapshot_df(assets: list[dict]) -> pd.DataFrame:
 
 # --- Rendu Streamlit ---------------------------------------------------------------
 
-def _ensure_dark_template() -> None:
-    if "portfolio_dark" not in pio.templates:
-        pio.templates["portfolio_dark"] = dict(
-            layout=dict(
-                paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-                xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
-            )
-        )
-    pio.templates.default = "portfolio_dark"
-
-
 def _live_kpis() -> dict | None:
     """KPIs du jour (même convention que la page d'accueil : cash exclu)."""
     if not DATA_PATH.exists():
@@ -2231,7 +1628,6 @@ def _live_kpis() -> dict | None:
 
 
 def render_history_page() -> None:
-    _ensure_dark_template()
     st.title("📈 Historique")
 
     try:
@@ -2303,17 +1699,18 @@ def render_history_page() -> None:
                 },
             )
 
+
 ################################################################################
-# Dossier : dashboard
-# Fichier : holding_view.py
-# Chemin relatif : holding_view.py
+# Dossier : dashboard/portfolio
+# Fichier : holding.py
+# Chemin relatif : portfolio/holding.py
 ################################################################################
 
 """Page Détention : durée de détention mise en regard de la performance.
 
 Lit `holdings`, `closed_sales` et `assets` dans dashboard.json (pipeline Rust,
 lecture seule). Logique pure (DataFrames, figures) séparée du rendu Streamlit,
-comme `history_view.py`.
+comme `history.py`.
 
 Vues :
 0. bandeau de KPI (âge moyen, plus vieux lot, capital jeune, lots, annualisé) ;
@@ -2332,12 +1729,11 @@ import math
 
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
 import streamlit as st
 
-from config import MIN_POSITION_VALUE_EUR
-from data import load_data
-from theme import BG_COLOR, GAIN_COLOR, GRID_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE, TEXT_COLOR
+from portfolio.config import MIN_POSITION_VALUE_EUR
+from portfolio.data import load_data
+from portfolio.theme import BG_COLOR, GAIN_COLOR, GRID_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
 
 # Sous ce seuil, une annualisation amplifie du bruit : on affiche « — ».
 MIN_DAYS_ANNUALIZED = 30
@@ -2831,15 +2227,6 @@ def style_closed_table(table: pd.DataFrame):
 
 # --- Rendu Streamlit ---------------------------------------------------------------
 
-def _ensure_dark_template() -> None:
-    if "portfolio_dark" not in pio.templates:
-        pio.templates["portfolio_dark"] = dict(layout=dict(
-            paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-            xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
-        ))
-    pio.templates.default = "portfolio_dark"
-
-
 def _render_kpis(kpis: dict) -> None:
     cols = st.columns(5)
     cols[0].metric("Âge moyen", format_days(kpis["avg_age_days"]),
@@ -2878,7 +2265,6 @@ def _render_trade_stats(stats: dict) -> None:
 
 
 def render_holding_page() -> None:
-    _ensure_dark_template()
     st.title("⏳ Durée de détention")
 
     data = load_data()
@@ -2991,731 +2377,244 @@ def render_holding_page() -> None:
             "connus), comptées dans « Incomplètes exclues ». Durées : lots vendus, pondérées par le capital."
         )
 
+
 ################################################################################
-# Dossier : dashboard
-# Fichier : intentions.py
-# Chemin relatif : intentions.py
+# Dossier : dashboard/portfolio
+# Fichier : home.py
+# Chemin relatif : portfolio/home.py
 ################################################################################
 
-"""Intentions de trade : on note l'idée d'abord, on n'exécute qu'après un délai de réflexion.
+"""Page d'accueil : KPIs en en-tête, tableau par tag, allocation, P&L par actif, détail des positions."""
+from __future__ import annotations
 
-Persistant dans data/intentions.json (écrit par le dashboard, jamais par le pipeline Rust).
-Le rapprochement avec les vrais trades (dashboard.json) est recalculé à chaque affichage :
-l'état « exécutée » n'est jamais stocké.
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
-Une intention : {id, created_at (UTC, ISO), symbol, kind ("Buy"|"Sell"), reason,
-delay_hours, cancelled_at (None ou ISO)}.
+from portfolio.theme import GAIN_COLOR, LOSS_COLOR
+
+
+# --- Mise en forme ------------------------------------------------------------
+
+def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Copie du DataFrame des positions formatée pour st.dataframe (colonnes renommées en français)."""
+    d = df.copy()
+    d["quantity"] = d["quantity"].apply(lambda x: f"{x:,.4f}")
+    for col in ("price_eur", "value_eur", "cost_basis_eur"):
+        d[col] = d[col].apply(lambda x: f"{x:,.2f} €")
+    for col in ("pnl_eur", "realized_pnl_eur", "pnl_total_eur"):
+        d[col] = d[col].apply(lambda x: f"{x:+,.2f} €")
+    for col in ("pnl_pct", "pnl_total_pct"):
+        d[col] = d[col].apply(lambda x: f"{x:+.2f} %")
+
+    return d.rename(columns={
+        "symbol": "Symbole",
+        "kind": "Type",
+        "quantity": "Quantité",
+        "price_eur": "Prix",
+        "value_eur": "Valeur",
+        "cost_basis_eur": "Cost Basis",
+        "pnl_eur": "P&L latent",
+        "pnl_pct": "Latent (%)",
+        "realized_pnl_eur": "P&L réalisé",
+        "pnl_total_eur": "P&L total",
+        "pnl_total_pct": "Perf. totale (%)",
+    })
+
+
+# --- Rendu ------------------------------------------------------------------------
+
+def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
+    st.title("📈 Mon Portefeuille")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Valeur Totale", f"{kpis['total_value_eur']:,.2f} €")
+    col2.metric("Cost Basis", f"{kpis['total_cost_basis_eur']:,.2f} €")
+    col3.metric("P&L Latent", f"{kpis['total_pnl_latent_eur']:,.2f} €")
+    col4.metric("P&L Réalisé", f"{kpis['total_pnl_realized_eur']:,.2f} €")
+    col5.metric(
+        "P&L Total",
+        f"{kpis['total_pnl_eur']:,.2f} €",
+        help="Latent + réalisé",
+    )
+
+    if global_kpis is not None:
+        g1, g2, g3 = st.columns(3)
+        g1.metric("Titres + crypto + cash", f"{global_kpis['equity_eur']:,.2f} €")
+        g2.metric(
+            "Cash XTB disponible",
+            f"{global_kpis['cash_eur']:,.2f} €",
+            f"{global_kpis['cash_share'] * 100:.0f} % du total",
+            delta_color="off",
+        )
+        ret = global_kpis["return_pct"]
+        g3.metric(
+            "Performance globale (cash inclus)",
+            f"{ret:+.2f} %" if ret is not None else "n/a",
+            f"{global_kpis['gain_eur']:+,.2f} €",
+            help="(P&L latent + réalisé + dividendes nets) / (cost basis des lots ouverts + cash XTB). "
+                 "Le cash Binance n'est pas suivi.",
+        )
+    else:
+        invested = kpis.get("total_invested_eur") or kpis["total_cost_basis_eur"]
+        pnl_pct_global = kpis["total_pnl_eur"] / invested * 100 if invested > 0 else 0
+        st.metric("Performance Globale (hors cash)", f"{pnl_pct_global:+.2f} %")
+
+
+def render_tag_summary(df_all: pd.DataFrame) -> None:
+    """Valeur, capital engagé et performance par tag. Un actif à 2 tags compte dans les 2 lignes."""
+    if df_all.empty or "tags" not in df_all.columns:
+        return
+    exploded = df_all.explode("tags").dropna(subset=["tags"])
+    if exploded.empty:
+        return
+
+    summary = exploded.groupby("tags").agg(
+        Valeur=("value_eur", "sum"),
+        Cout=("invested_eur", "sum"),
+        PnL=("pnl_total_eur", "sum"),
+    ).reset_index()
+    summary["PnL %"] = summary.apply(lambda r: (r["PnL"] / r["Cout"] * 100) if r["Cout"] > 0 else 0.0, axis=1)
+    summary = summary.sort_values("Valeur", ascending=False)
+
+    display = summary.copy()
+    display["Valeur"] = display["Valeur"].apply(lambda x: f"{x:,.2f} €")
+    display["Cout"] = display["Cout"].apply(lambda x: f"{x:,.2f} €")
+    display["PnL"] = display["PnL"].apply(lambda x: f"{x:+,.2f} €")
+    display["PnL %"] = display["PnL %"].apply(lambda x: f"{x:+.2f} %")
+
+    st.subheader("📊 Vue d'ensemble : Performance par Tag")
+    st.dataframe(
+        display.rename(columns={
+            "tags": "Tag",
+            "Valeur": "Valeur Totale",
+            "Cout": "Capital engagé",
+            "PnL": "P&L total (€)",
+            "PnL %": "Perf. totale (%)",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.divider()
+
+
+def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = None) -> None:
+    """Camembert d'allocation (df) et barres de P&L total par actif (df_perf, défaut : df)."""
+    df_perf = df if df_perf is None else df_perf
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("🥧 Allocation du Portefeuille")
+        fig_pie = px.pie(df, values="value_eur", names="symbol", hole=0.4)
+        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
+        fig_pie.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+        # --- Export CSV : ticker + % d'allocation uniquement (pas de prix) ---
+        total_value = float(df["value_eur"].sum())
+        alloc_df = (
+            df[["symbol", "value_eur"]]
+            .assign(allocation_pct=lambda d: d["value_eur"] / total_value * 100 if total_value > 0 else 0.0)
+            .drop(columns="value_eur")
+            .rename(columns={"symbol": "ticker"})
+            .sort_values("allocation_pct", ascending=False)
+            .reset_index(drop=True)
+        )
+        alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)  # évite les bruits flottants
+
+        st.download_button(
+            label="📥 Télécharger l'allocation (CSV)",
+            data=alloc_df.to_csv(index=False).encode("utf-8"),
+            file_name="allocation.csv",
+            mime="text/csv",
+            help="Ticker et pourcentage d'allocation uniquement — aucune donnée de prix.",
+        )
+
+    with col_right:
+        st.subheader("📊 P&L total par Actif (EUR, latent + réalisé)")
+        fig_bar = px.bar(
+            df_perf,
+            x="symbol",
+            y="pnl_total_eur",
+            color="pnl_color",
+            color_discrete_map={"Gain": GAIN_COLOR, "Perte": LOSS_COLOR},
+            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"},
+        )
+        fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
+        st.plotly_chart(fig_bar, use_container_width=True)
+
+
+def render_positions_table(df: pd.DataFrame) -> None:
+    st.subheader("📋 Détail des positions")
+    df_display = format_display_df(df)
+    st.dataframe(
+        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis",
+                    "P&L latent", "P&L réalisé", "P&L total", "Perf. totale (%)"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+################################################################################
+# Dossier : dashboard/portfolio
+# Fichier : theme.py
+# Chemin relatif : portfolio/theme.py
+################################################################################
+
+"""Thème sombre du dashboard.
+
+Le thème Streamlit lui-même est piloté par `.streamlit/config.toml` (base = "dark").
+Ce module gère ce que `config.toml` ne couvre pas : les graphiques Plotly, qui ont leur propre
+thème et restent blancs par défaut même si la page Streamlit est sombre.
 """
 from __future__ import annotations
 
-import json
-import uuid
-from datetime import datetime, timezone
-from pathlib import Path
+import plotly.graph_objects as go
+import plotly.io as pio
+import streamlit as st
 
-import pandas as pd
+# Palette cohérente avec .streamlit/config.toml
+BG_COLOR = "#0E1117"
+TEXT_COLOR = "#E6E6E6"
+GRID_COLOR = "#2A2E37"
+GAIN_COLOR = "#26C281"
+LOSS_COLOR = "#E74C3C"
 
-from config import INTENTION_MAX_AGE_DAYS, ROOT_DIR
-
-INTENTIONS_PATH = ROOT_DIR / "data" / "intentions.json"
-
-DONE_ON_TIME = "Exécutée à temps"
-DONE_TOO_EARLY = "Exécutée trop tôt"
-WAITING = "En attente"
-READY = "Prête"
-CANCELLED = "Annulée"
-EXPIRED = "Expirée"
+PASTEL_DARK_SEQUENCE = [
+    "#4C9AFF", "#26C281", "#F5B942", "#E74C3C",
+    "#9B59B6", "#1ABC9C", "#F39C12", "#5DADE2",
+]
 
 
-# --- Persistance ---------------------------------------------------------------------------
-
-def load_intentions(path: Path = INTENTIONS_PATH) -> list[dict]:
-    if not path.exists():
-        return []
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def save_intentions(items: list[dict], path: Path = INTENTIONS_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(items, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def add_intention(items: list[dict], symbol: str, kind: str, reason: str, delay_hours: int,
-                  now: datetime | None = None) -> dict:
-    symbol, reason = symbol.strip(), reason.strip()
-    if not symbol:
-        raise ValueError("Choisis un actif.")
-    if kind not in ("Buy", "Sell"):
-        raise ValueError(f"Sens inconnu : {kind!r}")
-    if not reason:
-        raise ValueError("Une raison est obligatoire : c'est elle que tu relis avant d'exécuter.")
-    item = {
-        "id": uuid.uuid4().hex[:8],
-        "created_at": (now or datetime.now(timezone.utc)).isoformat(),
-        "symbol": symbol,
-        "kind": kind,
-        "reason": reason,
-        "delay_hours": int(delay_hours),
-        "cancelled_at": None,
-    }
-    items.append(item)
-    return item
+def _build_dark_template() -> go.layout.Template:
+    template = go.layout.Template()
+    template.layout = go.Layout(
+        paper_bgcolor=BG_COLOR,
+        plot_bgcolor=BG_COLOR,
+        font=dict(color=TEXT_COLOR),
+        xaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR),
+        yaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR),
+        colorway=PASTEL_DARK_SEQUENCE,
+        legend=dict(bgcolor="rgba(0,0,0,0)"),
+    )
+    return template
 
 
-def cancel_intention(items: list[dict], intention_id: str, now: datetime | None = None) -> None:
-    for it in items:
-        if it["id"] == intention_id:
-            it["cancelled_at"] = (now or datetime.now(timezone.utc)).isoformat()
-            return
-    raise ValueError(f"Intention {intention_id} introuvable.")
+def apply_theme() -> None:
+    """À appeler une fois, tout en haut de CHAQUE page, avant tout autre st.* ou px.*.
 
-
-# --- Rapprochement intentions / trades réels -----------------------------------------------
-
-def reconcile(items: list[dict], trades: pd.DataFrame, now: datetime | None = None,
-              max_age_days: int = INTENTION_MAX_AGE_DAYS) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Rapproche un pour un les intentions et les trades réels.
-
-    `trades` : colonnes time (datetime avec fuseau), symbol, kind ("Buy"|"Sell").
-    Un trade est rattaché à la plus ancienne intention non annulée et encore libre, de même actif et
-    même sens, créée avant lui et au plus `max_age_days` jours plus tôt.
-    Le suivi commence à la première intention : les trades antérieurs ne sont pas jugés.
-
-    Renvoie (intentions avec statut, trades sans intention).
+    Configure la page Streamlit et active le template Plotly sombre "portfolio_dark".
     """
-    now_ts = pd.Timestamp(now or datetime.now(timezone.utc))
-    if now_ts.tzinfo is None:
-        now_ts = now_ts.tz_localize("UTC")
-    max_age = pd.Timedelta(days=max_age_days)
+    st.set_page_config(page_title="Portfolio Dashboard", page_icon="📈", layout="wide")
 
-    rows = []
-    for it in items:
-        created = pd.Timestamp(it["created_at"])
-        rows.append({
-            **it,
-            "created": created,
-            "unlock": created + pd.Timedelta(hours=it["delay_hours"]),
-            "executed_at": None,
-            "status": "",
-        })
-    rows.sort(key=lambda r: r["created"])
-
-    unplanned = []
-    if rows:
-        start = rows[0]["created"]
-        for _, t in trades.sort_values("time").iterrows():
-            if t["time"] < start:
-                continue
-            match = next(
-                (r for r in rows
-                 if r["executed_at"] is None and not r["cancelled_at"]
-                 and r["symbol"].upper() == str(t["symbol"]).upper() and r["kind"] == t["kind"]
-                 and r["created"] <= t["time"] <= r["created"] + max_age),
-                None,
-            )
-            if match is not None:
-                match["executed_at"] = t["time"]
-            else:
-                unplanned.append(t)
-
-    for r in rows:
-        if r["cancelled_at"]:
-            r["status"] = CANCELLED
-        elif r["executed_at"] is not None:
-            r["status"] = DONE_ON_TIME if r["executed_at"] >= r["unlock"] else DONE_TOO_EARLY
-        elif now_ts < r["unlock"]:
-            r["status"] = WAITING
-        elif now_ts <= r["created"] + max_age:
-            r["status"] = READY
-        else:
-            r["status"] = EXPIRED
-
-    table = pd.DataFrame(rows)
-    unplanned_df = pd.DataFrame(unplanned) if unplanned else trades.iloc[0:0]
-    return table, unplanned_df
+    pio.templates["portfolio_dark"] = _build_dark_template()
+    pio.templates.default = "portfolio_dark"
 
 
 ################################################################################
-# Dossier : dashboard/pages
-# Fichier : 3_📊_Activite.py
-# Chemin relatif : pages/3_📊_Activite.py
-################################################################################
-
-"""Page 4 : activité de trading -- fréquence des achats/ventes (par mois ou
-par semaine) et historique filtrable des trades.
-
-Lit uniquement `trades` et `trade_frequency` dans dashboard.json (pipeline
-Rust, lecture seule). Aucune persistance propre à cette page."""
-from __future__ import annotations
-
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.io as pio
-import streamlit as st
-
-from data import load_data
-from theme import BG_COLOR, TEXT_COLOR, GRID_COLOR, PASTEL_DARK_SEQUENCE
-
-# Applique uniquement le template Plotly (set_page_config est déjà géré par app.py)
-if "portfolio_dark" not in pio.templates:
-    pio.templates["portfolio_dark"] = dict(
-        layout=dict(
-            paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-            xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
-        )
-    )
-pio.templates.default = "portfolio_dark"
-
-BUY_COLOR = PASTEL_DARK_SEQUENCE[0]   # bleu
-SELL_COLOR = PASTEL_DARK_SEQUENCE[2]  # orange
-WEEKS_DEFAULT = 52
-
-st.title("📊 Activité")
-
-data = load_data()
-trades = data.get("trades") or []
-freq = data.get("trade_frequency") or {}
-
-if not trades:
-    st.info("Aucun trade dans dashboard.json.")
-    st.stop()
-
-df = pd.DataFrame(trades)
-df["time"] = pd.to_datetime(df["time"], utc=True)
-df = df.sort_values("time", ascending=False).reset_index(drop=True)
-df["date"] = df["time"].dt.date
-
-# --- KPIs ---------------------------------------------------------------------
-buys_eur = float(df.loc[df["kind"] == "Buy", "value_eur"].sum())
-sells_eur = float(df.loc[df["kind"] == "Sell", "value_eur"].sum())
-
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Trades", f"{freq.get('total_trades', len(df)):,}")
-c2.metric("Moyenne / mois", f"{freq.get('avg_per_month', 0.0):.1f}")
-c3.metric("Moyenne / semaine", f"{freq.get('avg_per_week', 0.0):.1f}")
-c4.metric("Total acheté", f"{buys_eur:,.0f} €")
-c5.metric("Total vendu", f"{sells_eur:,.0f} €")
-
-st.divider()
-
-# --- Fréquence ----------------------------------------------------------------
-st.subheader("Fréquence")
-
-granularity = st.radio("Période", ["Mois", "Semaine"], horizontal=True, label_visibility="collapsed")
-rows = freq.get("by_month" if granularity == "Mois" else "by_week") or []
-periods = pd.DataFrame(rows)
-
-if periods.empty:
-    st.info("Pas de données de fréquence.")
-else:
-    if granularity == "Semaine":
-        show_all = st.checkbox("Afficher toute la période", value=False)
-        if not show_all:
-            periods = periods.tail(WEEKS_DEFAULT)
-            st.caption(f"{WEEKS_DEFAULT} dernières semaines (la période est la fin de semaine, dimanche).")
-
-    left, right = st.columns(2)
-
-    fig_count = go.Figure()
-    fig_count.add_bar(x=periods["period"], y=periods["buys"], name="Achats", marker_color=BUY_COLOR)
-    fig_count.add_bar(x=periods["period"], y=periods["sells"], name="Ventes", marker_color=SELL_COLOR)
-    fig_count.update_layout(
-        barmode="stack", title="Nombre de trades", height=360,
-        margin=dict(l=10, r=10, t=50, b=10), xaxis=dict(type="category"),
-        legend=dict(orientation="h", y=1.1, x=0),
-    )
-    left.plotly_chart(fig_count, use_container_width=True)
-
-    fig_vol = go.Figure()
-    fig_vol.add_bar(x=periods["period"], y=periods["volume_eur"], name="Volume", marker_color=BUY_COLOR)
-    fig_vol.update_layout(
-        title="Volume échangé (€)", height=360,
-        margin=dict(l=10, r=10, t=50, b=10), xaxis=dict(type="category"),
-        yaxis=dict(ticksuffix=" €"), showlegend=False,
-    )
-    right.plotly_chart(fig_vol, use_container_width=True)
-
-st.divider()
-
-# --- Historique filtrable -------------------------------------------------------
-st.subheader("Historique")
-
-f1, f2, f3, f4 = st.columns([2, 1, 1, 2])
-symbols = f1.multiselect("Actif", sorted(df["symbol"].unique()))
-kinds = f2.multiselect("Type", sorted(df["kind"].unique()))
-platforms = f3.multiselect("Plateforme", sorted(df["platform"].unique()))
-date_range = f4.date_input("Dates", value=(df["date"].min(), df["date"].max()))
-
-mask = pd.Series(True, index=df.index)
-if symbols:
-    mask &= df["symbol"].isin(symbols)
-if kinds:
-    mask &= df["kind"].isin(kinds)
-if platforms:
-    mask &= df["platform"].isin(platforms)
-# date_input renvoie un tuple d'un élément tant que la plage n'est pas complète
-if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-    mask &= (df["date"] >= date_range[0]) & (df["date"] <= date_range[1])
-
-view = df[mask]
-
-st.caption(
-    f"{len(view)} trades — achats {view.loc[view['kind'] == 'Buy', 'value_eur'].sum():,.0f} €, "
-    f"ventes {view.loc[view['kind'] == 'Sell', 'value_eur'].sum():,.0f} €"
-)
-
-st.dataframe(
-    view[["time", "symbol", "kind", "platform", "quantity", "unit_price_eur", "value_eur"]],
-    hide_index=True,
-    use_container_width=True,
-    column_config={
-        "time": st.column_config.DatetimeColumn("Date", format="DD/MM/YYYY HH:mm"),
-        "symbol": "Actif",
-        "kind": "Type",
-        "platform": "Plateforme",
-        "quantity": st.column_config.NumberColumn("Quantité", format="%.4f"),
-        "unit_price_eur": st.column_config.NumberColumn("Prix unitaire", format="%.2f €"),
-        "value_eur": st.column_config.NumberColumn("Valeur", format="%.2f €"),
-    },
-)
-
-# --- Récap par actif (sur la sélection) ----------------------------------------
-if not view.empty:
-    st.subheader("Par actif")
-    recap = (
-        view.assign(
-            achete=view["value_eur"].where(view["kind"] == "Buy", 0.0),
-            vendu=view["value_eur"].where(view["kind"] == "Sell", 0.0),
-        )
-        .groupby("symbol")
-        .agg(trades=("symbol", "size"), achete=("achete", "sum"), vendu=("vendu", "sum"), dernier=("time", "max"))
-        .sort_values("trades", ascending=False)
-        .reset_index()
-    )
-    st.dataframe(
-        recap,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "symbol": "Actif",
-            "trades": "Trades",
-            "achete": st.column_config.NumberColumn("Acheté", format="%.0f €"),
-            "vendu": st.column_config.NumberColumn("Vendu", format="%.0f €"),
-            "dernier": st.column_config.DatetimeColumn("Dernier trade", format="DD/MM/YYYY"),
-        },
-    )
-
-################################################################################
-# Dossier : dashboard/pages
-# Fichier : 4_🏷️_Gestion_Tags.py
-# Chemin relatif : pages/4_🏷️_Gestion_Tags.py
-################################################################################
-
-"""Page 4 : Gestion et assignation des Tags aux actifs du portefeuille."""
-from __future__ import annotations
-
-import pandas as pd
-import streamlit as st
-
-from data import load_data, build_assets_df, yfinance_ticker_for
-from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio, update_asset
-
-st.title("🏷️ Gestion des Tags")
-
-# 1. Charger les données du portefeuille (dashboard.json)
-data = load_data()
-df_portfolio = build_assets_df(data)
-
-# 2. Charger les données des actifs (où sont stockés les tags)
-assets_data = load_assets_data()
-
-# 3. Synchroniser : ajouter automatiquement les nouveaux actifs achetés
-def resolver(symbol):
-    row = df_portfolio[df_portfolio["symbol"] == symbol]
-    if not row.empty:
-        return yfinance_ticker_for(row.iloc[0])
-    return symbol
-
-added = sync_watchlist_with_portfolio(assets_data, df_portfolio, ticker_resolver=resolver)
-if added > 0:
-    save_assets_data(assets_data)
-    st.toast(f"{added} nouvel(s) actif(s) ajouté(s) pour taggage.", icon="✅")
-
-# --- Récupérer tous les tags existants ---
-all_tags = sorted(set(tag for a in assets_data["assets"] for tag in a.get("tags", [])))
-
-# ==========================================
-# NOUVEAU : GESTION GLOBALE (SUPPRESSION)
-# ==========================================
-st.subheader("🧹 Gestion globale des tags")
-if not all_tags:
-    st.info("Aucun tag n'existe encore dans le système.")
-else:
-    col1, col2 = st.columns([3, 1])
-    tag_to_delete = col1.selectbox("Sélectionner un tag à supprimer de TOUS les actifs", all_tags)
-    if col2.button("🗑️ Supprimer définitivement", type="primary"):
-        if tag_to_delete:
-            count = 0
-            # On boucle sur tous les actifs pour retirer ce tag s'il est présent
-            for a in assets_data["assets"]:
-                if tag_to_delete in a.get("tags", []):
-                    a["tags"].remove(tag_to_delete)
-                    count += 1
-            
-            save_assets_data(assets_data)
-            st.success(f"Le tag '{tag_to_delete}' a été retiré de {count} actif(s).")
-            st.rerun() # Rafraîchit la page pour mettre à jour la liste des tags
-
-st.divider()
-
-# ==========================================
-# GESTION PAR ACTIF (INCHANGÉE + CORRIGÉE)
-# ==========================================
-st.subheader("✏️ Tags par actif")
-
-# On priorise les actifs réellement détenus
-current_tickers = set()
-for _, row in df_portfolio.iterrows():
-    if row["value_eur"] > 0:
-        tk = row.get("ticker") or row["symbol"]
-        current_tickers.add(tk)
-
-assets_list = assets_data["assets"]
-# Trier : détenus en premier, puis par ordre alphabétique
-assets_list_sorted = sorted(assets_list, key=lambda x: (x["ticker"] not in current_tickers, x["name"]))
-
-# Créer une liste de labels pour le selectbox
-asset_options = [f"{a['name']} ({a['ticker']})" for a in assets_list_sorted]
-
-selected_label = st.selectbox("Choisir un actif à tagger", options=asset_options)
-selected_index = asset_options.index(selected_label)
-selected_asset = assets_list_sorted[selected_index]
-
-st.markdown(f"##### Configuration pour {selected_asset['name']}")
-current_tags = selected_asset.get("tags", [])
-
-# 1. Multiselect avec les tags existants (SUGGESTION)
-chosen_existing = st.multiselect(
-    "Sélectionner des tags existants", 
-    options=all_tags, 
-    default=[t for t in current_tags if t in all_tags]
-)
-
-# 2. Option pour créer un nouveau tag (AUTRE)
-st.markdown("**Ou créer un nouveau tag :**")
-new_tag = st.text_input("Nouveau tag (laisser vide pour ignorer)", placeholder="Ex: Tech, Dividende...")
-
-# Combiner les tags existants choisis et le nouveau tag
-new_tags_list = list(set(chosen_existing)) # On enlève les doublons
-if new_tag.strip():
-    new_tags_list.append(new_tag.strip())
-
-st.write("**Tags actuels pour cet actif :**", ", ".join(new_tags_list) if new_tags_list else "Aucun")
-
-if st.button("💾 Sauvegarder les tags", type="primary"):
-    # Mettre à jour
-    update_asset(assets_data, selected_asset["ticker"], tags=new_tags_list)
-    save_assets_data(assets_data)
-    st.success("Tags sauvegardés avec succès !")
-    st.rerun()
-
-################################################################################
-# Dossier : dashboard/pages
-# Fichier : 5_Historique.py
-# Chemin relatif : pages/5_Historique.py
-################################################################################
-
-"""Page Historique : valeur totale et cost basis dans le temps (data/history.json)."""
-from history_view import render_history_page
-
-render_history_page()
-
-################################################################################
-# Dossier : dashboard/pages
-# Fichier : 6_🔗_Correlation.py
-# Chemin relatif : pages/6_🔗_Correlation.py
-################################################################################
-
-"""Page Corrélation : Matrice, Clustering et Variation sur les fenêtres temporelles."""
-from __future__ import annotations
-
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.io as pio
-
-from config import MIN_POSITION_VALUE_EUR
-from data import load_data, build_assets_df, filter_small_positions, CASH_KIND
-from correlation import render_correlation_section
-from theme import BG_COLOR, TEXT_COLOR, GRID_COLOR
-
-# Applique le template sombre pour cette page
-if "portfolio_dark" not in pio.templates:
-    pio.templates["portfolio_dark"] = dict(
-        layout=dict(
-            paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-            xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
-        )
-    )
-pio.templates.default = "portfolio_dark"
-
-st.title("🔗 Corrélations")
-
-# --- Chargement des données (similaire à app.py) ---
-data = load_data()
-df = build_assets_df(data)
-df = df[~((df["kind"] == CASH_KIND) & (df["symbol"] == "EUR"))].copy()
-df = filter_small_positions(df, MIN_POSITION_VALUE_EUR)
-
-if df.empty:
-    st.info(f"Aucune position d'au moins {MIN_POSITION_VALUE_EUR:.0f} €.")
-    st.stop()
-
-# --- 1. Section classique (Matrice, par actif, clustering) ---
-render_correlation_section(df, data)
-
-st.divider()
-
-# --- 2. NOUVEAU : Variation de la corrélation (90j, 6m, 1y) ---
-st.subheader("📈 Variation de corrélation entre deux actifs")
-st.caption("Compare le coefficient de corrélation de deux actifs sur les différentes fenêtres temporelles pour voir si leur relation se renforce ou s'affaiblit avec le temps.")
-
-correlation_matrices = data.get("correlation_matrices", {})
-
-# Le pipeline Rust calcule "90d", "6m" (180j) et "1y" (365j)
-available_windows = [w for w in ["90d", "6m", "1y"] if w in correlation_matrices]
-
-if not available_windows:
-    st.info("Données de corrélation indisponibles. Lance le pipeline Rust (`cargo run`).")
-else:
-    # Récupérer tous les actifs présents dans les matrices
-    all_assets = set()
-    for w in available_windows:
-        all_assets.update(correlation_matrices[w].keys())
-    all_assets = sorted(list(all_assets))
-
-    if len(all_assets) < 2:
-        st.info("Pas assez d'actifs pour comparer.")
-    else:
-        col1, col2 = st.columns(2)
-        asset_a = col1.selectbox("Actif A", all_assets, index=0)
-        # Pour l'actif B, on met un autre actif par défaut si possible
-        default_idx_b = 1 if len(all_assets) > 1 else 0
-        asset_b = col2.selectbox("Actif B", all_assets, index=default_idx_b)
-
-        if asset_a == asset_b:
-            st.warning("Sélectionne deux actifs différents pour voir leur corrélation.")
-        else:
-            variations = []
-            for w in available_windows:
-                # La matrice est structurée comme { "90d": { "BTC": { "ETH": 0.8 } } }
-                val = correlation_matrices[w].get(asset_a, {}).get(asset_b)
-                if val is not None:
-                    variations.append({"window": w, "correlation": val})
-            
-            if not variations:
-                st.info(f"Corrélation non calculable entre {asset_a} et {asset_b} (données historiques insuffisantes).")
-            else:
-                df_var = pd.DataFrame(variations)
-                
-                # Ordre chronologique explicite pour l'axe X
-                window_order = ["90d", "6m", "1y"]
-                df_var['sort'] = df_var['window'].apply(lambda x: window_order.index(x))
-                df_var = df_var.sort_values('sort')
-                
-                # Mapping pour un affichage plus clair
-                labels_map = {"90d": "3 mois (90j)", "6m": "6 mois (180j)", "1y": "1 an (365j)"}
-                df_var["label"] = df_var["window"].map(labels_map)
-
-                fig_var = go.Figure(go.Scatter(
-                    x=df_var["label"], 
-                    y=df_var["correlation"],
-                    mode="lines+markers+text",
-                    text=[f"{v:.2f}" for v in df_var["correlation"]],
-                    textposition="top center",
-                    line=dict(color="#4C9AFF", width=3, shape="spline"),
-                    marker=dict(size=10, color="#F5B942", line=dict(width=2, color=BG_COLOR))
-                ))
-                
-                fig_var.update_layout(
-                    title=f"Évolution de la corrélation : {asset_a} vs {asset_b}",
-                    xaxis_title="Fenêtre temporelle",
-                    yaxis_title="Coefficient de corrélation",
-                    yaxis=dict(range=[-1.1, 1.1], dtick=0.5),
-                    height=450,
-                    margin=dict(l=20, r=20, t=60, b=20)
-                )
-                
-                # Ligne horizontale à 0 pour bien voir les décorélations
-                fig_var.add_hline(y=0, line_color=GRID_COLOR, line_width=1, line_dash="dash")
-                
-                st.plotly_chart(fig_var, use_container_width=True)
-                
-                st.markdown("""
-                **Comment l'interpréter ?**
-                - **Corrélation qui monte sur le long terme (1 an)** : Les actifs sont de plus en plus liés structurellement (ex: deux actions tech qui suivent le même secteur).
-                - **Corrélation qui baisse sur le long terme** : Les actifs se décorrelent, c'est excellent pour la diversification de ton portefeuille.
-                - **Corrélation négative** : L'actif B a tendance à monter quand l'actif A descend (couvre-risque).
-                """)
-
-################################################################################
-# Dossier : dashboard/pages
-# Fichier : 7_Holding.py
-# Chemin relatif : pages/7_Holding.py
-################################################################################
-
-"""Page Détention : durée de détention par actif (data/dashboard.json -> `holdings`)."""
-from holding_view import render_holding_page
- 
-render_holding_page()
- 
-
-################################################################################
-# Dossier : dashboard/pages
-# Fichier : Discipline.py
-# Chemin relatif : pages/Discipline.py
-################################################################################
-
-"""Page Discipline : quota de trades par semaine (à placer dans dashboard/pages/)."""
-from __future__ import annotations
-
-import pandas as pd
-import plotly.graph_objects as go
-import streamlit as st
-
-from theme import apply_theme
-from config import WEEKLY_TRADE_QUOTA
-from data import load_data
-
-TZ = "Europe/Paris"
-GREEN, RED = "#2ecc71", "#e74c3c"
-QUOTA = WEEKLY_TRADE_QUOTA
-
-apply_theme()  # même en-tête que les autres pages
-st.title("🎯 Discipline : quota de trades")
-
-data = load_data()
-raw = pd.DataFrame(data.get("trades", []))
-if raw.empty:
-    st.info("Aucun trade dans dashboard.json.")
-    st.stop()
-
-# --- Trades : heure locale, semaines du lundi au dimanche ------------------------------------
-st.sidebar.subheader("🎯 Discipline")
-group_fills = st.sidebar.checkbox(
-    "Regrouper les exécutions d'un même ordre",
-    value=True,
-    help="Même actif, même sens, même minute = 1 trade (ex. une vente qui ferme plusieurs lots XTB).",
-)
-
-df = raw.copy()
-df["time"] = pd.to_datetime(df["time"], utc=True).dt.tz_convert(TZ)
-if group_fills:
-    key = df["symbol"] + "|" + df["kind"] + "|" + df["time"].dt.floor("min").astype(str)
-    df = df.loc[~key.duplicated()]
-
-since = st.sidebar.date_input(
-    "Compter à partir du",
-    value=df["time"].min().date(),
-    help="Mets la date du jour pour ne juger que les semaines à venir.",
-)
-df = df[df["time"].dt.date >= since].copy()
-df["week"] = df["time"].dt.tz_localize(None).dt.to_period("W-SUN").dt.start_time  # lundi
-
-# --- Série hebdomadaire complète (semaines sans trade = 0) -----------------------------------
-current_week = pd.Timestamp.now(tz=TZ).tz_localize(None).to_period("W-SUN").start_time
-start = df["week"].min() if not df.empty else current_week
-weeks = pd.date_range(start, current_week, freq="7D")
-counts = df.groupby("week").size().reindex(weeks, fill_value=0)
-
-# --- Décompte de la semaine en cours ---------------------------------------------------------
-used = int(counts.iloc[-1])
-left = QUOTA - used
-
-c1, c2, c3, c4 = st.columns(4)
-if left >= 0:
-    c1.metric("Restants cette semaine", f"{left} / {QUOTA}", f"{used} fait(s)", delta_color="off")
-else:
-    c1.metric("Quota dépassé", f"{used} / {QUOTA}", f"+{-left}", delta_color="inverse")
-
-done = counts.iloc[:-1]  # semaines terminées
-respected = (done <= QUOTA).tolist()
-streak = 0
-for ok in reversed(respected):
-    if not ok:
-        break
-    streak += 1
-
-c2.metric(
-    "Semaines respectées",
-    f"{sum(respected)} / {len(done)}" if len(done) else "—",
-    f"{sum(respected) / len(done) * 100:.0f} %" if len(done) else None,
-    delta_color="off",
-)
-c3.metric("Série en cours", f"{streak} sem.")
-c4.metric("Moyenne / semaine", f"{done.mean():.1f}" if len(done) else "—")
-
-st.progress(min(used / QUOTA, 1.0))
-if left > 0:
-    st.success(f"Il te reste {left} trade(s) cette semaine.")
-elif left == 0:
-    st.warning("Quota atteint : plus de trade cette semaine.")
-else:
-    st.error(f"Quota dépassé de {-left} trade(s) cette semaine.")
-
-# --- Graphique : rouge si dépassé, vert sinon ------------------------------------------------
-colors = [RED if n > QUOTA else GREEN for n in counts]
-outline = [0] * (len(counts) - 1) + [2]  # contour sur la semaine en cours
-
-fig = go.Figure(
-    go.Bar(
-        x=counts.index,
-        y=counts.values,
-        marker=dict(color=colors, line=dict(width=outline, color="#888888")),
-        hovertemplate="Semaine du %{x|%d/%m/%Y}<br>%{y} trade(s)<extra></extra>",
-    )
-)
-empty = counts[counts == 0]
-if not empty.empty:  # un point vert pour les semaines sans trade (sinon aucune barre visible)
-    fig.add_trace(
-        go.Scatter(
-            x=empty.index,
-            y=[0] * len(empty),
-            mode="markers",
-            marker=dict(color=GREEN, size=8),
-            hovertemplate="Semaine du %{x|%d/%m/%Y}<br>0 trade<extra></extra>",
-        )
-    )
-fig.add_hline(y=QUOTA, line_dash="dash", annotation_text=f"Quota : {QUOTA}")
-fig.update_layout(showlegend=False, bargap=0.25, xaxis_title=None, yaxis_title="Trades")
-fig.update_yaxes(dtick=1, rangemode="tozero")
-st.plotly_chart(fig, use_container_width=True)
-st.caption(
-    "Vert : quota respecté. Rouge : dépassé. Contour : semaine en cours. "
-    "Un trade = achat ou vente d'un actif hors cash ; un convert Binance compte pour 2."
-)
-
-# --- Détail des semaines dépassées -----------------------------------------------------------
-over_weeks = counts[counts > QUOTA].index
-if len(over_weeks):
-    with st.expander(f"Trades des {len(over_weeks)} semaine(s) dépassée(s)"):
-        detail = df[df["week"].isin(over_weeks)].sort_values("time", ascending=False)
-        table = pd.DataFrame(
-            {
-                "Semaine du": detail["week"].dt.strftime("%d/%m/%Y"),
-                "Date": detail["time"].dt.strftime("%d/%m %H:%M"),
-                "Actif": detail["symbol"],
-                "Sens": detail["kind"],
-                "Montant (€)": detail["value_eur"].round(2),
-            }
-        )
-        st.dataframe(table, use_container_width=True, hide_index=True)
-
-
-################################################################################
-# Dossier : dashboard
+# Dossier : dashboard/tests
 # Fichier : test_history.py
-# Chemin relatif : test_history.py
+# Chemin relatif : tests/test_history.py
 ################################################################################
 
 """Tests de la page Historique. Lancer depuis dashboard/ : `python -m pytest tests -q`.
@@ -3731,10 +2630,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import history_view as hv  # noqa: E402
-from data import history_to_df  # noqa: E402
+from portfolio import history as hv  # noqa: E402
+from portfolio.history import history_to_df  # noqa: E402
 
-PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "5_📈_Historique.py")
+PAGE = str(next((Path(__file__).resolve().parent.parent / "pages").glob("5_*Historique.py")))
 
 
 def raw_history(n: int = 6, incomplete_at: int | None = None) -> list[dict]:
@@ -3930,66 +2829,5 @@ def test_page_period_selection_changes_the_number_of_points(monkeypatch):
     at.radio[0].set_value("1 mois").run()
     assert not at.exception
     assert n_points(at) == 5  # dimanches à 0, 7, 14, 21 et 28 jours de la fin
-
-################################################################################
-# Dossier : dashboard
-# Fichier : theme.py
-# Chemin relatif : theme.py
-################################################################################
-
-"""Thème sombre du dashboard.
-
-Le thème Streamlit lui-même est piloté par `.streamlit/config.toml`
-(base = "dark") -- c'est la manière officielle de faire, ça évite le CSS
-fragile qui casse à chaque update de Streamlit.
-
-Ce module gère la partie que `config.toml` ne couvre pas : les graphiques
-Plotly, qui ont leur propre thème et restent blancs par défaut même si la
-page Streamlit est sombre.
-"""
-from __future__ import annotations
-
-import plotly.graph_objects as go
-import plotly.io as pio
-import streamlit as st
-
-# Palette cohérente avec .streamlit/config.toml
-BG_COLOR = "#0E1117"
-CARD_BG_COLOR = "#161B22"
-TEXT_COLOR = "#E6E6E6"
-GRID_COLOR = "#2A2E37"
-GAIN_COLOR = "#26C281"
-LOSS_COLOR = "#E74C3C"
-
-PASTEL_DARK_SEQUENCE = [
-    "#4C9AFF", "#26C281", "#F5B942", "#E74C3C",
-    "#9B59B6", "#1ABC9C", "#F39C12", "#5DADE2",
-]
-
-
-def _build_dark_template() -> go.layout.Template:
-    template = go.layout.Template()
-    template.layout = go.Layout(
-        paper_bgcolor=BG_COLOR,
-        plot_bgcolor=BG_COLOR,
-        font=dict(color=TEXT_COLOR),
-        xaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR),
-        yaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR),
-        colorway=PASTEL_DARK_SEQUENCE,
-        legend=dict(bgcolor="rgba(0,0,0,0)"),
-    )
-    return template
-
-
-def apply_theme() -> None:
-    """À appeler une fois, tout en haut de app.py, avant tout st.* ou px.*.
-
-    Configure la page Streamlit et enregistre + active un template Plotly
-    sombre nommé "portfolio_dark" pour tous les graphiques du dashboard.
-    """
-    st.set_page_config(page_title="Portfolio Dashboard", page_icon="📈", layout="wide")
-
-    pio.templates["portfolio_dark"] = _build_dark_template()
-    pio.templates.default = "portfolio_dark"
 
 

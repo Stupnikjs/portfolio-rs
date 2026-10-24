@@ -1,29 +1,21 @@
-"""Modèle Asset : un actif suivi (en DCA actif ou en watchlist), avec son
-analyse associée. Persistant dans data/assets/<TICKER>.json (un fichier
-JSON par actif) -- séparé de dashboard.json (pipeline Rust, lecture seule).
+"""Actifs suivis (tags, thèse, DCA) : un fichier JSON par actif dans data/assets/<TICKER>.json.
 
-Le DCA est piloté par une QUANTITÉ (ex. 0.01 ETH/mois, 2 parts/mois) et non
-par un montant en euros saisi à la main : le montant mensuel se déduit en
-multipliant cette quantité par le prix courant (get_price_eur), recalculé à
-chaque affichage.
-
-La thèse d'investissement (texte, scénario d'invalidation, données financières,
-avis analystes) est stockée directement dans l'Asset, donc dans son fichier JSON."""
+Séparé de dashboard.json (pipeline Rust, lecture seule). Le dashboard ne modifie que les tags
+et l'ajout automatique des actifs détenus ; les autres champs (thèse, données financières, DCA)
+sont préservés tels quels à chaque sauvegarde.
+"""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import asdict, dataclass, field
-from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
-import yfinance as yf
 
-from config import ROOT_DIR
-
-ASSETS_DIR = ROOT_DIR / "data" / "assets"                  # un fichier JSON par actif
-LEGACY_ASSETS_PATH = ROOT_DIR / "data" / "assets.json"     # ancien format (tous les actifs dans un fichier)
+from portfolio.config import ASSETS_DIR, LEGACY_ASSETS_PATH
+from portfolio.data import yfinance_ticker_for
 
 
 # --- Schéma FIXE des blocs de données --------------------------------------
@@ -117,35 +109,24 @@ class Asset:
     name: str
     ticker: str
     in_dca: bool
-    analysis_path: str = ""            
-    last_analysis_update: str = ""     
+    analysis_path: str = ""
+    last_analysis_update: str = ""
     quantite_dca_mensuelle: float = 0.0
     thesis: str = ""
     invalidation_scenario: str = ""
     donnees_financieres: dict = field(default_factory=lambda: empty_block(FINANCIAL_SCHEMA))
     avis_analystes: dict = field(default_factory=lambda: empty_block(ANALYST_SCHEMA))
-    tags: list = field(default_factory=list)  # <-- Ligne obligatoire
+    tags: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
-    @staticmethod
-    def from_dict(d: dict) -> "Asset":
-        # Les champs absents (ancien assets.json) prennent leur valeur par défaut.
-        return Asset(**{k: d[k] for k in Asset.__dataclass_fields__ if k in d and d[k] is not None})
-
-
-DEFAULT_ASSETS_DATA = {"assets": []}
-
 
 # --- Chargement / sauvegarde -------------------------------------------------
 # Un actif = un fichier data/assets/<TICKER>.json (le contenu de Asset.to_dict()).
-# `data` garde en mémoire deux clés techniques, jamais écrites sur disque :
-#   "_files"   : ticker -> fichier d'origine (un fichier renommé à la main
-#                est donc réécrit sous son nom, pas dupliqué)
-#   "_removed" : tickers retirés, dont le fichier est supprimé à la sauvegarde.
-# Rien d'autre n'est jamais supprimé : un fichier illisible ou ajouté à la main
-# entre-temps n'est pas touché.
+# `data` garde en mémoire une clé technique "_files" (ticker -> fichier d'origine), jamais écrite
+# sur disque : un fichier renommé à la main est réécrit sous son nom, pas dupliqué.
+# Rien n'est jamais supprimé : un fichier illisible ou ajouté à la main entre-temps n'est pas touché.
 
 def _asset_file(ticker: str, directory: Path) -> Path:
     return directory / f"{re.sub(r'[^A-Za-z0-9._-]', '_', ticker)}.json"
@@ -212,30 +193,19 @@ def load_assets_data(directory: Path = ASSETS_DIR, legacy_path: Path = LEGACY_AS
         _normalize_and_warn(a, p.name)
         assets.append(a)
         files[ticker] = p
-    return {"assets": assets, "_files": files, "_removed": []}
+    return {"assets": assets, "_files": files}
 
 
 def save_assets_data(data: dict, directory: Path = ASSETS_DIR) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     files: dict = data.setdefault("_files", {})
-
-    for ticker in data.get("_removed", []):
-        f = files.pop(ticker, None) or _asset_file(ticker, directory)
-        if f.exists():
-            f.unlink()
-    data["_removed"] = []
-
     for a in data["assets"]:
         f = files.get(a["ticker"]) or _asset_file(a["ticker"], directory)
         _write_if_changed(f, a)
         files[a["ticker"]] = f
 
 
-# --- Accès aux objets Asset ---------------------------------------------------
-
-def _assets(data: dict) -> list[Asset]:
-    return [Asset.from_dict(a) for a in data["assets"]]
-
+# --- Accès aux actifs ---------------------------------------------------------
 
 def _find(data: dict, ticker: str) -> dict | None:
     for a in data["assets"]:
@@ -261,122 +231,49 @@ def update_asset(data: dict, ticker: str, **changes) -> None:
     raw.update(changes)
 
 
-THESIS_FIELDS = ("thesis", "invalidation_scenario", "donnees_financieres", "avis_analystes")
+def sync_watchlist_with_portfolio(data: dict, portfolio_df: pd.DataFrame) -> int:
+    """Ajoute en watchlist tout actif détenu (df issu de build_assets_df) absent de data/assets/.
 
-
-def update_thesis(data: dict, ticker: str, payload: dict) -> None:
-    """Met à jour la thèse d'un actif à partir d'un dict (saisie manuelle ou
-    JSON importé). Seuls les champs présents dans `payload` sont modifiés ;
-    pour les deux blocs de données, seules les clés fournies changent (fusion
-    clé par clé) et elles doivent appartenir au schéma fixe. last_analysis_update
-    passe à la date du jour."""
-    unknown = set(payload) - set(THESIS_FIELDS)
-    if unknown:
-        raise ValueError(f"Champs inconnus : {sorted(unknown)} (attendus : {list(THESIS_FIELDS)})")
-    for k in ("thesis", "invalidation_scenario"):
-        if k in payload and not isinstance(payload[k], str):
-            raise ValueError(f"« {k} » doit être un texte.")
-
-    raw = _find(data, ticker)
-    if raw is None:
-        raise ValueError(f"{ticker} introuvable.")
-    payload = dict(payload)
-    for name, schema in BLOCK_SCHEMAS.items():
-        if name not in payload:
-            continue
-        if not isinstance(payload[name], dict):
-            raise ValueError(f"« {name} » doit être un objet JSON.")
-        check_block(name, payload[name], schema)
-        merged = {**normalize_block(raw.get(name), schema), **payload[name]}
-        payload[name] = normalize_block(merged, schema)
-
-    update_asset(data, ticker, last_analysis_update=date.today().isoformat(), **payload)
-
-
-def remove_asset(data: dict, ticker: str) -> None:
-    data["assets"] = [a for a in data["assets"] if a["ticker"] != ticker]
-    data.setdefault("_removed", []).append(ticker)  # le fichier est supprimé à la prochaine sauvegarde
-
-
-def promote_to_dca(data: dict, ticker: str, quantite_dca_mensuelle: float) -> None:
-    """Passe un candidat de la watchlist au panier DCA actif."""
-    update_asset(data, ticker, in_dca=True, quantite_dca_mensuelle=quantite_dca_mensuelle)
-
-
-def demote_to_watchlist(data: dict, ticker: str) -> None:
-    """Sort un actif du DCA sans le supprimer -- il redevient un candidat suivi."""
-    update_asset(data, ticker, in_dca=False, quantite_dca_mensuelle=0.0)
-
-
-def get_dca_assets(data: dict) -> list[Asset]:
-    return [a for a in _assets(data) if a.in_dca]
-
-
-def get_watchlist_assets(data: dict) -> list[Asset]:
-    return [a for a in _assets(data) if not a.in_dca]
-
-
-def sync_watchlist_with_portfolio(data: dict, portfolio_df, ticker_resolver=None) -> int:
-    """Ajoute automatiquement en watchlist tout actif détenu dans le
-    portefeuille (df issu de build_assets_df) mais absent de assets.json.
-    Ne touche jamais aux actifs déjà présents -- statut DCA, quantité,
-    analyse restent tels quels, y compris si l'actif a été vendu depuis.
-    `ticker_resolver` (ex. data.yfinance_ticker_for) convertit le symbole
-    du portefeuille en ticker yfinance si les deux diffèrent.
-    Renvoie le nombre d'actifs ajoutés."""
+    Ne touche jamais aux actifs déjà présents (DCA, quantité, analyse restent tels quels, y compris
+    si l'actif a été vendu depuis). Renvoie le nombre d'actifs ajoutés.
+    """
     if portfolio_df is None or portfolio_df.empty:
         return 0
 
     existing_tickers = {a["ticker"] for a in data["assets"]}
     added = 0
-    for symbol in portfolio_df["symbol"]:
-        ticker = ticker_resolver(symbol) if ticker_resolver else symbol
+    for _, row in portfolio_df.iterrows():
+        ticker = yfinance_ticker_for(row)
         if ticker in existing_tickers:
             continue
-        add_asset(data, Asset(name=symbol, ticker=ticker, in_dca=False))
+        add_asset(data, Asset(name=row["symbol"], ticker=ticker, in_dca=False))
         existing_tickers.add(ticker)
         added += 1
     return added
 
 
-# --- Prix en EUR (yfinance) --------------------------------------------------
+def load_synced_assets(portfolio_df: pd.DataFrame) -> tuple[dict, int]:
+    """Charge les actifs suivis, y ajoute les nouveaux actifs détenus et sauvegarde si besoin.
 
-def _yahoo_symbol(ticker: str) -> str:
-    """Ticker de l'actif -> symbole Yahoo Finance. Le suffixe ".US" (convention
-    courtier : BSX.US) n'existe pas chez Yahoo, où les actions US n'ont pas de
-    suffixe : BSX.US -> BSX. Les autres tickers (SAN.PA, ETH-USD...) passent tels quels."""
-    return ticker[:-3] if ticker.endswith(".US") else ticker
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fx_rate_to_eur(currency: str) -> float | None:
-    if currency == "EUR":
-        return 1.0
-    try:
-        hist = yf.Ticker(f"{currency}EUR=X").history(period="5d", interval="1d")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-    except Exception:
-        pass
-    return None
+    Renvoie (données, nombre d'actifs ajoutés).
+    """
+    assets_data = load_assets_data()
+    added = sync_watchlist_with_portfolio(assets_data, portfolio_df)
+    if added:
+        save_assets_data(assets_data)
+    return assets_data, added
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_price_eur(ticker: str) -> float | None:
-    """Dernier prix connu, converti en EUR. None si indisponible."""
-    try:
-        t = yf.Ticker(_yahoo_symbol(ticker))
-        fast = t.fast_info
-        price = fast.get("lastPrice") if hasattr(fast, "get") else getattr(fast, "last_price", None)
-        currency = (fast.get("currency") if hasattr(fast, "get") else getattr(fast, "currency", None)) or "USD"
-        if price is None:
-            hist = t.history(period="5d", interval="1d")
-            if hist.empty:
-                return None
-            price = float(hist["Close"].iloc[-1])
-        rate = _fx_rate_to_eur(currency)
-        if rate is None:
-            return None
-        return float(price) * rate
-    except Exception:
-        return None
+def attach_tags(df: pd.DataFrame, assets_data: dict) -> pd.DataFrame:
+    """Copie de `df` avec une colonne `tags` (liste), recherchée par ticker puis par symbole."""
+    tag_map = {a["ticker"]: a.get("tags", []) for a in assets_data["assets"]}
+
+    def tags_for(row: pd.Series) -> list:
+        for key in (row.get("ticker"), row.get("symbol")):
+            if key in tag_map:
+                return tag_map[key]
+        return []
+
+    out = df.copy()
+    out["tags"] = [tags_for(row) for _, row in out.iterrows()]
+    return out

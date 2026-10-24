@@ -1,125 +1,63 @@
-"""Point d'entrée du dashboard. Lancer avec : streamlit run app.py"""
+"""Page d'accueil du dashboard, articulée autour des tags. Lancer avec : streamlit run app.py"""
 from __future__ import annotations
 
 import streamlit as st
 
-from theme import apply_theme
-from config import MIN_POSITION_VALUE_EUR
-from data import (
-    load_data, build_assets_df, compute_kpis, compute_global_kpis, yfinance_ticker_for, CASH_KIND,
-    filter_small_positions, small_positions_summary,
-)
-from charts import render_kpis, render_allocation_and_pnl, render_positions_table
-from correlation import render_correlation_section
-from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio  # <-- NOUVELLE LIGNE
-
+from portfolio.assets import attach_tags, load_synced_assets
+from portfolio.config import MIN_POSITION_VALUE_EUR
+from portfolio.data import compute_global_kpis, compute_kpis, load_portfolio, small_positions_summary
+from portfolio.history import load_history
+from portfolio.home import render_kpis
+from portfolio.tag_stats import UNTAGGED, symbol_tags_map, tag_history, tag_summary, tag_trades
+from portfolio.tag_view import render_tag_detail, render_tag_overview, render_tags_history
+from portfolio.theme import apply_theme
+# pytest tests -v
 apply_theme()  # doit être appelé avant tout autre st.* ou px.*
 
-data = load_data()
-df = build_assets_df(data)
-df = df[~((df["kind"] == CASH_KIND) & (df["symbol"] == "EUR"))].copy()
+data, df_all = load_portfolio()
+assets_data, _ = load_synced_assets(df_all)  # ajoute les nouveaux actifs détenus à la watchlist
+df_all = attach_tags(df_all, assets_data)
 
-# --- SYNCHRONISATION ET FUSION DES TAGS ---
-assets_data = load_assets_data()
-
-def resolver(symbol):
-    row = df[df["symbol"] == symbol]
-    if not row.empty:
-        return yfinance_ticker_for(row.iloc[0])
-    return symbol
-
-added = sync_watchlist_with_portfolio(assets_data, df, ticker_resolver=resolver)
-if added > 0:
-    save_assets_data(assets_data)
-
-tag_map = {a["ticker"]: a.get("tags", []) for a in assets_data["assets"]}
-
-def get_tags(row):
-    if row.get("ticker") in tag_map:
-        return tag_map[row["ticker"]]
-    elif row.get("symbol") in tag_map:
-        return tag_map[row["symbol"]]
-    return []
-
-df["tags"] = df.apply(get_tags, axis=1)
-
-# --- POSITIONS DE POUSSIÈRE ---
-# `df_all` garde toutes les positions pour les totaux : une position soldée (valeur 0) porte du
-# P&L réalisé qu'il ne faut pas perdre. `df` ne sert qu'à l'affichage (tableaux, graphiques,
-# corrélations). Le filtre vient APRÈS la synchro watchlist : tout actif détenu y est ajouté.
-df_all = df.copy()
+# `df_all` garde toutes les positions pour les totaux (une position soldée porte du P&L réalisé).
+# Le seuil de poussière ne sert qu'à l'affichage des graphiques d'allocation.
 n_dust, dust_value = small_positions_summary(df_all, MIN_POSITION_VALUE_EUR)
-df = filter_small_positions(df_all, MIN_POSITION_VALUE_EUR)
-
-
-# --- NOUVEAU : TABLEAU D'AGRÉGATION GLOBAL PAR TAG ---
-# On explode les tags : si un actif a 2 tags, il compte dans les 2 lignes du tableau
-df_global = df_all.copy()
-if not df_global.empty and "tags" in df_global.columns:
-    df_exploded = df_global.explode("tags").dropna(subset=["tags"])
-    if not df_exploded.empty:
-        tag_summary = df_exploded.groupby("tags").agg(
-            Valeur=("value_eur", "sum"),
-            Cout=("invested_eur", "sum"),
-            PnL=("pnl_total_eur", "sum"),
-        ).reset_index()
-        
-        tag_summary["PnL %"] = tag_summary.apply(lambda r: (r["PnL"]/r["Cout"]*100) if r["Cout"] > 0 else 0.0, axis=1)
-        tag_summary = tag_summary.sort_values("Valeur", ascending=False)
-        
-        st.subheader("📊 Vue d'ensemble : Performance par Tag")
-        
-        # Formatage pour l'affichage
-        tag_display = tag_summary.copy()
-        tag_display["Valeur"] = tag_display["Valeur"].apply(lambda x: f"{x:,.2f} €")
-        tag_display["Cout"] = tag_display["Cout"].apply(lambda x: f"{x:,.2f} €")
-        tag_display["PnL"] = tag_display["PnL"].apply(lambda x: f"{x:+,.2f} €")
-        tag_display["PnL %"] = tag_display["PnL %"].apply(lambda x: f"{x:+.2f} %")
-        
-        st.dataframe(tag_display.rename(columns={
-            "tags": "Tag",
-            "Valeur": "Valeur Totale",
-            "Cout": "Capital engagé",
-            "PnL": "P&L total (€)",
-            "PnL %": "Perf. totale (%)"
-        }), use_container_width=True, hide_index=True)
-        st.divider()
-
-# --- FILTRAGE PAR TAGS ---
-all_tags = sorted(set(tag for tags in df["tags"] for tag in tags))
-selected_tags: list[str] = []
-
-if all_tags:
-    st.sidebar.subheader("🏷️ Filtrer par Tag")
-    selected_tags = st.sidebar.multiselect("Sélectionner un ou plusieurs tags", all_tags)
-    
-    if selected_tags:
-        has_selected_tag = lambda x: any(t in x for t in selected_tags)
-        df = df[df["tags"].apply(has_selected_tag)].copy()
-        df_all = df_all[df_all["tags"].apply(has_selected_tag)].copy()
-
 if n_dust:
     st.sidebar.caption(
-        f"{n_dust} position(s) < {MIN_POSITION_VALUE_EUR:.0f} € masquée(s) des tableaux et graphiques "
+        f"{n_dust} position(s) < {MIN_POSITION_VALUE_EUR:.0f} € masquée(s) des graphiques "
         f"({dust_value:,.2f} € au total). Les totaux les incluent."
     )
 
-kpis = compute_kpis(df_all)
-# Le cash n'a pas de tag : on ne l'ajoute que sur le portefeuille complet.
-global_kpis = None if selected_tags else compute_global_kpis(df_all, data)
-
-render_kpis(kpis, global_kpis)
-
+# --- En-tête : le portefeuille complet ---
+render_kpis(compute_kpis(df_all), compute_global_kpis(df_all, data))
 st.divider()
 
-if df.empty:
-    st.info(f"Aucune position d'au moins {MIN_POSITION_VALUE_EUR:.0f} €.")
+summary = tag_summary(df_all)
+if summary.empty:
+    st.info("Aucune position à afficher.")
     st.stop()
 
-# Vue par actif : positions détenues + positions soldées qui portent du P&L réalisé.
-df_perf = df_all[(df_all["value_eur"] >= MIN_POSITION_VALUE_EUR) | (df_all["realized_pnl_eur"].abs() > 0.01)].copy()
+# --- Données par tag ---
+sym_tags = symbol_tags_map(df_all)
+try:
+    history = load_history()
+except ValueError as e:
+    st.warning(str(e))
+    history = None
+hist = tag_history(history, sym_tags)
+trades = tag_trades(data.get("trades"), sym_tags)
 
-render_allocation_and_pnl(df, df_perf)  # camembert : df ; barres de P&L : df_perf
+# --- 1. Vue d'ensemble : tous les tags ---
+render_tag_overview(summary)
+if UNTAGGED in set(summary["tag"]):
+    st.caption(f"« {UNTAGGED} » regroupe les actifs non taggés : à compléter dans la page Gestion Tags.")
 
 st.divider()
-render_positions_table(df_perf)
+
+# --- 2. Évolution : tous les tags ---
+render_tags_history(hist)
+
+st.divider()
+
+# --- 3. Détail d'un tag ---
+tag = st.selectbox("Tag à détailler", list(summary["tag"]), help="Triés par valeur décroissante.")
+render_tag_detail(tag, df_all, summary, hist, trades, MIN_POSITION_VALUE_EUR)

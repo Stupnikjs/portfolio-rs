@@ -11,10 +11,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import history_view as hv  # noqa: E402
-from data import history_to_df  # noqa: E402
+from portfolio import history as hv  # noqa: E402
+from portfolio.history import history_to_df  # noqa: E402
 
-PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "5_📈_Historique.py")
+PAGE = str(next((Path(__file__).resolve().parent.parent / "pages").glob("5_*Historique.py")))
 
 
 def raw_history(n: int = 6, incomplete_at: int | None = None) -> list[dict]:

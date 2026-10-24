@@ -1,31 +1,19 @@
-"""Page 4 : Gestion et assignation des Tags aux actifs du portefeuille."""
+"""Page Tags : gestion et assignation des Tags aux actifs du portefeuille."""
 from __future__ import annotations
 
-import pandas as pd
 import streamlit as st
 
-from data import load_data, build_assets_df, yfinance_ticker_for
-from assets_data import load_assets_data, save_assets_data, sync_watchlist_with_portfolio, update_asset
+from portfolio.assets import load_synced_assets, save_assets_data, update_asset
+from portfolio.data import build_assets_df, load_data
+from portfolio.theme import apply_theme
 
+apply_theme()
 st.title("🏷️ Gestion des Tags")
 
-# 1. Charger les données du portefeuille (dashboard.json)
-data = load_data()
-df_portfolio = build_assets_df(data)
-
-# 2. Charger les données des actifs (où sont stockés les tags)
-assets_data = load_assets_data()
-
-# 3. Synchroniser : ajouter automatiquement les nouveaux actifs achetés
-def resolver(symbol):
-    row = df_portfolio[df_portfolio["symbol"] == symbol]
-    if not row.empty:
-        return yfinance_ticker_for(row.iloc[0])
-    return symbol
-
-added = sync_watchlist_with_portfolio(assets_data, df_portfolio, ticker_resolver=resolver)
+# Positions (dashboard.json) + actifs suivis (où sont stockés les tags), nouveaux actifs ajoutés
+df_portfolio = build_assets_df(load_data())
+assets_data, added = load_synced_assets(df_portfolio)
 if added > 0:
-    save_assets_data(assets_data)
     st.toast(f"{added} nouvel(s) actif(s) ajouté(s) pour taggage.", icon="✅")
 
 # --- Récupérer tous les tags existants ---
@@ -93,7 +81,7 @@ st.markdown("**Ou créer un nouveau tag :**")
 new_tag = st.text_input("Nouveau tag (laisser vide pour ignorer)", placeholder="Ex: Tech, Dividende...")
 
 # Combiner les tags existants choisis et le nouveau tag
-new_tags_list = list(set(chosen_existing)) # On enlève les doublons
+new_tags_list = list(dict.fromkeys(chosen_existing))  # sans doublons, ordre conservé
 if new_tag.strip():
     new_tags_list.append(new_tag.strip())
 

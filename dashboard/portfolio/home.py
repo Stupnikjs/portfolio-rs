@@ -1,13 +1,42 @@
-"""KPIs en en-tête + graphiques d'allocation/P&L + tableau détaillé."""
+"""Page d'accueil : KPIs en en-tête, tableau par tag, allocation, P&L par actif, détail des positions."""
 from __future__ import annotations
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from data import format_display_df
-from theme import GAIN_COLOR, LOSS_COLOR
+from portfolio.theme import GAIN_COLOR, LOSS_COLOR
 
+
+# --- Mise en forme ------------------------------------------------------------
+
+def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Copie du DataFrame des positions formatée pour st.dataframe (colonnes renommées en français)."""
+    d = df.copy()
+    d["quantity"] = d["quantity"].apply(lambda x: f"{x:,.4f}")
+    for col in ("price_eur", "value_eur", "cost_basis_eur"):
+        d[col] = d[col].apply(lambda x: f"{x:,.2f} €")
+    for col in ("pnl_eur", "realized_pnl_eur", "pnl_total_eur"):
+        d[col] = d[col].apply(lambda x: f"{x:+,.2f} €")
+    for col in ("pnl_pct", "pnl_total_pct"):
+        d[col] = d[col].apply(lambda x: f"{x:+.2f} %")
+
+    return d.rename(columns={
+        "symbol": "Symbole",
+        "kind": "Type",
+        "quantity": "Quantité",
+        "price_eur": "Prix",
+        "value_eur": "Valeur",
+        "cost_basis_eur": "Cost Basis",
+        "pnl_eur": "P&L latent",
+        "pnl_pct": "Latent (%)",
+        "realized_pnl_eur": "P&L réalisé",
+        "pnl_total_eur": "P&L total",
+        "pnl_total_pct": "Perf. totale (%)",
+    })
+
+
+# --- Rendu ------------------------------------------------------------------------
 
 def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
     st.title("📈 Mon Portefeuille")
@@ -45,18 +74,52 @@ def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
         pnl_pct_global = kpis["total_pnl_eur"] / invested * 100 if invested > 0 else 0
         st.metric("Performance Globale (hors cash)", f"{pnl_pct_global:+.2f} %")
 
+
+def render_tag_summary(df_all: pd.DataFrame) -> None:
+    """Valeur, capital engagé et performance par tag. Un actif à 2 tags compte dans les 2 lignes."""
+    if df_all.empty or "tags" not in df_all.columns:
+        return
+    exploded = df_all.explode("tags").dropna(subset=["tags"])
+    if exploded.empty:
+        return
+
+    summary = exploded.groupby("tags").agg(
+        Valeur=("value_eur", "sum"),
+        Cout=("invested_eur", "sum"),
+        PnL=("pnl_total_eur", "sum"),
+    ).reset_index()
+    summary["PnL %"] = summary.apply(lambda r: (r["PnL"] / r["Cout"] * 100) if r["Cout"] > 0 else 0.0, axis=1)
+    summary = summary.sort_values("Valeur", ascending=False)
+
+    display = summary.copy()
+    display["Valeur"] = display["Valeur"].apply(lambda x: f"{x:,.2f} €")
+    display["Cout"] = display["Cout"].apply(lambda x: f"{x:,.2f} €")
+    display["PnL"] = display["PnL"].apply(lambda x: f"{x:+,.2f} €")
+    display["PnL %"] = display["PnL %"].apply(lambda x: f"{x:+.2f} %")
+
+    st.subheader("📊 Vue d'ensemble : Performance par Tag")
+    st.dataframe(
+        display.rename(columns={
+            "tags": "Tag",
+            "Valeur": "Valeur Totale",
+            "Cout": "Capital engagé",
+            "PnL": "P&L total (€)",
+            "PnL %": "Perf. totale (%)",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.divider()
+
+
 def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = None) -> None:
+    """Camembert d'allocation (df) et barres de P&L total par actif (df_perf, défaut : df)."""
     df_perf = df if df_perf is None else df_perf
     col_left, col_right = st.columns(2)
 
     with col_left:
         st.subheader("🥧 Allocation du Portefeuille")
-        fig_pie = px.pie(
-            df,
-            values="value_eur",
-            names="symbol",
-            hole=0.4,
-        )
+        fig_pie = px.pie(df, values="value_eur", names="symbol", hole=0.4)
         fig_pie.update_traces(textposition="inside", textinfo="percent+label")
         fig_pie.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
         st.plotly_chart(fig_pie, use_container_width=True)
@@ -71,8 +134,7 @@ def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = N
             .sort_values("allocation_pct", ascending=False)
             .reset_index(drop=True)
         )
-        # Arrondi pour éviter les bruits flottants
-        alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)
+        alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)  # évite les bruits flottants
 
         st.download_button(
             label="📥 Télécharger l'allocation (CSV)",
@@ -94,6 +156,7 @@ def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = N
         )
         fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
         st.plotly_chart(fig_bar, use_container_width=True)
+
 
 def render_positions_table(df: pd.DataFrame) -> None:
     st.subheader("📋 Détail des positions")

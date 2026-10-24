@@ -1,19 +1,19 @@
-"""Page Discipline : quota de trades par semaine (à placer dans dashboard/pages/)."""
+"""Page Discipline : quota de trades par semaine."""
 from __future__ import annotations
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from theme import apply_theme
-from config import WEEKLY_TRADE_QUOTA
-from data import load_data
+from portfolio.config import WEEKLY_TRADE_QUOTA
+from portfolio.data import load_data
+from portfolio.theme import apply_theme
 
 TZ = "Europe/Paris"
 GREEN, RED = "#2ecc71", "#e74c3c"
 QUOTA = WEEKLY_TRADE_QUOTA
 
-apply_theme()  # même en-tête que les autres pages
+apply_theme()
 st.title("🎯 Discipline : quota de trades")
 
 data = load_data()

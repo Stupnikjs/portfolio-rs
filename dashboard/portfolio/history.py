@@ -5,14 +5,16 @@ Lit `data/history.json` (pipeline Rust, lecture seule). La logique pure
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
 import streamlit as st
 
-from config import DATA_PATH
-from data import build_assets_df, compute_kpis, load_data, load_history
-from theme import BG_COLOR, GAIN_COLOR, GRID_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE, TEXT_COLOR
+from portfolio.config import DATA_PATH, HISTORY_PATH
+from portfolio.data import build_assets_df, compute_kpis, load_data
+from portfolio.theme import GAIN_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
 
 VALUE_COLOR = PASTEL_DARK_SEQUENCE[0]  # bleu
 COST_COLOR = PASTEL_DARK_SEQUENCE[2]   # jaune
@@ -25,6 +27,53 @@ PERIODS: dict[str, int | None] = {
     "1 an": 366,
     "Tout": None,
 }
+
+
+# --- Chargement de history.json -------------------------------------------------
+
+HISTORY_REQUIRED_COLUMNS = {"date", "total_value_eur", "total_cost_basis_eur"}
+
+
+def history_to_df(raw: list[dict]) -> pd.DataFrame:
+    """Transforme le contenu de history.json en DataFrame trié par date.
+
+    - accepte l'ancien nom de colonne `week_end` (renommé en `date`) ;
+    - `complete` absent (ancien format) -> True ;
+    - un doublon de date garde la dernière entrée ;
+    - lève ValueError si une colonne indispensable manque.
+    """
+    df = pd.DataFrame(raw)
+    if df.empty:
+        return pd.DataFrame(columns=sorted(HISTORY_REQUIRED_COLUMNS | {"total_pnl_eur", "complete", "assets"}))
+
+    if "date" not in df.columns and "week_end" in df.columns:
+        df = df.rename(columns={"week_end": "date"})
+
+    missing = HISTORY_REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(f"history.json : colonne(s) manquante(s) : {', '.join(sorted(missing))}")
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    df["complete"] = df["complete"].fillna(True).astype(bool) if "complete" in df.columns else True
+    if "total_pnl_eur" not in df.columns:
+        df["total_pnl_eur"] = df["total_value_eur"] - df["total_cost_basis_eur"]
+    if "assets" not in df.columns:
+        df["assets"] = None
+
+    return (
+        df.sort_values("date")
+        .drop_duplicates(subset="date", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def load_history(path: Path = HISTORY_PATH) -> pd.DataFrame | None:
+    """Charge history.json (pipeline Rust). Renvoie None si le fichier n'existe pas."""
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return history_to_df(json.load(f))
 
 
 # --- Logique pure ---------------------------------------------------------------
@@ -130,17 +179,6 @@ def asset_snapshot_df(assets: list[dict]) -> pd.DataFrame:
 
 # --- Rendu Streamlit ---------------------------------------------------------------
 
-def _ensure_dark_template() -> None:
-    if "portfolio_dark" not in pio.templates:
-        pio.templates["portfolio_dark"] = dict(
-            layout=dict(
-                paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-                xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
-            )
-        )
-    pio.templates.default = "portfolio_dark"
-
-
 def _live_kpis() -> dict | None:
     """KPIs du jour (même convention que la page d'accueil : cash exclu)."""
     if not DATA_PATH.exists():
@@ -149,7 +187,6 @@ def _live_kpis() -> dict | None:
 
 
 def render_history_page() -> None:
-    _ensure_dark_template()
     st.title("📈 Historique")
 
     try:

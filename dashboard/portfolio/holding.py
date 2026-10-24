@@ -2,7 +2,7 @@
 
 Lit `holdings`, `closed_sales` et `assets` dans dashboard.json (pipeline Rust,
 lecture seule). Logique pure (DataFrames, figures) séparée du rendu Streamlit,
-comme `history_view.py`.
+comme `history.py`.
 
 Vues :
 0. bandeau de KPI (âge moyen, plus vieux lot, capital jeune, lots, annualisé) ;
@@ -21,12 +21,11 @@ import math
 
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
 import streamlit as st
 
-from config import MIN_POSITION_VALUE_EUR
-from data import load_data
-from theme import BG_COLOR, GAIN_COLOR, GRID_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE, TEXT_COLOR
+from portfolio.config import MIN_POSITION_VALUE_EUR
+from portfolio.data import load_data
+from portfolio.theme import BG_COLOR, GAIN_COLOR, GRID_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
 
 # Sous ce seuil, une annualisation amplifie du bruit : on affiche « — ».
 MIN_DAYS_ANNUALIZED = 30
@@ -520,15 +519,6 @@ def style_closed_table(table: pd.DataFrame):
 
 # --- Rendu Streamlit ---------------------------------------------------------------
 
-def _ensure_dark_template() -> None:
-    if "portfolio_dark" not in pio.templates:
-        pio.templates["portfolio_dark"] = dict(layout=dict(
-            paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-            xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
-        ))
-    pio.templates.default = "portfolio_dark"
-
-
 def _render_kpis(kpis: dict) -> None:
     cols = st.columns(5)
     cols[0].metric("Âge moyen", format_days(kpis["avg_age_days"]),
@@ -567,7 +557,6 @@ def _render_trade_stats(stats: dict) -> None:
 
 
 def render_holding_page() -> None:
-    _ensure_dark_template()
     st.title("⏳ Durée de détention")
 
     data = load_data()

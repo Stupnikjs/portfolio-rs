@@ -1,4 +1,4 @@
-"""Page 4 : activité de trading -- fréquence des achats/ventes (par mois ou
+"""Page Activité : activité de trading -- fréquence des achats/ventes (par mois ou
 par semaine) et historique filtrable des trades.
 
 Lit uniquement `trades` et `trade_frequency` dans dashboard.json (pipeline
@@ -7,21 +7,12 @@ from __future__ import annotations
 
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.io as pio
 import streamlit as st
 
-from data import load_data
-from theme import BG_COLOR, TEXT_COLOR, GRID_COLOR, PASTEL_DARK_SEQUENCE
+from portfolio.data import load_data
+from portfolio.theme import PASTEL_DARK_SEQUENCE, apply_theme
 
-# Applique uniquement le template Plotly (set_page_config est déjà géré par app.py)
-if "portfolio_dark" not in pio.templates:
-    pio.templates["portfolio_dark"] = dict(
-        layout=dict(
-            paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR, font=dict(color=TEXT_COLOR),
-            xaxis=dict(gridcolor=GRID_COLOR), yaxis=dict(gridcolor=GRID_COLOR),
-        )
-    )
-pio.templates.default = "portfolio_dark"
+apply_theme()
 
 BUY_COLOR = PASTEL_DARK_SEQUENCE[0]   # bleu
 SELL_COLOR = PASTEL_DARK_SEQUENCE[2]  # orange

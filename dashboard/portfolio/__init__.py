@@ -1,0 +1,21 @@
+"""Dashboard portefeuille : carte du code.
+
+Flux de données (lecture seule, produites par le pipeline Rust `cargo run`) :
+    data/dashboard.json  -> positions, trades, ventes, corrélations, cash
+    data/history.json    -> valeur et cost basis par semaine
+Persistance propre au dashboard : data/assets/<TICKER>.json (tags, thèse, DCA).
+
+Modules (chacun ne dépend que de ceux de la liste au-dessus) :
+    config       constantes et chemins
+    theme        palette, template Plotly sombre, apply_theme() (à appeler en 1er sur chaque page)
+    data         chargement de dashboard.json, DataFrame des positions, KPIs
+    assets       actifs suivis et tags (data/assets/*.json)
+    home         page d'accueil : KPIs, allocation, P&L par actif, tableau par tag
+    history      page Historique (logique pure + rendu)
+    holding      page Détention (logique pure + rendu)
+    correlation  page Corrélation : matrice, groupes (clustering), variation par fenêtre
+
+Pages Streamlit (dossier pages/) : soit un script autonome (Activité, Tags, Discipline),
+soit un appel à `render_<page>_page()` du package (Historique, Détention, Corrélation).
+Convention : logique pure (DataFrames, figures) séparée du rendu `st.*`, pour pouvoir la tester.
+"""
