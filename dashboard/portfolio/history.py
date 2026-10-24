@@ -1,4 +1,4 @@
-"""Page Historique : courbe de la valeur totale et courbe du cost basis.
+"""Page Historique : plus-value latente dans le temps (valeur totale - cost basis).
 
 Lit `data/history.json` (pipeline Rust, lecture seule). La logique pure
 (filtrage, stats, figure) est séparée du rendu Streamlit pour être testable.
@@ -16,8 +16,7 @@ from portfolio.config import DATA_PATH, HISTORY_PATH
 from portfolio.data import build_assets_df, compute_kpis, load_data
 from portfolio.theme import GAIN_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
 
-VALUE_COLOR = PASTEL_DARK_SEQUENCE[0]  # bleu
-COST_COLOR = PASTEL_DARK_SEQUENCE[2]   # jaune
+LINE_COLOR = PASTEL_DARK_SEQUENCE[0]  # bleu : courbe de la plus-value latente
 
 # Libellé -> nombre de jours affichés (None = tout l'historique).
 PERIODS: dict[str, int | None] = {
@@ -124,27 +123,62 @@ def period_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def unrealized_gain(df: pd.DataFrame) -> pd.Series:
+    """Écart valeur totale - cost basis (plus-value latente), en EUR, pour chaque point."""
+    return df["total_value_eur"] - df["total_cost_basis_eur"]
+
+
+def split_at_zero(x: pd.Series, y: pd.Series) -> tuple[list, list[float]]:
+    """Série (x, y) avec un point interpolé à y = 0 à chaque changement de signe.
+
+    Permet de remplir proprement la partie positive et la partie négative d'une courbe
+    sans qu'un segment qui traverse zéro déborde de l'autre côté.
+    """
+    xs, ys = list(x), [float(v) for v in y]
+    out_x, out_y = [], []
+    for i, (xi, yi) in enumerate(zip(xs, ys)):
+        if i > 0 and ys[i - 1] * yi < 0:
+            share = ys[i - 1] / (ys[i - 1] - yi)
+            out_x.append(xs[i - 1] + (xi - xs[i - 1]) * share)
+            out_y.append(0.0)
+        out_x.append(xi)
+        out_y.append(yi)
+    return out_x, out_y
+
+
 def build_history_figure(df: pd.DataFrame) -> go.Figure:
-    """Deux courbes (valeur totale, cost basis) + croix rouges sur les points incomplets."""
+    """Plus-value latente (valeur - cost basis) : courbe + remplissage vert (gain) / rouge (perte).
+
+    La première trace est la courbe elle-même, un point par ligne de `df` ; viennent ensuite
+    les remplissages, puis les croix rouges (points incomplets) et le point actuel.
+    """
     few_points = len(df) <= 40
     mode = "lines+markers" if few_points else "lines"
+    gain = unrealized_gain(df)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df["date"], y=df["total_value_eur"], name="Valeur totale", mode=mode,
-        line=dict(color=VALUE_COLOR, width=2.5), marker=dict(size=5),
-        hovertemplate="%{y:,.2f} €",
+        x=df["date"], y=gain, name="Plus-value latente", mode=mode,
+        line=dict(color=LINE_COLOR, width=2.5), marker=dict(size=5),
+        hovertemplate="%{y:+,.2f} €",
     ))
-    fig.add_trace(go.Scatter(
-        x=df["date"], y=df["total_cost_basis_eur"], name="Cost basis", mode=mode,
-        line=dict(color=COST_COLOR, width=2, dash="dash"), marker=dict(size=5),
-        hovertemplate="%{y:,.2f} €",
-    ))
+
+    fill_x, fill_y = split_at_zero(df["date"], gain)
+    for name, color, values in (
+        ("Gain", GAIN_COLOR, [max(v, 0.0) for v in fill_y]),
+        ("Perte", LOSS_COLOR, [min(v, 0.0) for v in fill_y]),
+    ):
+        fig.add_trace(go.Scatter(
+            x=fill_x, y=values, name=name, mode="lines", line=dict(width=0),
+            fill="tozeroy", fillcolor=_with_alpha(color, 0.25),
+            showlegend=False, hoverinfo="skip",
+        ))
+    fig.add_hline(y=0, line=dict(color="rgba(150,150,150,0.6)", width=1))
 
     incomplete = df[~df["complete"]]
     if not incomplete.empty:
         fig.add_trace(go.Scatter(
-            x=incomplete["date"], y=incomplete["total_value_eur"],
+            x=incomplete["date"], y=unrealized_gain(incomplete),
             name="Prix manquants/reportés", mode="markers",
             marker=dict(symbol="x", size=11, color=LOSS_COLOR, line=dict(width=2)),
             hovertemplate="Prix incomplet<extra></extra>",
@@ -153,18 +187,25 @@ def build_history_figure(df: pd.DataFrame) -> go.Figure:
     live = df[df["live"]] if "live" in df.columns else df.iloc[0:0]
     if not live.empty:
         fig.add_trace(go.Scatter(
-            x=live["date"], y=live["total_value_eur"], name="Aujourd'hui", mode="markers",
+            x=live["date"], y=unrealized_gain(live), name="Aujourd'hui", mode="markers",
             marker=dict(symbol="circle-open", size=12, color=GAIN_COLOR, line=dict(width=2)),
-            hovertemplate="%{y:,.2f} € (valeur actuelle)<extra></extra>",
+            hovertemplate="%{y:+,.2f} € (actuel)<extra></extra>",
         ))
 
     fig.update_layout(
         height=480, hovermode="x unified",
         margin=dict(l=10, r=10, t=30, b=10),
-        yaxis=dict(ticksuffix=" €", rangemode="tozero"),
+        yaxis=dict(ticksuffix=" €", zeroline=False),
         legend=dict(orientation="h", y=1.08, x=0),
     )
     return fig
+
+
+def _with_alpha(color: str, alpha: float) -> str:
+    """'#RRGGBB' -> 'rgba(r, g, b, alpha)' (plotly n'accepte pas l'alpha en hexadécimal 6 chiffres)."""
+    h = color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r}, {g}, {b}, {alpha})"
 
 
 def asset_snapshot_df(assets: list[dict]) -> pd.DataFrame:
@@ -224,8 +265,9 @@ def render_history_page() -> None:
 
     st.plotly_chart(build_history_figure(view), use_container_width=True)
     st.caption(
-        "Écart entre les deux courbes = plus-value latente. Le cash est exclu. "
-        "Les variations du cost basis correspondent aux achats/ventes."
+        "Courbe = valeur totale - cost basis (plus-value latente), cash exclu. Un achat ne la modifie pas "
+        "(valeur et cost basis montent ensemble) ; elle bouge avec les prix, et redescend quand tu "
+        "vends des positions gagnantes (la plus-value devient réalisée)."
     )
 
     n_bad = int((~view["complete"]).sum())

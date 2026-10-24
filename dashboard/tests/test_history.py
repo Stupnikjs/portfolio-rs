@@ -121,14 +121,47 @@ def test_period_stats_zero_cost_does_not_divide_by_zero():
 
 # --- figure ---------------------------------------------------------------------------
 
-def test_figure_has_one_curve_for_value_and_one_for_cost_basis():
+def test_unrealized_gain_is_value_minus_cost_basis():
+    df = history_to_df(raw_history(3))  # valeurs 1000, 1100, 1200 ; cost 900, 950, 1000
+    assert list(hv.unrealized_gain(df)) == [100.0, 150.0, 200.0]
+
+
+def test_figure_plots_the_gap_between_value_and_cost_basis_not_the_two_curves():
     df = history_to_df(raw_history(5)).assign(live=False)
     fig = hv.build_history_figure(df)
 
-    names = [t.name for t in fig.data]
-    assert names == ["Valeur totale", "Cost basis"]
-    assert list(fig.data[0].y) == list(df["total_value_eur"])
-    assert list(fig.data[1].y) == list(df["total_cost_basis_eur"])
+    main = fig.data[0]
+    assert main.name == "Plus-value latente"
+    assert list(main.x) == list(df["date"])                      # un point par snapshot
+    assert list(main.y) == list(df["total_value_eur"] - df["total_cost_basis_eur"])
+    assert not {"Valeur totale", "Cost basis"} & {t.name for t in fig.data}
+
+
+def test_figure_fills_gains_in_green_and_losses_in_red_across_a_sign_change():
+    raw = [
+        {"date": "2026-03-01", "total_value_eur": 900.0, "total_cost_basis_eur": 1000.0},   # -100
+        {"date": "2026-03-15", "total_value_eur": 1100.0, "total_cost_basis_eur": 1000.0},  # +100
+        {"date": "2026-03-29", "total_value_eur": 1050.0, "total_cost_basis_eur": 1000.0},  # +50
+    ]
+    fig = hv.build_history_figure(history_to_df(raw).assign(live=False))
+    by_name = {t.name: t for t in fig.data}
+
+    gain, loss = by_name["Gain"], by_name["Perte"]
+    assert min(gain.y) >= 0 and max(loss.y) <= 0
+    assert gain.fill == "tozeroy" and loss.fill == "tozeroy"
+    # le croisement de zéro est interpolé à mi-chemin (2026-03-08) pour que les remplissages ne débordent pas
+    assert pd.Timestamp("2026-03-08") in list(gain.x)
+    assert max(gain.y) == 100.0 and min(loss.y) == -100.0
+
+
+def test_split_at_zero_inserts_an_interpolated_point_only_when_the_sign_changes():
+    x = pd.Series(pd.to_datetime(["2026-01-01", "2026-01-03", "2026-01-05"]))
+    xs, ys = hv.split_at_zero(x, pd.Series([-10.0, 10.0, 20.0]))
+    assert xs == [pd.Timestamp("2026-01-01"), pd.Timestamp("2026-01-02"), pd.Timestamp("2026-01-03"), pd.Timestamp("2026-01-05")]
+    assert ys == [-10.0, 0.0, 10.0, 20.0]
+
+    xs, ys = hv.split_at_zero(x, pd.Series([5.0, 0.0, 20.0]))  # toucher zéro n'est pas le traverser
+    assert len(xs) == 3 and ys == [5.0, 0.0, 20.0]
 
 
 def test_figure_flags_incomplete_snapshots_and_the_live_point():
@@ -138,7 +171,8 @@ def test_figure_flags_incomplete_snapshots_and_the_live_point():
 
     by_name = {t.name: t for t in fig.data}
     assert list(by_name["Prix manquants/reportés"].x) == [pd.Timestamp("2026-03-15")]
-    assert list(by_name["Aujourd'hui"].y) == [2000.0]
+    assert list(by_name["Prix manquants/reportés"].y) == [200.0]  # snapshot n°2 : valeur 1200 - cost 1000
+    assert list(by_name["Aujourd'hui"].y) == [500.0]  # 2000 - 1500
 
 
 def test_figure_uses_lines_only_for_long_histories():
