@@ -8,7 +8,9 @@ from portfolio.config import MIN_POSITION_VALUE_EUR
 from portfolio.data import compute_global_kpis, compute_kpis, load_portfolio, small_positions_summary
 from portfolio.history import load_history
 from portfolio.home import render_kpis
-from portfolio.tag_stats import UNTAGGED, symbol_tags_map, tag_history, tag_summary, tag_trades
+from portfolio.tag_stats import (
+    UNTAGGED, symbol_tags_map, tag_history, tag_overlap, tag_returns, tag_summary, tag_trades,
+)
 from portfolio.tag_view import render_tag_detail, render_tag_overview, render_tags_history
 from portfolio.theme import apply_theme
 # pytest tests -v
@@ -44,17 +46,18 @@ except ValueError as e:
     st.warning(str(e))
     history = None
 hist = tag_history(history, sym_tags)
+returns = tag_returns(history, sym_tags)
 trades = tag_trades(data.get("trades"), sym_tags)
 
 # --- 1. Vue d'ensemble : tous les tags ---
-render_tag_overview(summary)
+render_tag_overview(summary, tag_overlap(df_all))
 if UNTAGGED in set(summary["tag"]):
     st.caption(f"« {UNTAGGED} » regroupe les actifs non taggés : à compléter dans la page Gestion Tags.")
 
 st.divider()
 
 # --- 2. Évolution : tous les tags ---
-render_tags_history(hist)
+render_tags_history(hist, returns)
 
 st.divider()
 
