@@ -14,7 +14,9 @@ from portfolio.config import MIN_POSITION_VALUE_EUR
 from portfolio.data import compute_global_kpis, compute_kpis, load_portfolio, small_positions_summary
 from portfolio.history import load_history
 from portfolio.home import render_kpis
-from portfolio.tag_stats import UNTAGGED, symbol_tags_map, tag_history, tag_summary, tag_trades
+from portfolio.tag_stats import (
+    UNTAGGED, symbol_tags_map, tag_history, tag_overlap, tag_returns, tag_summary, tag_trades,
+)
 from portfolio.tag_view import render_tag_detail, render_tag_overview, render_tags_history
 from portfolio.theme import apply_theme
 # pytest tests -v
@@ -50,23 +52,25 @@ except ValueError as e:
     st.warning(str(e))
     history = None
 hist = tag_history(history, sym_tags)
+returns = tag_returns(history, sym_tags)
 trades = tag_trades(data.get("trades"), sym_tags)
 
 # --- 1. Vue d'ensemble : tous les tags ---
-render_tag_overview(summary)
+render_tag_overview(summary, tag_overlap(df_all))
 if UNTAGGED in set(summary["tag"]):
     st.caption(f"« {UNTAGGED} » regroupe les actifs non taggés : à compléter dans la page Gestion Tags.")
 
 st.divider()
 
 # --- 2. Évolution : tous les tags ---
-render_tags_history(hist)
+render_tags_history(hist, returns)
 
 st.divider()
 
 # --- 3. Détail d'un tag ---
 tag = st.selectbox("Tag à détailler", list(summary["tag"]), help="Triés par valeur décroissante.")
 render_tag_detail(tag, df_all, summary, hist, trades, MIN_POSITION_VALUE_EUR)
+
 
 ################################################################################
 # Dossier : dashboard/pages
@@ -2606,6 +2610,7 @@ Un actif sans tag tombe dans le tag « Sans tag ».
 """
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 UNTAGGED = "Sans tag"
@@ -2732,6 +2737,147 @@ def trades_by_month(trades_tag: pd.DataFrame) -> pd.DataFrame:
         .sort_values("month")
     )
 
+
+# --- Chevauchement entre tags ---------------------------------------------------------
+
+def tag_overlap(df_all: pd.DataFrame) -> pd.DataFrame:
+    """Matrice de chevauchement (en %) : cellule (A, B) = part de la valeur de A portée aussi par B.
+
+    Diagonale = 100. Vide s'il y a moins de 2 tags réels (« Sans tag » est ignoré).
+    """
+    ex = explode_tags(df_all)
+    ex = ex[(ex["tag"] != UNTAGGED) & (ex["value_eur"] > 0)]
+    if ex["tag"].nunique() < 2:
+        return pd.DataFrame()
+    m = ex.pivot_table(index="symbol", columns="tag", values="value_eur", aggfunc="sum", fill_value=0.0)
+    m = m[m.sum().sort_values(ascending=False).index]          # tags triés par valeur décroissante
+    shared = m.T @ (m > 0).astype(float)                        # [A, B] = valeur de A sur les actifs aussi dans B
+    return shared.div(m.sum(), axis=0) * 100
+
+
+# --- Performance par tag, insensible aux flux ---------------------------------------------
+
+def tag_returns(history: pd.DataFrame | None, sym_tags: dict[str, list[str]]) -> pd.DataFrame:
+    """Rendement par (date, tag) entre deux snapshots consécutifs, hors achats/ventes.
+
+    Pour chaque actif détenu au snapshot précédent : gain = quantité_précédente x variation de prix.
+    Le rendement du tag = somme des gains / somme des valeurs de départ. Un achat ou une vente
+    entre deux dates ne change donc pas la performance (contrairement à la valeur en €).
+
+    Colonnes : date, tag, ret (fraction), gain_eur, base_eur (valeur de départ du tag),
+    port_gain_eur, port_base_eur (même chose pour tout le portefeuille, sans double compte).
+    Chaque tag commence par une ligne d'ancrage (ret = 0, gain/base = 0, port_* = NaN).
+    """
+    cols = ["date", "tag", "ret", "gain_eur", "base_eur", "port_gain_eur", "port_base_eur"]
+    if history is None or history.empty:
+        return pd.DataFrame(columns=cols)
+
+    rows, prev, prev_date = [], None, None
+    for date, assets in zip(history["date"], history["assets"]):
+        if not isinstance(assets, list):
+            prev, prev_date = None, None
+            continue
+        cur = {a["symbol"]: (float(a.get("quantity") or 0.0), float(a.get("price_eur") or 0.0))
+               for a in assets if a.get("kind") != CASH_KIND and a.get("symbol")}
+        if prev is not None:
+            gain: dict[str, float] = {}
+            base: dict[str, float] = {}
+            pg = pb = 0.0
+            for sym, (q0, p0) in prev.items():
+                p1 = cur.get(sym, (0.0, 0.0))[1]
+                if q0 <= 0 or p0 <= 0 or p1 <= 0:
+                    continue
+                pg += q0 * (p1 - p0)
+                pb += q0 * p0
+                for tag in sym_tags.get(sym, [UNTAGGED]):
+                    gain[tag] = gain.get(tag, 0.0) + q0 * (p1 - p0)
+                    base[tag] = base.get(tag, 0.0) + q0 * p0
+            rows += [(prev_date, date, tag, gain[tag] / b, gain[tag], b, pg, pb) for tag, b in base.items()]
+        prev, prev_date = cur, date
+
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    r = pd.DataFrame(rows, columns=["prev_date"] + cols)
+    out = []
+    for tag, g in r.sort_values("date").groupby("tag"):
+        anchor = pd.DataFrame({"date": [g["prev_date"].iloc[0]], "tag": [tag], "ret": [0.0],
+                               "gain_eur": [0.0], "base_eur": [0.0],
+                               "port_gain_eur": [np.nan], "port_base_eur": [np.nan]})
+        out.append(pd.concat([anchor, g[cols]], ignore_index=True))
+    return pd.concat(out, ignore_index=True).sort_values(["tag", "date"]).reset_index(drop=True)
+
+
+def rebase_returns(returns: pd.DataFrame, start: pd.Timestamp | None = None) -> pd.DataFrame:
+    """Ajoute `index` : base 100 au premier point de chaque tag dans la fenêtre (date >= start)."""
+    d = returns if start is None else returns[returns["date"] >= start]
+    d = d.sort_values(["tag", "date"]).reset_index(drop=True)
+    if d.empty:
+        return d.assign(index=pd.Series(dtype=float))
+    d.loc[~d.duplicated("tag"), "ret"] = 0.0
+    d["index"] = 100 * (1 + d["ret"]).groupby(d["tag"]).cumprod()
+    return d
+
+
+def tag_perf_stats(rebased: pd.DataFrame, min_points_vol: int = 8) -> pd.DataFrame:
+    """Par tag : performance sur la fenêtre, volatilité annualisée, drawdown max, nb de points."""
+    rows = []
+    for tag, g in rebased.sort_values("date").groupby("tag"):
+        idx = g["index"]
+        rets = g["ret"].iloc[1:]
+        vol = np.nan
+        if len(rets) >= min_points_vol:
+            step = g["date"].diff().dt.days.median()
+            vol = rets.std() * np.sqrt(365 / step if step and step > 0 else 52) * 100
+        rows.append({
+            "tag": tag,
+            "perf_pct": (idx.iloc[-1] / 100 - 1) * 100,
+            "vol_pct": vol,
+            "max_dd_pct": (idx / idx.cummax() - 1).min() * 100,
+            "points": len(g),
+        })
+    return pd.DataFrame(rows, columns=["tag", "perf_pct", "vol_pct", "max_dd_pct", "points"]) \
+        .sort_values("perf_pct", ascending=False).reset_index(drop=True)
+
+
+def tag_contribution(returns: pd.DataFrame, start: pd.Timestamp | None = None) -> tuple[pd.DataFrame, float]:
+    """Contribution de chaque tag à la performance du portefeuille sur la fenêtre (date >= start).
+
+    Par période : gain du tag / valeur de départ de TOUT le portefeuille ; les périodes sont ensuite
+    additionnées (approximation). Un actif à plusieurs tags contribue à chacun : les contributions
+    ne s'additionnent donc pas. Renvoie (df[tag, contrib_pts, gain_eur], performance du portefeuille en %).
+    """
+    empty = pd.DataFrame(columns=["tag", "contrib_pts", "gain_eur"])
+    d = returns if start is None else returns[returns["date"] >= start]
+    if d.empty:
+        return empty, 0.0
+    start_point = d["date"].min()                       # point de départ de la fenêtre (ancrage inclus)
+    d = d[(d["date"] > start_point) & (d["port_base_eur"] > 0)]   # périodes qui commencent dans la fenêtre
+    if d.empty:
+        return empty, 0.0
+
+    port = d.drop_duplicates("date")
+    port_perf = float(((1 + port["port_gain_eur"] / port["port_base_eur"]).prod() - 1) * 100)
+    d = d.assign(c=d["gain_eur"] / d["port_base_eur"] * 100)
+    out = d.groupby("tag").agg(contrib_pts=("c", "sum"), gain_eur=("gain_eur", "sum")).reset_index()
+    return out.sort_values("contrib_pts", ascending=False).reset_index(drop=True), port_perf
+
+
+def tag_correlation(rebased: pd.DataFrame, min_points: int = 8) -> pd.DataFrame:
+    """Corrélation des rendements périodiques entre tags (fenêtre déjà appliquée par rebase_returns).
+
+    Vide s'il y a moins de 2 tags ou moins de `min_points` périodes communes.
+    Attention : deux tags qui partagent des actifs sont corrélés mécaniquement.
+    """
+    if rebased.empty or rebased["tag"].nunique() < 2:
+        return pd.DataFrame()
+    d = rebased[rebased.duplicated("tag")]              # retire le 1er point (ret forcé à 0)
+    wide = d.pivot(index="date", columns="tag", values="ret").dropna(how="all")
+    if len(wide) < min_points:
+        return pd.DataFrame()
+    return wide.corr(min_periods=min_points).dropna(how="all").dropna(axis=1, how="all")
+
+
 ################################################################################
 # Dossier : dashboard/portfolio
 # Fichier : tag_view.py
@@ -2746,8 +2892,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from portfolio.history import PERIODS
 from portfolio.home import render_positions_table
-from portfolio.tag_stats import positions_of_tag, trades_by_month
+from portfolio.tag_stats import (
+    positions_of_tag, rebase_returns, tag_contribution, tag_correlation, tag_perf_stats, trades_by_month,
+)
 from portfolio.theme import GAIN_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
 
 BUY_COLOR = PASTEL_DARK_SEQUENCE[0]
@@ -2758,149 +2907,18 @@ MARGIN = dict(l=10, r=10, t=40, b=10)
 
 # --- Vue d'ensemble : tous les tags côte à côte --------------------------------------
 
-def render_tag_overview(summary: pd.DataFrame) -> None:
+def render_tag_overview(summary: pd.DataFrame, overlap: pd.DataFrame | None = None) -> None:
     st.subheader("🏷️ Vue d'ensemble par tag")
     st.caption("Un actif à plusieurs tags compte dans chacun d'eux : les lignes ne s'additionnent pas.")
 
     c1, c2, c3 = st.columns(3)
 
-    fig_alloc = px.pie(summary, values="value", names="tag", hole=0.4, title="Poids par tag (valeur)")
-    fig_alloc.update_traces(textposition="inside", textinfo="percent+label")
-    fig_alloc.update_layout(showlegend=False, margin=MARGIN)
-    c1.plotly_chart(fig_alloc, use_container_width=True)
-
-    fig_pnl = px.bar(
-        summary, x="tag", y="pnl_total", color="pnl_color", color_discrete_map=COLOR_MAP,
-        labels={"pnl_total": "P&L total (€)", "tag": "Tag"}, title="P&L total par tag (€)",
+    by_weight = summary.sort_values("weight_pct")
+    fig_alloc = px.bar(
+        by_weight, x="weight_pct", y="tag", orientation="h",
+        labels={"weight_pct": "% du portefeuille", "tag": ""}, title="Poids par tag (% du portefeuille)",
     )
-    fig_pnl.update_layout(showlegend=False, margin=MARGIN)
-    c2.plotly_chart(fig_pnl, use_container_width=True)
-
-    by_perf = summary.sort_values("perf_pct", ascending=False)
-    fig_perf = px.bar(
-        by_perf, x="tag", y="perf_pct", color="pnl_color", color_discrete_map=COLOR_MAP,
-        labels={"perf_pct": "Perf. totale (%)", "tag": "Tag"}, title="Performance par tag (%)",
-    )
-    fig_perf.update_layout(showlegend=False, margin=MARGIN, yaxis=dict(ticksuffix=" %"))
-    c3.plotly_chart(fig_perf, use_container_width=True)
-
-    st.dataframe(
-        summary[["tag", "positions", "value", "weight_pct", "cost_basis", "pnl_latent", "latent_pct",
-                 "pnl_realized", "pnl_total", "invested", "perf_pct"]],
-        hide_index=True, use_container_width=True,
-        column_config={
-            "tag": "Tag",
-            "positions": st.column_config.NumberColumn("Positions", format="%d"),
-            "value": st.column_config.NumberColumn("Valeur", format="%.2f €"),
-            "weight_pct": st.column_config.NumberColumn("Poids", format="%.1f %%"),
-            "cost_basis": st.column_config.NumberColumn(
-                "Capital engagé", format="%.2f €", help="Cost basis des lots encore détenus."),
-            "pnl_latent": st.column_config.NumberColumn("P&L latent", format="%+.2f €"),
-            "latent_pct": st.column_config.NumberColumn(
-                "Latent (%)", format="%+.2f %%", help="P&L latent / capital engagé."),
-            "pnl_realized": st.column_config.NumberColumn("P&L réalisé", format="%+.2f €"),
-            "pnl_total": st.column_config.NumberColumn("P&L total", format="%+.2f €"),
-            "invested": st.column_config.NumberColumn(
-                "Total investi", format="%.2f €", help="Cumulé : lots détenus + lots déjà vendus."),
-            "perf_pct": st.column_config.NumberColumn(
-                "Perf. totale", format="%+.2f %%", help="P&L total / total investi (cumulé)."),
-        },
-    )
-
-
-# --- Évolution dans le temps : tous les tags ---------------------------------------------
-
-def render_tags_history(hist: pd.DataFrame) -> None:
-    st.subheader("📈 Évolution par tag")
-    if hist.empty:
-        st.info("Pas d'historique par actif (history.json absent ou sans détail : "
-                "relance `cargo run -- --rebuild-history`).")
-        return
-
-    metric = st.radio(
-        "Mesure", ["Valeur (€)", "P&L latent (%)"], horizontal=True, label_visibility="collapsed",
-    )
-    y, suffix = ("value_eur", " €") if metric == "Valeur (€)" else ("pnl_pct", " %")
-    fig = px.line(hist, x="date", y=y, color="tag", labels={y: metric, "date": "", "tag": "Tag"})
-    fig.update_layout(height=420, margin=MARGIN, hovermode="x unified",
-                      yaxis=dict(ticksuffix=suffix), legend=dict(orientation="h", y=1.1, x=0))
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("P&L latent (%) = (valeur − cost basis) / cost basis des lots ouverts à chaque date.")
-
-
-# --- Détail d'un tag --------------------------------------------------------------------
-
-def render_tag_detail(
-    tag: str,
-    df_all: pd.DataFrame,
-    summary: pd.DataFrame,
-    hist: pd.DataFrame,
-    trades: pd.DataFrame,
-    min_value_eur: float,
-) -> None:
-    """KPIs, allocation, P&L par actif, historique, activité et positions d'un tag."""
-    row = summary[summary["tag"] == tag].iloc[0]
-    positions = positions_of_tag(df_all, tag)
-    held = positions[positions["value_eur"] >= min_value_eur]            # allocation : sans poussière
-    perf = positions[(positions["value_eur"] >= min_value_eur) | (positions["realized_pnl_eur"].abs() > 0.01)]
-
-    st.subheader(f"🔎 Détail : {tag}")
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Valeur", f"{row['value']:,.2f} €", f"{row['weight_pct']:.1f} % du portefeuille", delta_color="off")
-    k2.metric("Capital engagé", f"{row['cost_basis']:,.2f} €",
-              help=f"Cost basis des lots détenus. Total investi cumulé (lots vendus inclus) : {row['invested']:,.2f} €.")
-    k3.metric("P&L total", f"{row['pnl_total']:+,.2f} €", f"{row['perf_pct']:+.2f} %")
-    k4.metric("Positions", f"{int(row['positions'])}")
-
-    k5, k6, k7, _ = st.columns(4)
-    k5.metric("P&L latent", f"{row['pnl_latent']:+,.2f} €", f"{row['latent_pct']:+.2f} %")
-    k6.metric("P&L réalisé", f"{row['pnl_realized']:+,.2f} €")
-    if not perf.empty:
-        best = perf.loc[perf["pnl_total_pct"].idxmax()]
-        k7.metric("Meilleur actif", best["symbol"], f"{best['pnl_total_pct']:+.1f} %")
-
-    left, right = st.columns(2)
-    if not held.empty:
-        fig_pie = px.pie(held, values="value_eur", names="symbol", hole=0.4, title=f"Répartition dans « {tag} »")
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(showlegend=False, margin=MARGIN)
-        left.plotly_chart(fig_pie, use_container_width=True)
-    if not perf.empty:
-        fig_bar = px.bar(
-            perf.sort_values("pnl_total_eur", ascending=False), x="symbol", y="pnl_total_eur",
-            color="pnl_color", color_discrete_map=COLOR_MAP,
-            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"}, title="P&L total par actif (€)",
-        )
-        fig_bar.update_layout(showlegend=False, margin=MARGIN)
-        right.plotly_chart(fig_bar, use_container_width=True)
-
-    # --- Historique du tag ---
-    h = hist[hist["tag"] == tag]
-    if len(h) >= 2:
-        fig_h = go.Figure()
-        fig_h.add_scatter(x=h["date"], y=h["value_eur"], name="Valeur", mode="lines",
-                          line=dict(color=BUY_COLOR, width=2.5), hovertemplate="%{y:,.2f} €")
-        fig_h.add_scatter(x=h["date"], y=h["cost_basis_eur"], name="Cost basis", mode="lines",
-                          line=dict(color=SELL_COLOR, width=2, dash="dash"), hovertemplate="%{y:,.2f} €")
-        fig_h.update_layout(title="Valeur et cost basis dans le temps", height=380, margin=MARGIN,
-                            hovermode="x unified", yaxis=dict(ticksuffix=" €", rangemode="tozero"),
-                            legend=dict(orientation="h", y=1.12, x=0))
-        st.plotly_chart(fig_h, use_container_width=True)
-
-    # --- Activité du tag ---
-    t = trades[trades["tag"] == tag] if not trades.empty else trades
-    monthly = trades_by_month(t)
-    if not monthly.empty:
-        fig_t = go.Figure()
-        fig_t.add_bar(x=monthly["month"], y=monthly["bought"], name="Acheté", marker_color=BUY_COLOR)
-        fig_t.add_bar(x=monthly["month"], y=monthly["sold"], name="Vendu", marker_color=SELL_COLOR)
-        fig_t.update_layout(barmode="group", title=f"Activité mensuelle ({int(monthly['n_trades'].sum())} trades)",
-                            height=340, margin=MARGIN, xaxis=dict(type="category"),
-                            yaxis=dict(ticksuffix=" €"), legend=dict(orientation="h", y=1.12, x=0))
-        st.plotly_chart(fig_t, use_container_width=True)
-
-    render_positions_table(perf)
+    fig_alloc.update_traces(texttemplate="%{x:.1f} %", textposition="outside", cliponaxis=False)
 
 ################################################################################
 # Dossier : dashboard/portfolio
@@ -3252,57 +3270,4 @@ def test_summary_counts_multi_tag_assets_in_each_tag_and_keeps_closed_positions(
     assert s.loc["Tech", "value"] == 600.0 and s.loc["Dividende", "value"] == 600.0
     assert s.loc["Tech", "pnl_total"] == 150.0          # AIR 100 + OLD 50 réalisé
     assert s.loc["Tech", "cost_basis"] == 500.0         # capital engagé : lots ouverts seulement
-    assert s.loc["Tech", "latent_pct"] == pytest.approx(20.0)
-    assert s.loc["Tech", "invested"] == 600.0           # total investi cumulé : 500 + 100
-    assert s.loc["Tech", "perf_pct"] == pytest.approx(25.0)
-    assert s.loc["Tech", "positions"] == 1              # OLD est soldée
-    assert s.loc["Crypto", "pnl_color"] == "Perte"
-
-
-def test_summary_weight_uses_real_total_without_double_counting_or_cash():
-    s = ts.tag_summary(positions()).set_index("tag")
-    assert s.loc["Tech", "weight_pct"] == pytest.approx(60.0)  # 600 / (600+300+100)
-
-
-def test_positions_of_tag_handles_untagged_bucket():
-    df = positions()
-    assert list(ts.positions_of_tag(df, ts.UNTAGGED)["symbol"]) == ["XYZ"]
-    assert set(ts.positions_of_tag(df, "Tech")["symbol"]) == {"AIR", "OLD"}
-
-
-def test_tag_history_sums_assets_per_date_and_tag():
-    history = pd.DataFrame({
-        "date": pd.to_datetime(["2026-03-01", "2026-03-08"]),
-        "assets": [
-            [{"symbol": "AIR", "kind": "Stock", "value_eur": 100.0, "cost_basis_eur": 80.0},
-             {"symbol": "BTC", "kind": "Crypto", "value_eur": 50.0, "cost_basis_eur": 60.0}],
-            [{"symbol": "AIR", "kind": "Stock", "value_eur": 120.0, "cost_basis_eur": 80.0}],
-        ],
-    })
-    h = ts.tag_history(history, {"AIR": ["Tech", "Dividende"], "BTC": ["Crypto"]})
-    tech = h[h["tag"] == "Tech"].reset_index(drop=True)
-
-    assert list(tech["value_eur"]) == [100.0, 120.0]
-    assert tech.loc[1, "pnl_pct"] == pytest.approx(50.0)
-    assert len(h[h["tag"] == "Crypto"]) == 1
-
-
-def test_tag_history_without_detail_is_empty():
-    assert ts.tag_history(None, {}).empty
-    legacy = pd.DataFrame({"date": pd.to_datetime(["2026-03-01"]), "assets": [None]})
-    assert ts.tag_history(legacy, {}).empty
-
-
-def test_trades_by_month_per_tag():
-    trades = [
-        {"time": "2026-03-02T10:00:00Z", "symbol": "AIR", "kind": "Buy", "value_eur": 100.0},
-        {"time": "2026-03-20T10:00:00Z", "symbol": "AIR", "kind": "Sell", "value_eur": 40.0},
-        {"time": "2026-04-01T10:00:00Z", "symbol": "BTC", "kind": "Buy", "value_eur": 70.0},
-    ]
-    t = ts.tag_trades(trades, {"AIR": ["Tech"], "BTC": ["Crypto"]})
-    m = ts.trades_by_month(t[t["tag"] == "Tech"])
-
-    assert list(m["month"]) == ["2026-03"]
-    assert m.loc[0, "bought"] == 100.0 and m.loc[0, "sold"] == 40.0 and m.loc[0, "n_trades"] == 2
-    assert ts.trades_by_month(ts.tag_trades(None, {})).empty
 
