@@ -15,9 +15,10 @@ Modules (chacun ne dépend que de ceux de la liste au-dessus) :
     history      page Historique (logique pure + rendu)
     holding      page Détention (logique pure + rendu)
     correlation  page Corrélation : matrice, groupes (clustering), variation par fenêtre
+    compare      page Comparer : un tag face à un actif (base 100, corrélation, bêta)
 
 Navigation : app.py est le routeur (`st.navigation`) ; il déclare titres, icônes, groupes et URLs.
 Pages Streamlit (dossier pages/) : soit un script autonome (Accueil, Activité, Tags, Discipline),
-soit un appel à `render_<page>_page()` du package (Historique, Détention, Corrélation).
+soit un appel à `render_<page>_page()` du package (Historique, Détention, Corrélation, Comparer).
 Convention : logique pure (DataFrames, figures) séparée du rendu `st.*`, pour pouvoir la tester.
 """
