@@ -276,4 +276,4 @@ def attach_tags(df: pd.DataFrame, assets_data: dict) -> pd.DataFrame:
 
     out = df.copy()
     out["tags"] = [tags_for(row) for _, row in out.iterrows()]
-    return out
+    return out

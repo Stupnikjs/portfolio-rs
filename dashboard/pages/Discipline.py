@@ -131,4 +131,4 @@ if len(over_weeks):
                 "Montant (€)": detail["value_eur"].round(2),
             }
         )
-        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.dataframe(table, use_container_width=True, hide_index=True)

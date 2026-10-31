@@ -1,0 +1,8 @@
+# À fusionner avec ton .streamlit/config.toml (mêmes couleurs que portfolio/theme.py).
+[theme]
+base = "dark"
+primaryColor = "#4C9AFF"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#161A23"
+textColor = "#E6E6E6"
+font = "sans serif"

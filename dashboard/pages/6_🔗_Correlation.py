@@ -3,4 +3,4 @@ from portfolio.correlation import render_correlation_page
 from portfolio.theme import apply_theme
 
 apply_theme()
-render_correlation_page()
+render_correlation_page()

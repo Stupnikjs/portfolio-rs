@@ -1,45 +1,32 @@
-"""Page d'accueil : vue globale du portefeuille. Lancer avec : streamlit run app.py
+"""Point d'entrée du dashboard : déclare la navigation. Lancer avec : streamlit run app.py
 
-Les tags n'apparaissent pas ici : la vue par tag est dans la page « Vue par Tag »,
-leur gestion dans la page « Gestion Tags ».
+Nécessite Streamlit >= 1.36 (`st.navigation` / `st.Page`). Avec `st.navigation`, le dossier
+`pages/` n'est plus parcouru automatiquement : titres, icônes, groupes et URLs sont définis ICI,
+en un seul endroit, quel que soit le nom des fichiers. Pour ajouter une page : un `st.Page(...)`.
 """
 from __future__ import annotations
 
 import streamlit as st
 
-from portfolio.config import MIN_POSITION_VALUE_EUR
-from portfolio.data import (
-    CASH_KIND, compute_global_kpis, compute_kpis, load_portfolio, small_positions_summary,
-)
-from portfolio.home import render_allocation_and_pnl, render_kpis, render_positions_table
 from portfolio.theme import apply_theme
 
-apply_theme()  # doit être appelé avant tout autre st.* ou px.*
+apply_theme()  # set_page_config + template Plotly : avant tout autre st.*, une seule fois pour le routeur
 
-data, df_all = load_portfolio()
+PAGES = {
+    "Portefeuille": [
+        st.Page("pages/Home.py", title="Vue globale", icon="📈", url_path="accueil", default=True),
+        st.Page("pages/2 🏷 vue par tag.py", title="Vue par tag", icon="🏷️", url_path="vue-par-tag"),
+        st.Page("pages/5_Historique.py", title="Historique", icon="🕒", url_path="historique"),
+        st.Page("pages/7_Holding.py", title="Détention", icon="⏳", url_path="detention"),
+    ],
+    "Analyse": [
+        st.Page("pages/3_📊_Activite.py", title="Activité", icon="📊", url_path="activite"),
+        st.Page("pages/6_🔗_Correlation.py", title="Corrélation", icon="🔗", url_path="correlation"),
+    ],
+    "Organisation": [
+        st.Page("pages/Discipline.py", title="Discipline", icon="🎯", url_path="discipline"),
+        st.Page("pages/4_🏷️_Gestion_Tags.py", title="Gestion Tags", icon="⚙️", url_path="gestion-tags"),
+    ],
+}
 
-# --- En-tête : KPIs du portefeuille complet ---
-render_kpis(compute_kpis(df_all), compute_global_kpis(df_all, data))
-st.divider()
-
-# `df_all` garde toutes les positions pour les totaux (une position soldée porte du P&L réalisé).
-# Le seuil de poussière ne sert qu'à l'affichage.
-n_dust, dust_value = small_positions_summary(df_all, MIN_POSITION_VALUE_EUR)
-if n_dust:
-    st.sidebar.caption(
-        f"{n_dust} position(s) < {MIN_POSITION_VALUE_EUR:.0f} € masquée(s) des graphiques "
-        f"({dust_value:,.2f} € au total). Les totaux les incluent."
-    )
-
-scope = df_all[df_all["kind"] != CASH_KIND]
-df_view = scope[scope["value_eur"] >= MIN_POSITION_VALUE_EUR]  # allocation : sans poussière
-# P&L et tableau : on garde aussi les positions soldées qui ont du P&L réalisé.
-df_perf = scope[(scope["value_eur"] >= MIN_POSITION_VALUE_EUR) | (scope["realized_pnl_eur"].abs() > 0.01)]
-
-if df_view.empty:
-    st.info("Aucune position à afficher.")
-    st.stop()
-
-render_allocation_and_pnl(df_view, df_perf)
-st.divider()
-render_positions_table(df_perf)
+st.navigation(PAGES).run()

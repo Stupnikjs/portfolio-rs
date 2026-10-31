@@ -667,4 +667,4 @@ def render_holding_page() -> None:
             "Titres uniquement (pour la crypto, un retrait est un transfert entre wallets). Indépendant du "
             "filtre d'actifs. Les montants et le P&L excluent les ventes incomplètes (au-delà des lots "
             "connus), comptées dans « Incomplètes exclues ». Durées : lots vendus, pondérées par le capital."
-        )
+        )

@@ -1,4 +1,4 @@
-"""Rendu de la page d'accueil articulée autour des tags : vue d'ensemble puis détail d'un tag."""
+"""Rendu de la page « Vue par tag » : vue d'ensemble de tous les tags, évolution, puis détail d'un tag."""
 from __future__ import annotations
 
 import pandas as pd
@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from portfolio.history import PERIODS
-from portfolio.home import render_positions_table
+from portfolio.home import allocation_figure, pnl_by_asset_figure, render_positions_table
 from portfolio.tag_stats import (
     positions_of_tag, rebase_returns, tag_contribution, tag_correlation, tag_perf_stats, trades_by_month,
 )
@@ -222,18 +222,9 @@ def render_tag_detail(
 
     left, right = st.columns(2)
     if not held.empty:
-        fig_pie = px.pie(held, values="value_eur", names="symbol", hole=0.4, title=f"Répartition dans « {tag} »")
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(showlegend=False, margin=MARGIN)
-        left.plotly_chart(fig_pie, use_container_width=True)
+        left.plotly_chart(allocation_figure(held, title=f"Répartition dans « {tag} »"), use_container_width=True)
     if not perf.empty:
-        fig_bar = px.bar(
-            perf.sort_values("pnl_total_eur", ascending=False), x="symbol", y="pnl_total_eur",
-            color="pnl_color", color_discrete_map=COLOR_MAP,
-            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"}, title="P&L total par actif (€)",
-        )
-        fig_bar.update_layout(showlegend=False, margin=MARGIN)
-        right.plotly_chart(fig_bar, use_container_width=True)
+        right.plotly_chart(pnl_by_asset_figure(perf, title="P&L total par actif (€)"), use_container_width=True)
 
     # --- Historique du tag ---
     h = hist[hist["tag"] == tag]

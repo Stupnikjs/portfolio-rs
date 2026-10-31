@@ -151,4 +151,4 @@ if not view.empty:
             "vendu": st.column_config.NumberColumn("Vendu", format="%.0f €"),
             "dernier": st.column_config.DatetimeColumn("Dernier trade", format="DD/MM/YYYY"),
         },
-    )
+    )

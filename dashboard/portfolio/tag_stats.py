@@ -271,4 +271,4 @@ def tag_correlation(rebased: pd.DataFrame, min_points: int = 8) -> pd.DataFrame:
     wide = d.pivot(index="date", columns="tag", values="ret").dropna(how="all")
     if len(wide) < min_points:
         return pd.DataFrame()
-    return wide.corr(min_periods=min_points).dropna(how="all").dropna(axis=1, how="all")
+    return wide.corr(min_periods=min_points).dropna(how="all").dropna(axis=1, how="all")

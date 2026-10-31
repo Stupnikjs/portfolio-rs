@@ -403,4 +403,4 @@ def render_correlation_page() -> None:
 
     render_correlation_section(df, data)
     st.divider()
-    render_window_variation(data.get("correlation_matrices", {}))
+    render_window_variation(data.get("correlation_matrices", {}))

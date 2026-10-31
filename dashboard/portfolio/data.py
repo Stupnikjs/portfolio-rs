@@ -122,4 +122,4 @@ def small_positions_summary(df: pd.DataFrame, min_value_eur: float = MIN_POSITIO
     Les positions soldées (valeur nulle) ne comptent pas : on ne les « possède » plus.
     """
     dust = df[(df["value_eur"] > 0) & (df["value_eur"] < min_value_eur)]
-    return int(len(dust)), float(dust["value_eur"].sum())
+    return int(len(dust)), float(dust["value_eur"].sum())

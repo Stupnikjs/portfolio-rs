@@ -92,4 +92,4 @@ if st.button("💾 Sauvegarder les tags", type="primary"):
     update_asset(assets_data, selected_asset["ticker"], tags=new_tags_list)
     save_assets_data(assets_data)
     st.success("Tags sauvegardés avec succès !")
-    st.rerun()
+    st.rerun()
