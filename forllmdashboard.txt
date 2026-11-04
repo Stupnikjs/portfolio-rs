@@ -4,51 +4,40 @@
 # Chemin relatif : app.py
 ################################################################################
 
-"""Page d'accueil : vue globale du portefeuille. Lancer avec : streamlit run app.py
+"""Point d'entrée du dashboard : déclare la navigation. Lancer avec : streamlit run app.py
 
-Les tags n'apparaissent pas ici : la vue par tag est dans la page « Vue par Tag »,
-leur gestion dans la page « Gestion Tags ».
+Nécessite Streamlit >= 1.36 (`st.navigation` / `st.Page`). Avec `st.navigation`, le dossier
+`pages/` n'est plus parcouru automatiquement : titres, icônes, groupes et URLs sont définis ICI,
+en un seul endroit, quel que soit le nom des fichiers. Pour ajouter une page : un `st.Page(...)`.
 """
 from __future__ import annotations
 
 import streamlit as st
 
-from portfolio.config import MIN_POSITION_VALUE_EUR
-from portfolio.data import (
-    CASH_KIND, compute_global_kpis, compute_kpis, load_portfolio, small_positions_summary,
-)
-from portfolio.home import render_allocation_and_pnl, render_kpis, render_positions_table
 from portfolio.theme import apply_theme
 
-apply_theme()  # doit être appelé avant tout autre st.* ou px.*
+apply_theme()  # set_page_config + template Plotly : avant tout autre st.*, une seule fois pour le routeur
 
-data, df_all = load_portfolio()
+PAGES = {
+    "Portefeuille": [
+        st.Page("pages/Home.py", title="Vue globale", icon="📈", url_path="accueil", default=True),
+        st.Page("pages/2 🏷 vue par tag.py", title="Vue par tag", icon="🏷️", url_path="vue-par-tag"),
+        st.Page("pages/5_Historique.py", title="Historique", icon="🕒", url_path="historique"),
+        st.Page("pages/7_Holding.py", title="Détention", icon="⏳", url_path="detention"),
+    ],
+    "Analyse": [
+        st.Page("pages/3_📊_Activite.py", title="Activité", icon="📊", url_path="activite"),
+        st.Page("pages/6_🔗_Correlation.py", title="Corrélation", icon="🔗", url_path="correlation"),
+        st.Page("pages/Comparer.py", title="Comparer", icon="⚖️", url_path="comparer"),
+    ],
+    "Organisation": [
+        st.Page("pages/Discipline.py", title="Discipline", icon="🎯", url_path="discipline"),
+        st.Page("pages/4_🏷️_Gestion_Tags.py", title="Gestion Tags", icon="⚙️", url_path="gestion-tags"),
+    ],
+}
 
-# --- En-tête : KPIs du portefeuille complet ---
-render_kpis(compute_kpis(df_all), compute_global_kpis(df_all, data))
-st.divider()
+st.navigation(PAGES).run()
 
-# `df_all` garde toutes les positions pour les totaux (une position soldée porte du P&L réalisé).
-# Le seuil de poussière ne sert qu'à l'affichage.
-n_dust, dust_value = small_positions_summary(df_all, MIN_POSITION_VALUE_EUR)
-if n_dust:
-    st.sidebar.caption(
-        f"{n_dust} position(s) < {MIN_POSITION_VALUE_EUR:.0f} € masquée(s) des graphiques "
-        f"({dust_value:,.2f} € au total). Les totaux les incluent."
-    )
-
-scope = df_all[df_all["kind"] != CASH_KIND]
-df_view = scope[scope["value_eur"] >= MIN_POSITION_VALUE_EUR]  # allocation : sans poussière
-# P&L et tableau : on garde aussi les positions soldées qui ont du P&L réalisé.
-df_perf = scope[(scope["value_eur"] >= MIN_POSITION_VALUE_EUR) | (scope["realized_pnl_eur"].abs() > 0.01)]
-
-if df_view.empty:
-    st.info("Aucune position à afficher.")
-    st.stop()
-
-render_allocation_and_pnl(df_view, df_perf)
-st.divider()
-render_positions_table(df_perf)
 
 ################################################################################
 # Dossier : dashboard/pages
@@ -118,6 +107,7 @@ st.divider()
 # --- 3. Détail d'un tag ---
 tag = st.selectbox("Tag à détailler", list(summary["tag"]), help="Triés par valeur décroissante.")
 render_tag_detail(tag, df_all, summary, hist, trades, MIN_POSITION_VALUE_EUR)
+
 
 ################################################################################
 # Dossier : dashboard/pages
@@ -278,7 +268,7 @@ if not view.empty:
             "vendu": st.column_config.NumberColumn("Vendu", format="%.0f €"),
             "dernier": st.column_config.DatetimeColumn("Dernier trade", format="DD/MM/YYYY"),
         },
-    )
+    )
 
 
 ################################################################################
@@ -381,7 +371,7 @@ if st.button("💾 Sauvegarder les tags", type="primary"):
     update_asset(assets_data, selected_asset["ticker"], tags=new_tags_list)
     save_assets_data(assets_data)
     st.success("Tags sauvegardés avec succès !")
-    st.rerun()
+    st.rerun()
 
 
 ################################################################################
@@ -395,7 +385,7 @@ from portfolio.history import render_history_page
 from portfolio.theme import apply_theme
 
 apply_theme()
-render_history_page()
+render_history_page()
 
 
 ################################################################################
@@ -409,7 +399,7 @@ from portfolio.correlation import render_correlation_page
 from portfolio.theme import apply_theme
 
 apply_theme()
-render_correlation_page()
+render_correlation_page()
 
 
 ################################################################################
@@ -423,7 +413,21 @@ from portfolio.holding import render_holding_page
 from portfolio.theme import apply_theme
 
 apply_theme()
-render_holding_page()
+render_holding_page()
+
+
+################################################################################
+# Dossier : dashboard/pages
+# Fichier : Comparer.py
+# Chemin relatif : pages/Comparer.py
+################################################################################
+
+"""Page Comparer : un tag face à un actif du portefeuille (base 100, corrélation, bêta)."""
+from portfolio.compare import render_compare_page
+from portfolio.theme import apply_theme
+
+apply_theme()
+render_compare_page()
 
 
 ################################################################################
@@ -565,7 +569,7 @@ if len(over_weeks):
                 "Montant (€)": detail["value_eur"].round(2),
             }
         )
-        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 ################################################################################
@@ -574,138 +578,58 @@ if len(over_weeks):
 # Chemin relatif : pages/Home.py
 ################################################################################
 
-"""Page d'accueil (vue globale) : KPIs en en-tête, allocation, P&L par actif, détail des positions."""
+"""Page d'accueil : vue globale du portefeuille, sans tags.
+
+La vue par tag est dans la page « Vue par tag », leur gestion dans « Gestion Tags ».
+"""
 from __future__ import annotations
 
-import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-from portfolio.theme import GAIN_COLOR, LOSS_COLOR
+from portfolio.config import MIN_POSITION_VALUE_EUR
+from portfolio.data import (
+    CASH_KIND, compute_global_kpis, compute_kpis, load_portfolio, small_positions_summary,
+)
+from portfolio.home import render_allocation, render_kpis, render_pnl_by_asset, render_positions_table
+from portfolio.theme import apply_theme
 
+apply_theme()  # doit être appelé avant tout autre st.* ou px.*
 
-# --- Mise en forme ------------------------------------------------------------
+data, df_all = load_portfolio()
 
-def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Copie du DataFrame des positions formatée pour st.dataframe (colonnes renommées en français)."""
-    d = df.copy()
-    d["quantity"] = d["quantity"].apply(lambda x: f"{x:,.4f}")
-    for col in ("price_eur", "value_eur", "cost_basis_eur"):
-        d[col] = d[col].apply(lambda x: f"{x:,.2f} €")
-    for col in ("pnl_eur", "realized_pnl_eur", "pnl_total_eur"):
-        d[col] = d[col].apply(lambda x: f"{x:+,.2f} €")
-    for col in ("pnl_pct", "pnl_total_pct"):
-        d[col] = d[col].apply(lambda x: f"{x:+.2f} %")
+# --- En-tête : KPIs du portefeuille complet ---
+render_kpis(compute_kpis(df_all), compute_global_kpis(df_all, data))
 
-    return d.rename(columns={
-        "symbol": "Symbole",
-        "kind": "Type",
-        "quantity": "Quantité",
-        "price_eur": "Prix",
-        "value_eur": "Valeur",
-        "cost_basis_eur": "Cost Basis",
-        "pnl_eur": "P&L latent",
-        "pnl_pct": "Latent (%)",
-        "realized_pnl_eur": "P&L réalisé",
-        "pnl_total_eur": "P&L total",
-        "pnl_total_pct": "Perf. totale (%)",
-    })
-
-
-# --- Rendu ------------------------------------------------------------------------
-
-def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
-    st.title("📈 Mon Portefeuille")
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Valeur Totale", f"{kpis['total_value_eur']:,.2f} €")
-    col2.metric("Cost Basis", f"{kpis['total_cost_basis_eur']:,.2f} €")
-    col3.metric("P&L Latent", f"{kpis['total_pnl_latent_eur']:,.2f} €")
-    col4.metric("P&L Réalisé", f"{kpis['total_pnl_realized_eur']:,.2f} €")
-    col5.metric(
-        "P&L Total",
-        f"{kpis['total_pnl_eur']:,.2f} €",
-        help="Latent + réalisé",
+# `df_all` garde toutes les positions pour les totaux (une position soldée porte du P&L réalisé).
+# Le seuil de poussière ne sert qu'à l'affichage.
+n_dust, dust_value = small_positions_summary(df_all, MIN_POSITION_VALUE_EUR)
+if n_dust:
+    st.sidebar.caption(
+        f"{n_dust} position(s) < {MIN_POSITION_VALUE_EUR:.0f} € masquée(s) des graphiques "
+        f"({dust_value:,.2f} € au total). Les totaux les incluent."
     )
 
-    if global_kpis is not None:
-        g1, g2, g3 = st.columns(3)
-        g1.metric("Titres + crypto + cash", f"{global_kpis['equity_eur']:,.2f} €")
-        g2.metric(
-            "Cash XTB disponible",
-            f"{global_kpis['cash_eur']:,.2f} €",
-            f"{global_kpis['cash_share'] * 100:.0f} % du total",
-            delta_color="off",
-        )
-        ret = global_kpis["return_pct"]
-        g3.metric(
-            "Performance globale (cash inclus)",
-            f"{ret:+.2f} %" if ret is not None else "n/a",
-            f"{global_kpis['gain_eur']:+,.2f} €",
-            help="(P&L latent + réalisé + dividendes nets) / (cost basis des lots ouverts + cash XTB). "
-                 "Le cash Binance n'est pas suivi.",
-        )
-    else:
-        invested = kpis.get("total_invested_eur") or kpis["total_cost_basis_eur"]
-        pnl_pct_global = kpis["total_pnl_eur"] / invested * 100 if invested > 0 else 0
-        st.metric("Performance Globale (hors cash)", f"{pnl_pct_global:+.2f} %")
+scope = df_all[df_all["kind"] != CASH_KIND]
+df_view = scope[scope["value_eur"] >= MIN_POSITION_VALUE_EUR]  # allocation : sans poussière
+# P&L et tableau : on garde aussi les positions soldées qui ont du P&L réalisé.
+df_perf = scope[(scope["value_eur"] >= MIN_POSITION_VALUE_EUR) | (scope["realized_pnl_eur"].abs() > 0.01)]
 
+if df_view.empty:
+    st.info("Aucune position à afficher.")
+    st.stop()
 
-def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = None) -> None:
-    """Camembert d'allocation (df) et barres de P&L total par actif (df_perf, défaut : df)."""
-    df_perf = df if df_perf is None else df_perf
-    col_left, col_right = st.columns(2)
+tab_alloc, tab_perf, tab_positions = st.tabs(["🥧 Allocation", "📊 Performance", "📋 Positions"])
 
-    with col_left:
-        st.subheader("🥧 Allocation du Portefeuille")
-        fig_pie = px.pie(df, values="value_eur", names="symbol", hole=0.4)
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
+with tab_alloc:
+    render_allocation(df_view)
 
-        # --- Export CSV : ticker + % d'allocation uniquement (pas de prix) ---
-        total_value = float(df["value_eur"].sum())
-        alloc_df = (
-            df[["symbol", "value_eur"]]
-            .assign(allocation_pct=lambda d: d["value_eur"] / total_value * 100 if total_value > 0 else 0.0)
-            .drop(columns="value_eur")
-            .rename(columns={"symbol": "ticker"})
-            .sort_values("allocation_pct", ascending=False)
-            .reset_index(drop=True)
-        )
-        alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)  # évite les bruits flottants
+with tab_perf:
+    render_pnl_by_asset(df_perf)
 
-        st.download_button(
-            label="📥 Télécharger l'allocation (CSV)",
-            data=alloc_df.to_csv(index=False).encode("utf-8"),
-            file_name="allocation.csv",
-            mime="text/csv",
-            help="Ticker et pourcentage d'allocation uniquement — aucune donnée de prix.",
-        )
+with tab_positions:
+    # Le poids est calculé sur tout le portefeuille (poussière comprise), pas sur les seules lignes affichées.
+    render_positions_table(df_perf, weight_base=float(scope["value_eur"].sum()))
 
-    with col_right:
-        st.subheader("📊 P&L total par Actif (EUR, latent + réalisé)")
-        fig_bar = px.bar(
-            df_perf,
-            x="symbol",
-            y="pnl_total_eur",
-            color="pnl_color",
-            color_discrete_map={"Gain": GAIN_COLOR, "Perte": LOSS_COLOR},
-            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"},
-        )
-        fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-
-def render_positions_table(df: pd.DataFrame) -> None:
-    st.subheader("📋 Détail des positions")
-    df_display = format_display_df(df)
-    st.dataframe(
-        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis",
-                    "P&L latent", "P&L réalisé", "P&L total", "Perf. totale (%)"]],
-        use_container_width=True,
-        hide_index=True,
-    )
 
 ################################################################################
 # Dossier : dashboard/portfolio
@@ -722,16 +646,19 @@ Persistance propre au dashboard : data/assets/<TICKER>.json (tags, thèse, DCA).
 
 Modules (chacun ne dépend que de ceux de la liste au-dessus) :
     config       constantes et chemins
+    fmt          formats d'affichage français (montants, pourcentages), fonctions pures
     theme        palette, template Plotly sombre, apply_theme() (à appeler en 1er sur chaque page)
     data         chargement de dashboard.json, DataFrame des positions, KPIs
     assets       actifs suivis et tags (data/assets/*.json)
-    home         page d'accueil : KPIs, allocation, P&L par actif, tableau par tag
+    home         page d'accueil : KPIs, allocation (treemap), P&L par actif, tableau des positions
     history      page Historique (logique pure + rendu)
     holding      page Détention (logique pure + rendu)
     correlation  page Corrélation : matrice, groupes (clustering), variation par fenêtre
+    compare      page Comparer : un tag face à un actif (base 100, corrélation, bêta)
 
-Pages Streamlit (dossier pages/) : soit un script autonome (Activité, Tags, Discipline),
-soit un appel à `render_<page>_page()` du package (Historique, Détention, Corrélation).
+Navigation : app.py est le routeur (`st.navigation`) ; il déclare titres, icônes, groupes et URLs.
+Pages Streamlit (dossier pages/) : soit un script autonome (Accueil, Activité, Tags, Discipline),
+soit un appel à `render_<page>_page()` du package (Historique, Détention, Corrélation, Comparer).
 Convention : logique pure (DataFrames, figures) séparée du rendu `st.*`, pour pouvoir la tester.
 """
 
@@ -1020,7 +947,283 @@ def attach_tags(df: pd.DataFrame, assets_data: dict) -> pd.DataFrame:
 
     out = df.copy()
     out["tags"] = [tags_for(row) for _, row in out.iterrows()]
+    return out
+
+
+################################################################################
+# Dossier : dashboard/portfolio
+# Fichier : compare.py
+# Chemin relatif : portfolio/compare.py
+################################################################################
+
+"""Page Comparer : un tag face à un actif (action, ETF ou crypto) du portefeuille.
+
+Même méthode que la page « Vue par tag » : rendement hebdomadaire entre deux snapshots de
+history.json, hors achats/ventes (quantité du snapshot précédent x variation de prix). Seules les
+semaines où le tag ET l'actif sont détenus sont comparées, pour que les deux courbes reposent sur
+exactement les mêmes dates. Logique pure (pandas) et figures séparées du rendu `st.*`.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from portfolio.assets import attach_tags, load_synced_assets
+from portfolio.data import CASH_KIND, load_portfolio
+from portfolio.fmt import fmt_number, fmt_pct
+from portfolio.history import PERIODS, load_history
+from portfolio.tag_stats import (
+    positions_of_tag, rebase_returns, symbol_tags_map, tag_perf_stats, tag_returns, tag_summary,
+)
+from portfolio.theme import GAIN_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
+
+TAG_COLOR = PASTEL_DARK_SEQUENCE[0]    # bleu
+ASSET_COLOR = PASTEL_DARK_SEQUENCE[2]  # orange
+MARGIN = dict(l=10, r=10, t=40, b=10)
+MIN_PERIODS = 8  # en dessous, corrélation et bêta ne sont pas significatifs
+
+SERIES_COLUMNS = ["date", "tag", "ret"]  # `tag` = libellé de la série : réutilise rebase_returns / tag_perf_stats
+
+
+# --- Logique pure -------------------------------------------------------------------
+
+def asset_returns(history: pd.DataFrame | None) -> pd.DataFrame:
+    """Rendement par (date, symbole) entre deux snapshots consécutifs, hors achats/ventes.
+
+    Même règle que `tag_returns` : l'actif doit être détenu au snapshot précédent, avec un prix
+    valide aux deux dates. Colonnes : prev_date, date, symbol, kind, ret (fraction).
+    """
+    cols = ["prev_date", "date", "symbol", "kind", "ret"]
+    if history is None or history.empty:
+        return pd.DataFrame(columns=cols)
+
+    rows, prev, prev_date = [], None, None
+    for date, assets in zip(history["date"], history["assets"]):
+        if not isinstance(assets, list):
+            prev, prev_date = None, None
+            continue
+        cur = {a["symbol"]: (float(a.get("quantity") or 0.0), float(a.get("price_eur") or 0.0), a.get("kind"))
+               for a in assets if a.get("kind") != CASH_KIND and a.get("symbol")}
+        if prev is not None:
+            for sym, (q0, p0, kind) in prev.items():
+                p1 = cur.get(sym, (0.0, 0.0, None))[1]
+                if q0 <= 0 or p0 <= 0 or p1 <= 0:
+                    continue
+                rows.append((prev_date, date, sym, kind, p1 / p0 - 1))
+        prev, prev_date = cur, date
+    return pd.DataFrame(rows, columns=cols)
+
+
+def asset_catalog(a_ret: pd.DataFrame, df_all: pd.DataFrame) -> pd.DataFrame:
+    """Actifs comparables (au moins une semaine de rendement) : symbol, kind, weeks, held.
+
+    `held` = encore détenu aujourd'hui. Les actifs soldés restent comparables tant qu'ils sont
+    dans l'historique.
+    """
+    cols = ["symbol", "kind", "weeks", "held"]
+    if a_ret.empty:
+        return pd.DataFrame(columns=cols)
+    cat = (
+        a_ret.groupby("symbol")
+        .agg(kind=("kind", "last"), weeks=("ret", "size"))
+        .reset_index()
+    )
+    cat["kind"] = cat["kind"].fillna("Autre")
+    held = set(df_all.loc[(df_all["kind"] != CASH_KIND) & (df_all["value_eur"] > 0), "symbol"])
+    cat["held"] = cat["symbol"].isin(held)
+    return cat[cols].sort_values(["kind", "symbol"]).reset_index(drop=True)
+
+
+def compare_series(
+    history_dates, tag_ret: pd.DataFrame, a_ret: pd.DataFrame,
+    tag: str, symbol: str, tag_label: str, asset_label: str,
+) -> pd.DataFrame:
+    """Séries du tag et de l'actif sur les semaines communes, prêtes pour `rebase_returns`.
+
+    Colonnes : date, tag (libellé de la série), ret. Chaque série commence par un point d'ancrage
+    (ret = 0) à la date du snapshot précédant la première semaine commune. Vide s'il n'y a aucune
+    semaine commune.
+    """
+    empty = pd.DataFrame(columns=SERIES_COLUMNS)
+    if tag_ret.empty or a_ret.empty:
+        return empty
+
+    t = tag_ret[(tag_ret["tag"] == tag) & (tag_ret["base_eur"] > 0)].drop_duplicates("date").set_index("date")["ret"]
+    a = a_ret[a_ret["symbol"] == symbol].drop_duplicates("date").set_index("date")["ret"]
+    common = t.index.intersection(a.index).sort_values()
+    if common.empty:
+        return empty
+
+    dates = pd.DatetimeIndex(sorted(pd.to_datetime(pd.Series(list(history_dates))).unique()))
+    pos = int(dates.searchsorted(common[0]))
+    anchor = dates[pos - 1] if pos > 0 else common[0] - pd.Timedelta(days=7)
+
+    frames = []
+    for label, series in ((tag_label, t), (asset_label, a)):
+        frames.append(pd.DataFrame({
+            "date": [anchor, *common],
+            "tag": label,
+            "ret": [0.0, *series.loc[common].astype(float).tolist()],
+        }))
+    return pd.concat(frames, ignore_index=True)[SERIES_COLUMNS]
+
+
+def relative_series(rebased: pd.DataFrame, tag_label: str, asset_label: str) -> pd.Series:
+    """Écart d'indice (tag - actif), en points, par date. Les deux séries partagent les mêmes dates."""
+    wide = rebased.pivot(index="date", columns="tag", values="index")
+    return (wide[tag_label] - wide[asset_label]).dropna()
+
+
+def relative_stats(rebased: pd.DataFrame, tag_label: str, asset_label: str, min_periods: int = MIN_PERIODS) -> dict:
+    """Performance, écart, corrélation, bêta (tag sur actif) et part de semaines gagnées par le tag.
+
+    Corrélation et bêta : rendements hebdomadaires, NaN sous `min_periods` semaines.
+    Bêta = cov(tag, actif) / var(actif) : si l'actif varie de 1 %, le tag varie en moyenne de bêta %.
+    """
+    nan = float("nan")
+    out = {"n_periods": 0, "perf_tag": nan, "perf_asset": nan, "diff": nan, "corr": nan, "beta": nan, "hit_rate": nan}
+    if rebased.empty:
+        return out
+
+    last = rebased.sort_values("date").groupby("tag")["index"].last()
+    out["perf_tag"] = float(last[tag_label] - 100)
+    out["perf_asset"] = float(last[asset_label] - 100)
+    out["diff"] = out["perf_tag"] - out["perf_asset"]
+
+    d = rebased[rebased.duplicated("tag")]  # retire le 1er point de chaque série (ret forcé à 0)
+    wide = d.pivot(index="date", columns="tag", values="ret").dropna()
+    n = len(wide)
+    out["n_periods"] = n
+    if n:
+        out["hit_rate"] = float((wide[tag_label] > wide[asset_label]).mean() * 100)
+    if n >= min_periods:
+        out["corr"] = float(wide[tag_label].corr(wide[asset_label]))
+        var = float(wide[asset_label].var())
+        if var > 0:
+            out["beta"] = float(wide[tag_label].cov(wide[asset_label]) / var)
     return out
+
+
+# --- Figures ------------------------------------------------------------------------
+
+def comparison_figure(rebased: pd.DataFrame, tag_label: str, asset_label: str) -> go.Figure:
+    """Les deux courbes en base 100 au début de la fenêtre."""
+    fig = go.Figure()
+    for label, color in ((tag_label, TAG_COLOR), (asset_label, ASSET_COLOR)):
+        g = rebased[rebased["tag"] == label]
+        fig.add_scatter(x=g["date"], y=g["index"], name=label, mode="lines",
+                        line=dict(color=color, width=2.5), hovertemplate="%{y:.1f}")
+    fig.add_hline(y=100, line_dash="dot", line_color="#555B66")
+    fig.update_layout(
+        title="Performance comparée (base 100)", height=420, margin=MARGIN, hovermode="x unified",
+        legend=dict(orientation="h", y=1.12, x=0),
+    )
+    return fig
+
+
+def difference_figure(diff: pd.Series, tag_label: str, asset_label: str) -> go.Figure:
+    """Écart d'indice tag - actif : vert quand le tag mène, rouge quand il est derrière."""
+    colors = [GAIN_COLOR if v >= 0 else LOSS_COLOR for v in diff]
+    fig = go.Figure(go.Bar(x=diff.index, y=diff.values, marker_color=colors, hovertemplate="%{y:+.1f} pts"))
+    fig.update_layout(
+        title=f"Écart : {tag_label} − {asset_label} (points d'indice)", height=280, margin=MARGIN,
+        showlegend=False, yaxis=dict(ticksuffix=" pts"),
+    )
+    return fig
+
+
+# --- Rendu Streamlit -----------------------------------------------------------------
+
+def render_compare_page() -> None:
+    st.title("⚖️ Comparer un tag à un actif")
+
+    data, df_all = load_portfolio()
+    assets_data, _ = load_synced_assets(df_all)
+    df_all = attach_tags(df_all, assets_data)
+
+    try:
+        history = load_history()
+    except ValueError as e:
+        st.warning(str(e))
+        return
+    if history is None or history.empty:
+        st.info("history.json introuvable ou vide : lance d'abord le pipeline Rust (`cargo run`).")
+        return
+
+    summary = tag_summary(df_all)
+    sym_tags = symbol_tags_map(df_all)
+    tag_ret = tag_returns(history, sym_tags)
+    a_ret = asset_returns(history)
+    catalog = asset_catalog(a_ret, df_all)
+    if summary.empty or catalog.empty:
+        st.info("Pas assez d'historique par actif pour comparer (il faut au moins deux snapshots).")
+        return
+
+    # --- Choix ---
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([2, 1, 2])
+        tag = c1.selectbox("Tag", list(summary["tag"]), help="Triés par valeur décroissante.")
+        kinds = ["Tous"] + sorted(catalog["kind"].unique())
+        kind = c2.selectbox("Type d'actif", kinds)
+        pool = catalog if kind == "Tous" else catalog[catalog["kind"] == kind]
+        info = pool.set_index("symbol")
+        symbol = c3.selectbox(
+            "Actif", list(pool["symbol"]),
+            format_func=lambda s: f"{s} · {info.loc[s, 'kind']}" + ("" if info.loc[s, "held"] else " (soldé)"),
+        )
+        period = st.radio("Période", list(PERIODS), index=len(PERIODS) - 1, horizontal=True)
+
+    tag_label, asset_label = f"Tag · {tag}", f"Actif · {symbol}"
+    combined = compare_series(history["date"], tag_ret, a_ret, tag, symbol, tag_label, asset_label)
+    if combined.empty:
+        st.warning("Aucune semaine commune : le tag et l'actif n'ont jamais été détenus en même temps.")
+        return
+
+    days = PERIODS[period]
+    start = None if days is None else combined["date"].max() - pd.Timedelta(days=days)
+    rebased = rebase_returns(combined, start)
+    stats = relative_stats(rebased, tag_label, asset_label)
+    if stats["n_periods"] < 1:
+        st.warning("Pas assez de semaines communes sur cette période : élargis la période.")
+        return
+
+    if symbol in set(positions_of_tag(df_all, tag)["symbol"]):
+        st.warning("Cet actif fait partie du tag : la corrélation et le bêta sont mécaniquement élevés.")
+
+    # --- KPIs ---
+    perf = tag_perf_stats(rebased).set_index("tag")
+    vol_t, vol_a = perf.loc[tag_label, "vol_pct"], perf.loc[asset_label, "vol_pct"]
+    dd_t, dd_a = perf.loc[tag_label, "max_dd_pct"], perf.loc[asset_label, "max_dd_pct"]
+
+    with st.container(border=True):
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric(f"Performance · {tag}", fmt_pct(stats["perf_tag"], 2),
+                  delta=f"{fmt_number(stats['diff'], 1, signed=True)} pts vs l'actif",
+                  help="Rendement cumulé de la période, hors achats/ventes.")
+        k2.metric(f"Performance · {symbol}", fmt_pct(stats["perf_asset"], 2))
+        k3.metric("Corrélation (hebdo)", fmt_number(stats["corr"], 2),
+                  help=f"Corrélation des rendements hebdomadaires ; « — » sous {MIN_PERIODS} semaines communes.")
+        k4.metric("Bêta du tag / actif", fmt_number(stats["beta"], 2),
+                  help="Si l'actif varie de 1 %, le tag varie en moyenne de bêta %. Sous 1 : le tag amortit l'actif.")
+
+        k5, k6, k7, k8 = st.columns(4)
+        k5.metric("Volatilité annualisée (tag / actif)",
+                  f"{fmt_pct(vol_t, 1, signed=False)} / {fmt_pct(vol_a, 1, signed=False)}")
+        k6.metric("Drawdown max (tag / actif)",
+                  f"{fmt_pct(dd_t, 1, signed=False)} / {fmt_pct(dd_a, 1, signed=False)}")
+        k7.metric("Semaines où le tag fait mieux", fmt_pct(stats["hit_rate"], 0, signed=False))
+        k8.metric("Semaines comparées", fmt_number(stats["n_periods"]))
+
+    # --- Graphiques ---
+    st.plotly_chart(comparison_figure(rebased, tag_label, asset_label), use_container_width=True)
+    st.plotly_chart(difference_figure(relative_series(rebased, tag_label, asset_label), tag_label, asset_label),
+                    use_container_width=True)
+    st.caption(
+        "Rendements hebdomadaires hors achats/ventes (même méthode que « Vue par tag »). Seules les semaines "
+        "où le tag et l'actif sont tous deux détenus sont comparées ; les deux courbes partent de 100 à la même date."
+    )
 
 
 ################################################################################
@@ -1069,7 +1272,7 @@ BENCHMARK_TICKERS = {
     "NASDAQ": "^NDX",
     "SU.FR": "SU.PA",
 }
-BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())
+BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())
 
 
 ################################################################################
@@ -1483,7 +1686,7 @@ def render_correlation_page() -> None:
 
     render_correlation_section(df, data)
     st.divider()
-    render_window_variation(data.get("correlation_matrices", {}))
+    render_window_variation(data.get("correlation_matrices", {}))
 
 
 ################################################################################
@@ -1616,7 +1819,58 @@ def small_positions_summary(df: pd.DataFrame, min_value_eur: float = MIN_POSITIO
     Les positions soldées (valeur nulle) ne comptent pas : on ne les « possède » plus.
     """
     dust = df[(df["value_eur"] > 0) & (df["value_eur"] < min_value_eur)]
-    return int(len(dust)), float(dust["value_eur"].sum())
+    return int(len(dust)), float(dust["value_eur"].sum())
+
+
+################################################################################
+# Dossier : dashboard/portfolio
+# Fichier : fmt.py
+# Chemin relatif : portfolio/fmt.py
+################################################################################
+
+"""Formats d'affichage à la française : milliers séparés par une espace insécable, virgule décimale.
+
+Fonctions pures, sans dépendance au reste du package. Elles alignent les KPIs et les tableaux
+sur les graphiques Plotly, qui utilisent les mêmes séparateurs (cf. `theme.PLOTLY_SEPARATORS`).
+"""
+from __future__ import annotations
+
+import pandas as pd
+
+NBSP = "\u00a0"  # espace insécable : évite qu'un montant se coupe en fin de ligne
+
+
+def _french(text: str) -> str:
+    """Convertit un nombre formaté à l'anglo-saxonne (1,234.56) au format français (1 234,56)."""
+    return text.replace(",", NBSP).replace(".", ",")
+
+
+def _number(x: float, decimals: int, signed: bool, grouped: bool) -> str:
+    # round(...) + 0.0 : évite l'affichage « -0,00 » pour une valeur négative infime.
+    value = round(float(x), decimals) + 0.0
+    spec = f"{'+' if signed else ''}{',' if grouped else ''}.{decimals}f"
+    return _french(format(value, spec))
+
+
+def fmt_number(x, decimals: int = 0, signed: bool = False, na: str = "—") -> str:
+    """1234.5 -> « 1 234,5 » (decimals=1)."""
+    if x is None or pd.isna(x):
+        return na
+    return _number(x, decimals, signed, grouped=True)
+
+
+def fmt_eur(x, decimals: int = 2, signed: bool = False, na: str = "—") -> str:
+    """1234.5 -> « 1 234,50 € » ; signed=True -> « +1 234,50 € »."""
+    if x is None or pd.isna(x):
+        return na
+    return f"{_number(x, decimals, signed, grouped=True)}{NBSP}€"
+
+
+def fmt_pct(x, decimals: int = 1, signed: bool = True, na: str = "—") -> str:
+    """3.456 -> « +3,5 % » ; signed=False -> « 3,5 % »."""
+    if x is None or pd.isna(x):
+        return na
+    return f"{_number(x, decimals, signed, grouped=False)}{NBSP}%"
 
 
 ################################################################################
@@ -1926,6 +2180,7 @@ def render_history_page() -> None:
                     "price_status": "Prix",
                 },
             )
+
 
 ################################################################################
 # Dossier : dashboard/portfolio
@@ -2602,7 +2857,7 @@ def render_holding_page() -> None:
             "Titres uniquement (pour la crypto, un retrait est un transfert entre wallets). Indépendant du "
             "filtre d'actifs. Les montants et le P&L excluent les ventes incomplètes (au-delà des lots "
             "connus), comptées dans « Incomplètes exclues ». Durées : lots vendus, pondérées par le capital."
-        )
+        )
 
 
 ################################################################################
@@ -2611,174 +2866,239 @@ def render_holding_page() -> None:
 # Chemin relatif : portfolio/home.py
 ################################################################################
 
-"""Page d'accueil : KPIs en en-tête, tableau par tag, allocation, P&L par actif, détail des positions."""
+"""Page d'accueil (vue globale) : KPIs, allocation, P&L par actif, tableau des positions.
+
+Les figures sont construites par des fonctions pures (`allocation_figure`, `pnl_by_asset_figure`)
+que la page « Vue par tag » réutilise pour le détail d'un tag.
+"""
 from __future__ import annotations
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-from portfolio.theme import GAIN_COLOR, LOSS_COLOR
+from portfolio.fmt import fmt_eur, fmt_number, fmt_pct
+from portfolio.theme import GAIN_COLOR, LOSS_COLOR, SURFACE_COLOR
+
+COLOR_MAP = {"Gain": GAIN_COLOR, "Perte": LOSS_COLOR}
+MARGIN = dict(l=10, r=10, t=40, b=10)
+
+# Colonnes du tableau des positions : (nom dans le DataFrame, libellé affiché), dans l'ordre d'affichage.
+POSITION_COLUMNS = {
+    "symbol": "Symbole",
+    "kind": "Type",
+    "quantity": "Quantité",
+    "price_eur": "Prix",
+    "value_eur": "Valeur",
+    "weight_pct": "Poids (%)",
+    "cost_basis_eur": "Cost Basis",
+    "pnl_eur": "P&L latent",
+    "realized_pnl_eur": "P&L réalisé",
+    "pnl_total_eur": "P&L total",
+    "pnl_total_pct": "Perf. totale (%)",
+}
+_PNL_COLUMNS = ["P&L latent", "P&L réalisé", "P&L total", "Perf. totale (%)"]
 
 
-# --- Mise en forme ------------------------------------------------------------
+# --- KPIs -------------------------------------------------------------------------
 
-def format_display_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Copie du DataFrame des positions formatée pour st.dataframe (colonnes renommées en français)."""
-    d = df.copy()
-    d["quantity"] = d["quantity"].apply(lambda x: f"{x:,.4f}")
-    for col in ("price_eur", "value_eur", "cost_basis_eur"):
-        d[col] = d[col].apply(lambda x: f"{x:,.2f} €")
-    for col in ("pnl_eur", "realized_pnl_eur", "pnl_total_eur"):
-        d[col] = d[col].apply(lambda x: f"{x:+,.2f} €")
-    for col in ("pnl_pct", "pnl_total_pct"):
-        d[col] = d[col].apply(lambda x: f"{x:+.2f} %")
-
-    return d.rename(columns={
-        "symbol": "Symbole",
-        "kind": "Type",
-        "quantity": "Quantité",
-        "price_eur": "Prix",
-        "value_eur": "Valeur",
-        "cost_basis_eur": "Cost Basis",
-        "pnl_eur": "P&L latent",
-        "pnl_pct": "Latent (%)",
-        "realized_pnl_eur": "P&L réalisé",
-        "pnl_total_eur": "P&L total",
-        "pnl_total_pct": "Perf. totale (%)",
-    })
+def _ratio_pct(numerator: float, denominator: float) -> float | None:
+    """Pourcentage, ou None si la base n'est pas strictement positive."""
+    return numerator / denominator * 100 if denominator > 0 else None
 
 
-# --- Rendu ------------------------------------------------------------------------
+def _signed_delta(amount: float, pct: float | None) -> str:
+    """« +1 234 € (+5,2 %) » : le signe pilote la couleur (vert/rouge) du delta de st.metric."""
+    text = fmt_eur(amount, decimals=0, signed=True)
+    return text if pct is None else f"{text} ({fmt_pct(pct)})"
+
 
 def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
+    """Ligne principale (3 chiffres clés) puis ligne secondaire (détail du P&L et cash)."""
     st.title("📈 Mon Portefeuille")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Valeur Totale", f"{kpis['total_value_eur']:,.2f} €")
-    col2.metric("Cost Basis", f"{kpis['total_cost_basis_eur']:,.2f} €")
-    col3.metric("P&L Latent", f"{kpis['total_pnl_latent_eur']:,.2f} €")
-    col4.metric("P&L Réalisé", f"{kpis['total_pnl_realized_eur']:,.2f} €")
-    col5.metric(
-        "P&L Total",
-        f"{kpis['total_pnl_eur']:,.2f} €",
-        help="Latent + réalisé",
+    cost = kpis["total_cost_basis_eur"]
+    invested = kpis.get("total_invested_eur") or cost  # capital engagé : lots ouverts + lots vendus
+    realized_cost = max(invested - cost, 0.0)
+    latent = kpis["total_pnl_latent_eur"]
+    realized = kpis["total_pnl_realized_eur"]
+    total = kpis["total_pnl_eur"]
+    latent_pct = _ratio_pct(latent, cost)
+    realized_pct = _ratio_pct(realized, realized_cost)
+    total_pct = _ratio_pct(total, invested)
+
+    # --- Ligne principale ---
+    h1, h2, h3 = st.columns(3)
+    with h1.container(border=True):
+        st.metric(
+            "Valeur du portefeuille", fmt_eur(kpis["total_value_eur"]),
+            delta=_signed_delta(latent, latent_pct),
+            help="Titres + crypto, hors cash. Le delta est le P&L latent (valeur - cost basis).",
+        )
+    with h2.container(border=True):
+        if global_kpis is not None:
+            ret = global_kpis["return_pct"]
+            st.metric(
+                "Performance globale (cash inclus)",
+                fmt_pct(ret, decimals=2) if ret is not None else "n/a",
+                delta=fmt_eur(global_kpis["gain_eur"], signed=True),
+                help="(P&L latent + réalisé + dividendes nets) / (cost basis des lots ouverts + cash XTB). "
+                     "Le cash Binance n'est pas suivi.",
+            )
+        else:
+            st.metric(
+                "Performance globale (hors cash)",
+                fmt_pct(total_pct, decimals=2),
+                delta=fmt_eur(total, signed=True),
+                help="(P&L latent + réalisé) / capital engagé.",
+            )
+    with h3.container(border=True):
+        if global_kpis is not None:
+            st.metric("Titres + crypto + cash", fmt_eur(global_kpis["equity_eur"]),
+                      help="Valeur du portefeuille + cash XTB disponible.")
+        else:
+            st.metric("Capital engagé", fmt_eur(invested),
+                      help="Cost basis des lots ouverts + coût des lots déjà vendus.")
+
+    # --- Ligne secondaire ---
+    with st.container(border=True):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Cost basis", fmt_eur(cost))
+        c2.metric("P&L latent", fmt_eur(latent, signed=True), delta=fmt_pct(latent_pct) if latent_pct is not None else None,
+                  help="Gain ou perte sur les lots encore détenus ; % rapporté au cost basis.")
+        c3.metric("P&L réalisé", fmt_eur(realized, signed=True), delta=fmt_pct(realized_pct) if realized_pct is not None else None,
+                  help="Gain ou perte sur les lots vendus ; % rapporté au coût de ces lots.")
+        c4.metric("P&L total", fmt_eur(total, signed=True), delta=fmt_pct(total_pct) if total_pct is not None else None,
+                  help="Latent + réalisé ; % rapporté au capital engagé (lots ouverts + lots vendus).")
+        if global_kpis is not None:
+            c5.metric("Cash XTB disponible", fmt_eur(global_kpis["cash_eur"]),
+                      delta=f"{global_kpis['cash_share'] * 100:.0f} % du total",
+                      delta_color="off", delta_arrow="off")
+
+
+# --- Allocation ---------------------------------------------------------------------
+
+def allocation_figure(df: pd.DataFrame, title: str | None = None) -> go.Figure:
+    """Treemap type d'actif > symbole, surface proportionnelle à la valeur.
+
+    Plus lisible qu'un camembert dès qu'il y a une dizaine de lignes. Le pourcentage affiché
+    est la part du total de `df`.
+    """
+    fig = px.treemap(
+        df, path=[px.Constant("Portefeuille"), "kind", "symbol"], values="value_eur", color="kind",
+        color_discrete_map={"(?)": SURFACE_COLOR},  # tuile racine : discrète
+        title=title,
+    )
+    fig.update_traces(
+        textinfo="label+percent root",
+        hovertemplate="%{label}<br>%{value:,.2f} €<br>%{percentRoot:.1%} du total<extra></extra>",
+    )
+    fig.update_layout(margin=MARGIN if title else dict(l=10, r=10, t=10, b=10), height=480)
+    return fig
+
+
+def render_allocation(df: pd.DataFrame) -> None:
+    st.plotly_chart(allocation_figure(df), use_container_width=True)
+
+    # --- Export CSV : ticker + % d'allocation uniquement (pas de prix) ---
+    total_value = float(df["value_eur"].sum())
+    alloc_df = (
+        df[["symbol", "value_eur"]]
+        .assign(allocation_pct=lambda d: d["value_eur"] / total_value * 100 if total_value > 0 else 0.0)
+        .drop(columns="value_eur")
+        .rename(columns={"symbol": "ticker"})
+        .sort_values("allocation_pct", ascending=False)
+        .reset_index(drop=True)
+    )
+    alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)  # évite les bruits flottants
+
+    st.download_button(
+        label="📥 Télécharger l'allocation (CSV)",
+        data=alloc_df.to_csv(index=False).encode("utf-8"),
+        file_name="allocation.csv",
+        mime="text/csv",
+        help="Ticker et pourcentage d'allocation uniquement — aucune donnée de prix.",
     )
 
-    if global_kpis is not None:
-        g1, g2, g3 = st.columns(3)
-        g1.metric("Titres + crypto + cash", f"{global_kpis['equity_eur']:,.2f} €")
-        g2.metric(
-            "Cash XTB disponible",
-            f"{global_kpis['cash_eur']:,.2f} €",
-            f"{global_kpis['cash_share'] * 100:.0f} % du total",
-            delta_color="off",
-        )
-        ret = global_kpis["return_pct"]
-        g3.metric(
-            "Performance globale (cash inclus)",
-            f"{ret:+.2f} %" if ret is not None else "n/a",
-            f"{global_kpis['gain_eur']:+,.2f} €",
-            help="(P&L latent + réalisé + dividendes nets) / (cost basis des lots ouverts + cash XTB). "
-                 "Le cash Binance n'est pas suivi.",
-        )
-    else:
-        invested = kpis.get("total_invested_eur") or kpis["total_cost_basis_eur"]
-        pnl_pct_global = kpis["total_pnl_eur"] / invested * 100 if invested > 0 else 0
-        st.metric("Performance Globale (hors cash)", f"{pnl_pct_global:+.2f} %")
 
+# --- P&L par actif --------------------------------------------------------------------
 
-def render_tag_summary(df_all: pd.DataFrame) -> None:
-    """Valeur, capital engagé et performance par tag. Un actif à 2 tags compte dans les 2 lignes."""
-    if df_all.empty or "tags" not in df_all.columns:
-        return
-    exploded = df_all.explode("tags").dropna(subset=["tags"])
-    if exploded.empty:
-        return
-
-    summary = exploded.groupby("tags").agg(
-        Valeur=("value_eur", "sum"),
-        Cout=("invested_eur", "sum"),
-        PnL=("pnl_total_eur", "sum"),
-    ).reset_index()
-    summary["PnL %"] = summary.apply(lambda r: (r["PnL"] / r["Cout"] * 100) if r["Cout"] > 0 else 0.0, axis=1)
-    summary = summary.sort_values("Valeur", ascending=False)
-
-    display = summary.copy()
-    display["Valeur"] = display["Valeur"].apply(lambda x: f"{x:,.2f} €")
-    display["Cout"] = display["Cout"].apply(lambda x: f"{x:,.2f} €")
-    display["PnL"] = display["PnL"].apply(lambda x: f"{x:+,.2f} €")
-    display["PnL %"] = display["PnL %"].apply(lambda x: f"{x:+.2f} %")
-
-    st.subheader("📊 Vue d'ensemble : Performance par Tag")
-    st.dataframe(
-        display.rename(columns={
-            "tags": "Tag",
-            "Valeur": "Valeur Totale",
-            "Cout": "Capital engagé",
-            "PnL": "P&L total (€)",
-            "PnL %": "Perf. totale (%)",
-        }),
-        use_container_width=True,
-        hide_index=True,
+def pnl_by_asset_figure(df: pd.DataFrame, title: str | None = None) -> go.Figure:
+    """Barres horizontales triées : le plus gros gain en haut, la plus grosse perte en bas."""
+    d = df.sort_values("pnl_total_eur")  # ordre croissant : Plotly dessine la 1re ligne en bas
+    fig = px.bar(
+        d, x="pnl_total_eur", y="symbol", orientation="h", color="pnl_color", color_discrete_map=COLOR_MAP,
+        labels={"pnl_total_eur": "P&L total (€)"}, title=title,
     )
-    st.divider()
+    fig.update_traces(texttemplate="%{x:+,.0f} €", textposition="outside", cliponaxis=False)
+    fig.update_xaxes(ticksuffix=" €")
+    fig.update_yaxes(title_text="")
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(l=10, r=70, t=40 if title else 10, b=10),
+        height=max(320, 28 * len(d) + 80),
+    )
+    return fig
 
 
-def render_allocation_and_pnl(df: pd.DataFrame, df_perf: pd.DataFrame | None = None) -> None:
-    """Camembert d'allocation (df) et barres de P&L total par actif (df_perf, défaut : df)."""
-    df_perf = df if df_perf is None else df_perf
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("🥧 Allocation du Portefeuille")
-        fig_pie = px.pie(df, values="value_eur", names="symbol", hole=0.4)
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-        # --- Export CSV : ticker + % d'allocation uniquement (pas de prix) ---
-        total_value = float(df["value_eur"].sum())
-        alloc_df = (
-            df[["symbol", "value_eur"]]
-            .assign(allocation_pct=lambda d: d["value_eur"] / total_value * 100 if total_value > 0 else 0.0)
-            .drop(columns="value_eur")
-            .rename(columns={"symbol": "ticker"})
-            .sort_values("allocation_pct", ascending=False)
-            .reset_index(drop=True)
-        )
-        alloc_df["allocation_pct"] = alloc_df["allocation_pct"].round(4)  # évite les bruits flottants
-
-        st.download_button(
-            label="📥 Télécharger l'allocation (CSV)",
-            data=alloc_df.to_csv(index=False).encode("utf-8"),
-            file_name="allocation.csv",
-            mime="text/csv",
-            help="Ticker et pourcentage d'allocation uniquement — aucune donnée de prix.",
-        )
-
-    with col_right:
-        st.subheader("📊 P&L total par Actif (EUR, latent + réalisé)")
-        fig_bar = px.bar(
-            df_perf,
-            x="symbol",
-            y="pnl_total_eur",
-            color="pnl_color",
-            color_discrete_map={"Gain": GAIN_COLOR, "Perte": LOSS_COLOR},
-            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"},
-        )
-        fig_bar.update_layout(showlegend=False, margin=dict(t=0, b=0, l=0, r=0))
-        st.plotly_chart(fig_bar, use_container_width=True)
+def render_pnl_by_asset(df: pd.DataFrame) -> None:
+    st.caption("P&L total par actif (latent + réalisé), en euros.")
+    st.plotly_chart(pnl_by_asset_figure(df), use_container_width=True)
 
 
-def render_positions_table(df: pd.DataFrame) -> None:
-    st.subheader("📋 Détail des positions")
-    df_display = format_display_df(df)
+# --- Tableau des positions -------------------------------------------------------------
+
+def positions_table(df: pd.DataFrame, weight_base: float | None = None) -> pd.DataFrame:
+    """Positions triées par valeur, colonnes renommées en français.
+
+    Les colonnes restent NUMÉRIQUES (le tri du tableau est correct) ; la mise en forme est faite
+    par `style_positions`. `weight_base` : valeur totale servant de base au poids (par défaut, la
+    somme des lignes du tableau).
+    """
+    d = df.copy()
+    base = float(weight_base) if weight_base else float(d["value_eur"].sum())
+    d["weight_pct"] = d["value_eur"] / base * 100 if base > 0 else 0.0
+    d = d.sort_values("value_eur", ascending=False)
+    return d[list(POSITION_COLUMNS)].rename(columns=POSITION_COLUMNS).reset_index(drop=True)
+
+
+def _pnl_color(value) -> str:
+    if value is None or pd.isna(value) or value == 0:
+        return ""
+    return f"color: {GAIN_COLOR}" if value > 0 else f"color: {LOSS_COLOR}"
+
+
+def style_positions(table: pd.DataFrame):
+    """Format français + P&L en vert/rouge. Le poids est géré par la ProgressColumn du rendu."""
+    styler = table.style.format({
+        "Quantité": lambda x: fmt_number(x, 4),
+        "Prix": fmt_eur,
+        "Valeur": fmt_eur,
+        "Cost Basis": fmt_eur,
+        "P&L latent": lambda x: fmt_eur(x, signed=True),
+        "P&L réalisé": lambda x: fmt_eur(x, signed=True),
+        "P&L total": lambda x: fmt_eur(x, signed=True),
+        "Perf. totale (%)": lambda x: fmt_pct(x, decimals=2),
+    }, na_rep="—")
+    # Styler.map remplace applymap à partir de pandas 2.1.
+    apply = getattr(styler, "map", None) or styler.applymap
+    return apply(_pnl_color, subset=_PNL_COLUMNS)
+
+
+def render_positions_table(df: pd.DataFrame, weight_base: float | None = None) -> None:
+    table = positions_table(df, weight_base)
     st.dataframe(
-        df_display[["Symbole", "Type", "Quantité", "Prix", "Valeur", "Cost Basis",
-                    "P&L latent", "P&L réalisé", "P&L total", "Perf. totale (%)"]],
-        use_container_width=True,
+        style_positions(table),
         hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Poids (%)": st.column_config.ProgressColumn(
+                "Poids", format="%.1f %%", min_value=0.0, max_value=float(max(table["Poids (%)"].max(), 1.0)),
+                help="Part de la valeur du portefeuille (hors cash)." if weight_base
+                else "Part de la valeur de la sélection affichée.",
+            ),
+        },
     )
 
 
@@ -3061,7 +3381,7 @@ def tag_correlation(rebased: pd.DataFrame, min_points: int = 8) -> pd.DataFrame:
     wide = d.pivot(index="date", columns="tag", values="ret").dropna(how="all")
     if len(wide) < min_points:
         return pd.DataFrame()
-    return wide.corr(min_periods=min_points).dropna(how="all").dropna(axis=1, how="all")
+    return wide.corr(min_periods=min_points).dropna(how="all").dropna(axis=1, how="all")
 
 
 ################################################################################
@@ -3070,7 +3390,7 @@ def tag_correlation(rebased: pd.DataFrame, min_points: int = 8) -> pd.DataFrame:
 # Chemin relatif : portfolio/tag_view.py
 ################################################################################
 
-"""Rendu de la page d'accueil articulée autour des tags : vue d'ensemble puis détail d'un tag."""
+"""Rendu de la page « Vue par tag » : vue d'ensemble de tous les tags, évolution, puis détail d'un tag."""
 from __future__ import annotations
 
 import pandas as pd
@@ -3079,7 +3399,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from portfolio.history import PERIODS
-from portfolio.home import render_positions_table
+from portfolio.home import allocation_figure, pnl_by_asset_figure, render_positions_table
 from portfolio.tag_stats import (
     positions_of_tag, rebase_returns, tag_contribution, tag_correlation, tag_perf_stats, trades_by_month,
 )
@@ -3294,18 +3614,9 @@ def render_tag_detail(
 
     left, right = st.columns(2)
     if not held.empty:
-        fig_pie = px.pie(held, values="value_eur", names="symbol", hole=0.4, title=f"Répartition dans « {tag} »")
-        fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-        fig_pie.update_layout(showlegend=False, margin=MARGIN)
-        left.plotly_chart(fig_pie, use_container_width=True)
+        left.plotly_chart(allocation_figure(held, title=f"Répartition dans « {tag} »"), use_container_width=True)
     if not perf.empty:
-        fig_bar = px.bar(
-            perf.sort_values("pnl_total_eur", ascending=False), x="symbol", y="pnl_total_eur",
-            color="pnl_color", color_discrete_map=COLOR_MAP,
-            labels={"pnl_total_eur": "P&L total (€)", "symbol": "Actif"}, title="P&L total par actif (€)",
-        )
-        fig_bar.update_layout(showlegend=False, margin=MARGIN)
-        right.plotly_chart(fig_bar, use_container_width=True)
+        right.plotly_chart(pnl_by_asset_figure(perf, title="P&L total par actif (€)"), use_container_width=True)
 
     # --- Historique du tag ---
     h = hist[hist["tag"] == tag]
@@ -3334,6 +3645,7 @@ def render_tag_detail(
 
     render_positions_table(perf)
 
+
 ################################################################################
 # Dossier : dashboard/portfolio
 # Fichier : theme.py
@@ -3351,9 +3663,11 @@ from __future__ import annotations
 import plotly.graph_objects as go
 import plotly.io as pio
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 # Palette cohérente avec .streamlit/config.toml
 BG_COLOR = "#0E1117"
+SURFACE_COLOR = "#161A23"  # cartes, infobulles (= secondaryBackgroundColor dans config.toml)
 TEXT_COLOR = "#E6E6E6"
 GRID_COLOR = "#2A2E37"
 GAIN_COLOR = "#26C281"
@@ -3364,17 +3678,28 @@ PASTEL_DARK_SEQUENCE = [
     "#9B59B6", "#1ABC9C", "#F39C12", "#5DADE2",
 ]
 
+FONT_FAMILY = '"Source Sans Pro", "Source Sans 3", sans-serif'
+# Séparateurs français pour tous les graphiques : virgule décimale, espace insécable pour les milliers
+# (même format que portfolio.fmt, utilisé pour les KPIs et les tableaux).
+PLOTLY_SEPARATORS = ",\u00a0"
+
 
 def _build_dark_template() -> go.layout.Template:
     template = go.layout.Template()
     template.layout = go.Layout(
         paper_bgcolor=BG_COLOR,
         plot_bgcolor=BG_COLOR,
-        font=dict(color=TEXT_COLOR),
-        xaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR),
-        yaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR),
+        font=dict(color=TEXT_COLOR, family=FONT_FAMILY),
+        title=dict(x=0, xanchor="left", font=dict(size=16)),
+        xaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR, automargin=True),
+        yaxis=dict(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR, automargin=True),
         colorway=PASTEL_DARK_SEQUENCE,
         legend=dict(bgcolor="rgba(0,0,0,0)"),
+        hoverlabel=dict(
+            bgcolor=SURFACE_COLOR, bordercolor=GRID_COLOR,
+            font=dict(color=TEXT_COLOR, family=FONT_FAMILY),
+        ),
+        separators=PLOTLY_SEPARATORS,
     )
     return template
 
@@ -3383,11 +3708,180 @@ def apply_theme() -> None:
     """À appeler une fois, tout en haut de CHAQUE page, avant tout autre st.* ou px.*.
 
     Configure la page Streamlit et active le template Plotly sombre "portfolio_dark".
+    Le routeur (app.py) l'appelle aussi avant `st.navigation` : un second appel de
+    `st.set_page_config` depuis une page peut être refusé selon la version de Streamlit,
+    on l'ignore alors (la configuration du routeur reste valable).
     """
-    st.set_page_config(page_title="Portfolio Dashboard", page_icon="📈", layout="wide")
+    try:
+        st.set_page_config(page_title="Portfolio Dashboard", page_icon="📈", layout="wide")
+    except StreamlitAPIException:
+        pass
 
     pio.templates["portfolio_dark"] = _build_dark_template()
     pio.templates.default = "portfolio_dark"
+
+
+################################################################################
+# Dossier : dashboard/tests
+# Fichier : test_compare.py
+# Chemin relatif : tests/test_compare.py
+################################################################################
+
+"""Tests de portfolio/compare.py (logique pure : rendements par actif, séries communes, bêta)."""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from portfolio import compare as cp  # noqa: E402
+from portfolio import tag_stats as ts  # noqa: E402
+
+
+def _history(rows: list[tuple[str, list[dict]]]) -> pd.DataFrame:
+    """rows : (date, [actifs]). Colonnes minimales de history_to_df."""
+    return pd.DataFrame({"date": pd.to_datetime([d for d, _ in rows]), "assets": [a for _, a in rows]})
+
+
+def _a(symbol, qty, price, kind="Stock"):
+    return {"symbol": symbol, "kind": kind, "quantity": qty, "price_eur": price}
+
+
+HIST = _history([
+    ("2026-01-04", [_a("A", 10, 100.0)]),
+    ("2026-01-11", [_a("A", 10, 110.0)]),                       # A : +10 %
+    ("2026-01-18", [_a("A", 20, 99.0), _a("B", 1, 50.0, "Crypto")]),   # A : -10 %, achat de 10 titres ; B achetée
+    ("2026-01-25", [_a("A", 20, 99.0), _a("B", 1, 55.0, "Crypto")]),   # A : 0 %, B : +10 %
+])
+
+
+def test_asset_returns_ignore_trades_and_need_a_previous_holding():
+    r = cp.asset_returns(HIST).set_index(["symbol", "date"])["ret"]
+    assert abs(r[("A", pd.Timestamp("2026-01-11"))] - 0.10) < 1e-9
+    assert abs(r[("A", pd.Timestamp("2026-01-18"))] - (-0.10)) < 1e-9   # l'achat n'a aucun effet
+    assert ("B", pd.Timestamp("2026-01-18")) not in r.index             # pas détenue au snapshot précédent
+    assert abs(r[("B", pd.Timestamp("2026-01-25"))] - 0.10) < 1e-9
+
+
+def test_single_asset_tag_equals_the_asset_series():
+    sym_tags = {"A": ["T"], "B": ["Autre"]}
+    t_ret, a_ret = ts.tag_returns(HIST, sym_tags), cp.asset_returns(HIST)
+    s = cp.compare_series(HIST["date"], t_ret, a_ret, "T", "A", "Tag · T", "Actif · A")
+    tag_part = s[s["tag"] == "Tag · T"].reset_index(drop=True)
+    asset_part = s[s["tag"] == "Actif · A"].reset_index(drop=True)
+    assert list(tag_part["date"]) == list(asset_part["date"])
+    assert np.allclose(tag_part["ret"], asset_part["ret"])
+    assert tag_part["ret"].iloc[0] == 0.0                               # point d'ancrage
+    assert tag_part["date"].iloc[0] == pd.Timestamp("2026-01-04")       # snapshot précédent la 1re semaine
+
+
+def test_only_common_weeks_are_compared():
+    sym_tags = {"A": ["T"], "B": ["Autre"]}
+    t_ret, a_ret = ts.tag_returns(HIST, sym_tags), cp.asset_returns(HIST)
+    s = cp.compare_series(HIST["date"], t_ret, a_ret, "T", "B", "Tag · T", "Actif · B")
+    assert list(s[s["tag"] == "Actif · B"]["date"]) == [pd.Timestamp("2026-01-18"), pd.Timestamp("2026-01-25")]
+    # B n'a de rendement que le 25/01 : une seule semaine comparée + l'ancrage (18/01)
+    assert len(s[s["tag"] == "Tag · T"]) == 2
+
+
+def test_no_common_week_gives_empty_frame():
+    t_ret = ts.tag_returns(HIST, {"A": ["T"], "B": ["Autre"]})
+    a_ret = cp.asset_returns(HIST[HIST["date"] <= "2026-01-11"])         # B inconnue
+    assert cp.compare_series(HIST["date"], t_ret, a_ret, "T", "B", "x", "y").empty
+
+
+def test_catalog_lists_assets_with_returns_and_held_flag():
+    a_ret = cp.asset_returns(HIST)
+    df_all = pd.DataFrame({"symbol": ["A"], "kind": ["Stock"], "value_eur": [1980.0]})
+    cat = cp.asset_catalog(a_ret, df_all).set_index("symbol")
+    assert set(cat.index) == {"A", "B"}
+    assert bool(cat.loc["A", "held"]) and not bool(cat.loc["B", "held"])
+    assert cat.loc["B", "kind"] == "Crypto"
+
+
+def _rebased(tag_rets, asset_rets):
+    dates = pd.date_range("2026-01-04", periods=len(tag_rets) + 1, freq="7D")
+    frames = [
+        pd.DataFrame({"date": dates, "tag": label, "ret": [0.0, *rets]})
+        for label, rets in (("T", tag_rets), ("A", asset_rets))
+    ]
+    return ts.rebase_returns(pd.concat(frames, ignore_index=True))
+
+
+def test_beta_and_correlation_of_a_leveraged_series():
+    asset = [0.01, -0.02, 0.015, 0.03, -0.01, 0.02, -0.015, 0.005, 0.01, -0.005]
+    rb = _rebased([2 * r for r in asset], asset)
+    st_ = cp.relative_stats(rb, "T", "A")
+    assert st_["n_periods"] == 10
+    assert abs(st_["beta"] - 2.0) < 1e-9 and abs(st_["corr"] - 1.0) < 1e-9
+    assert st_["hit_rate"] == 60.0      # le tag (x2) bat l'actif quand le rendement est positif : 6 semaines sur 10
+    assert st_["diff"] == st_["perf_tag"] - st_["perf_asset"]
+
+
+def test_beta_and_correlation_are_nan_below_min_periods():
+    rb = _rebased([0.01, 0.02, -0.01], [0.02, 0.01, -0.02])
+    st_ = cp.relative_stats(rb, "T", "A")
+    assert st_["n_periods"] == 3
+    assert np.isnan(st_["beta"]) and np.isnan(st_["corr"])
+
+
+def test_relative_series_is_index_difference():
+    rb = _rebased([0.10, 0.10], [0.0, 0.0])
+    d = cp.relative_series(rb, "T", "A")
+    assert abs(d.iloc[-1] - 21.0) < 1e-9 and d.iloc[0] == 0.0
+
+
+################################################################################
+# Dossier : dashboard/tests
+# Fichier : test_fmt.py
+# Chemin relatif : tests/test_fmt.py
+################################################################################
+
+"""Tests de portfolio/fmt.py (formats français)."""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from portfolio.fmt import fmt_eur, fmt_number, fmt_pct  # noqa: E402
+
+NB = "\u00a0"
+
+
+def test_fmt_eur_groups_thousands_and_uses_decimal_comma():
+    assert fmt_eur(1234.5) == f"1{NB}234,50{NB}€"
+    assert fmt_eur(1234567.891, decimals=0) == f"1{NB}234{NB}568{NB}€"
+
+
+def test_fmt_eur_signed():
+    assert fmt_eur(12.3, signed=True) == f"+12,30{NB}€"
+    assert fmt_eur(-1234.5, signed=True) == f"-1{NB}234,50{NB}€"
+
+
+def test_tiny_negative_value_has_no_negative_zero():
+    assert fmt_eur(-0.001) == f"0,00{NB}€"
+    assert fmt_pct(-0.001, decimals=1, signed=False) == f"0,0{NB}%"
+
+
+def test_fmt_pct():
+    assert fmt_pct(3.456) == f"+3,5{NB}%"
+    assert fmt_pct(-12.04) == f"-12,0{NB}%"
+    assert fmt_pct(3.456, decimals=2, signed=False) == f"3,46{NB}%"
+
+
+def test_fmt_number():
+    assert fmt_number(0.00123456, decimals=4) == "0,0012"
+    assert fmt_number(1234.5, decimals=1) == f"1{NB}234,5"
+
+
+@pytest.mark.parametrize("fn", [fmt_eur, fmt_pct, fmt_number])
+def test_missing_values_show_a_dash(fn):
+    assert fn(None) == "—"
+    assert fn(float("nan")) == "—"
 
 
 ################################################################################
@@ -3643,6 +4137,7 @@ def test_page_period_selection_changes_the_number_of_points(monkeypatch):
     assert not at.exception
     assert n_points(at) == 5  # dimanches à 0, 7, 14, 21 et 28 jours de la fin
 
+
 ################################################################################
 # Dossier : dashboard/tests
 # Fichier : test_tag_stats.py
@@ -3684,4 +4179,5 @@ def test_summary_counts_multi_tag_assets_in_each_tag_and_keeps_closed_positions(
     assert s.loc["Tech", "value"] == 600.0 and s.loc["Dividende", "value"] == 600.0
     assert s.loc["Tech", "pnl_total"] == 150.0          # AIR 100 + OLD 50 réalisé
     assert s.loc["Tech", "cost_basis"] == 500.0         # capital engagé : lots ouverts seulement
+
 
