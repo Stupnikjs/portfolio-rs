@@ -1,7 +1,13 @@
-"""Page Historique : plus-value latente dans le temps (valeur totale - cost basis).
+"""Page Historique : valeur totale et cost basis dans le temps (data/history.json).
 
-Lit `data/history.json` (pipeline Rust, lecture seule). La logique pure
-(filtrage, stats, figure) est séparée du rendu Streamlit pour être testable.
+Trois mesures disponibles :
+  - Plus-value latente (cash exclu) : valeur - cost basis (vue d'origine).
+  - Equity (cash inclus) : titres + crypto + cash XTB, face aux apports nets cumulés.
+  - Cash disponible : cash XTB (CTO + PEA) dans le temps.
+
+Le cash_eur et net_contributions_eur sont présents dans history.json depuis la
+version 4 de HistoryEntry (côté Rust). Les anciens snapshots sans ces champs sont
+à 0 ; relancer `cargo run -- --rebuild-history` les backfill.
 """
 from __future__ import annotations
 
@@ -16,7 +22,8 @@ from portfolio.config import DATA_PATH, HISTORY_PATH
 from portfolio.data import build_assets_df, compute_kpis, load_data
 from portfolio.theme import GAIN_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
 
-LINE_COLOR = PASTEL_DARK_SEQUENCE[0]  # bleu : courbe de la plus-value latente
+LINE_COLOR = PASTEL_DARK_SEQUENCE[0]  # bleu : courbe principale
+CONTRIBUTION_COLOR = "#888888"        # gris : apports nets (référence)
 
 # Libellé -> nombre de jours affichés (None = tout l'historique).
 PERIODS: dict[str, int | None] = {
@@ -26,6 +33,13 @@ PERIODS: dict[str, int | None] = {
     "1 an": 366,
     "Tout": None,
 }
+
+# Mesures disponibles sur la page (la première est la valeur par défaut).
+METRICS = [
+    "Plus-value latente (cash exclu)",
+    "Equity (titres + crypto + cash)",
+    "Cash disponible",
+]
 
 
 # --- Chargement de history.json -------------------------------------------------
@@ -39,11 +53,14 @@ def history_to_df(raw: list[dict]) -> pd.DataFrame:
     - accepte l'ancien nom de colonne `week_end` (renommé en `date`) ;
     - `complete` absent (ancien format) -> True ;
     - un doublon de date garde la dernière entrée ;
+    - `cash_eur` / `net_contributions_eur` absents (history.json < v4) -> 0.0 ;
     - lève ValueError si une colonne indispensable manque.
     """
     df = pd.DataFrame(raw)
     if df.empty:
-        return pd.DataFrame(columns=sorted(HISTORY_REQUIRED_COLUMNS | {"total_pnl_eur", "complete", "assets"}))
+        return pd.DataFrame(columns=sorted(
+            HISTORY_REQUIRED_COLUMNS | {"total_pnl_eur", "complete", "assets", "cash_eur", "net_contributions_eur"}
+        ))
 
     if "date" not in df.columns and "week_end" in df.columns:
         df = df.rename(columns={"week_end": "date"})
@@ -59,6 +76,14 @@ def history_to_df(raw: list[dict]) -> pd.DataFrame:
         df["total_pnl_eur"] = df["total_value_eur"] - df["total_cost_basis_eur"]
     if "assets" not in df.columns:
         df["assets"] = None
+    # cash_eur / net_contributions_eur : présents depuis la v4 de HistoryEntry (côté Rust).
+    # Les anciens snapshots (ou un history.json régénéré sans le champ) sont à 0.
+    if "cash_eur" not in df.columns:
+        df["cash_eur"] = 0.0
+    if "net_contributions_eur" not in df.columns:
+        df["net_contributions_eur"] = 0.0
+    df["cash_eur"] = df["cash_eur"].fillna(0.0)
+    df["net_contributions_eur"] = df["net_contributions_eur"].fillna(0.0)
 
     return (
         df.sort_values("date")
@@ -88,6 +113,10 @@ def filter_period(df: pd.DataFrame, days: int | None) -> pd.DataFrame:
 def with_live_point(df: pd.DataFrame, kpis: dict, now: pd.Timestamp | None = None) -> pd.DataFrame:
     """Ajoute le point "maintenant" (valeurs de dashboard.json) à la fin du df.
 
+    Le kpis dict doit contenir total_value_eur et total_cost_basis_eur ; cash_eur et
+    net_contributions_eur sont optionnels (0.0 par défaut, pour compat avec les tests
+    qui passent un kpis minimal).
+
     Sans effet si `now` n'est pas strictement postérieur à la dernière date.
     """
     now = now if now is not None else pd.Timestamp.now()
@@ -101,6 +130,8 @@ def with_live_point(df: pd.DataFrame, kpis: dict, now: pd.Timestamp | None = Non
         "total_value_eur": kpis["total_value_eur"],
         "total_cost_basis_eur": kpis["total_cost_basis_eur"],
         "total_pnl_eur": kpis["total_value_eur"] - kpis["total_cost_basis_eur"],
+        "cash_eur": kpis.get("cash_eur", 0.0),
+        "net_contributions_eur": kpis.get("net_contributions_eur", 0.0),
         "complete": True,
         "assets": None,
         "live": True,
@@ -109,7 +140,7 @@ def with_live_point(df: pd.DataFrame, kpis: dict, now: pd.Timestamp | None = Non
 
 
 def period_stats(df: pd.DataFrame) -> dict:
-    """Valeurs de fin de période et variations par rapport au premier point."""
+    """Stats plus-value latente (cash exclu) : valeurs de fin de période et deltas."""
     first, last = df.iloc[0], df.iloc[-1]
     value, cost = float(last["total_value_eur"]), float(last["total_cost_basis_eur"])
     pnl = value - cost
@@ -123,17 +154,53 @@ def period_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def equity_stats(df: pd.DataFrame) -> dict:
+    """Stats equity (titres + crypto + cash) vs apports nets cumulés.
+
+    Equity = total_value + cash_eur (ce que tu possèdes maintenant).
+    Apports nets = net_contributions_eur (virements externes cumulés : dépôts - retraits).
+    Gain = equity - apports nets (latent + réalisé + revenus).
+
+    ⚠ Apports nets fiables seulement si l'export XTB remonte à l'ouverture du compte
+    (un virement antérieur à l'export fausse la base et donc le gain).
+    """
+    first, last = df.iloc[0], df.iloc[-1]
+    equity = float(last["total_value_eur"]) + float(last["cash_eur"])
+    equity_first = float(first["total_value_eur"]) + float(first["cash_eur"])
+    contributions = float(last["net_contributions_eur"])
+    gain = equity - contributions
+    return {
+        "equity": equity,
+        "contributions": contributions,
+        "gain": gain,
+        "perf_pct": gain / contributions * 100 if contributions > 0 else 0.0,
+        "equity_delta": equity - equity_first,
+    }
+
+
+def cash_stats(df: pd.DataFrame) -> dict:
+    """Stats cash disponible : valeur de fin et variation sur la période."""
+    first, last = df.iloc[0], df.iloc[-1]
+    cash = float(last["cash_eur"])
+    cash_first = float(first["cash_eur"])
+    return {
+        "cash": cash,
+        "cash_delta": cash - cash_first,
+    }
+
+
 def unrealized_gain(df: pd.DataFrame) -> pd.Series:
     """Écart valeur totale - cost basis (plus-value latente), en EUR, pour chaque point."""
     return df["total_value_eur"] - df["total_cost_basis_eur"]
 
 
-def split_at_zero(x: pd.Series, y: pd.Series) -> tuple[list, list[float]]:
-    """Série (x, y) avec un point interpolé à y = 0 à chaque changement de signe.
+def equity_series(df: pd.DataFrame) -> pd.Series:
+    """Equity = titres + crypto + cash XTB, pour chaque point."""
+    return df["total_value_eur"] + df["cash_eur"]
 
-    Permet de remplir proprement la partie positive et la partie négative d'une courbe
-    sans qu'un segment qui traverse zéro déborde de l'autre côté.
-    """
+
+def split_at_zero(x: pd.Series, y: pd.Series) -> tuple[list, list[float]]:
+    """Série (x, y) avec un point interpolé à y = 0 à chaque changement de signe."""
     xs, ys = list(x), [float(v) for v in y]
     out_x, out_y = [], []
     for i, (xi, yi) in enumerate(zip(xs, ys)):
@@ -146,12 +213,17 @@ def split_at_zero(x: pd.Series, y: pd.Series) -> tuple[list, list[float]]:
     return out_x, out_y
 
 
-def build_history_figure(df: pd.DataFrame) -> go.Figure:
-    """Plus-value latente (valeur - cost basis) : courbe + remplissage vert (gain) / rouge (perte).
+# --- Figures ------------------------------------------------------------------------
 
-    La première trace est la courbe elle-même, un point par ligne de `df` ; viennent ensuite
-    les remplissages, puis les croix rouges (points incomplets) et le point actuel.
-    """
+def _with_alpha(color: str, alpha: float) -> str:
+    """'#RRGGBB' -> 'rgba(r, g, b, alpha)'."""
+    h = color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
+
+def build_history_figure(df: pd.DataFrame) -> go.Figure:
+    """Plus-value latente (valeur - cost basis) : courbe + remplissage vert (gain) / rouge (perte)."""
     few_points = len(df) <= 40
     mode = "lines+markers" if few_points else "lines"
     gain = unrealized_gain(df)
@@ -201,11 +273,71 @@ def build_history_figure(df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-def _with_alpha(color: str, alpha: float) -> str:
-    """'#RRGGBB' -> 'rgba(r, g, b, alpha)' (plotly n'accepte pas l'alpha en hexadécimal 6 chiffres)."""
-    h = color.lstrip("#")
-    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
-    return f"rgba({r}, {g}, {b}, {alpha})"
+def build_equity_figure(df: pd.DataFrame) -> go.Figure:
+    """Equity (titres + crypto + cash) et apports nets cumulés dans le temps.
+
+    Deux courbes : equity (ce que tu possèdes) et apports nets (ce que tu as déposé).
+    L'écart entre les deux = gain total (latent + réalisé + revenus).
+    """
+    equity = equity_series(df)
+    contributions = df["net_contributions_eur"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=equity, name="Equity", mode="lines",
+        line=dict(color=LINE_COLOR, width=2.5),
+        hovertemplate="%{y:,.2f} €<extra>Equity</extra>",
+    ))
+    # Apports nets : courbe de référence (ce que tu as injecté dans le compte).
+    has_contributions = contributions.abs().sum() > 0
+    if has_contributions:
+        fig.add_trace(go.Scatter(
+            x=df["date"], y=contributions, name="Apports nets", mode="lines",
+            line=dict(color=CONTRIBUTION_COLOR, width=2, dash="dash"),
+            hovertemplate="%{y:,.2f} €<extra>Apports nets</extra>",
+        ))
+
+    live = df[df["live"]] if "live" in df.columns else df.iloc[0:0]
+    if not live.empty:
+        fig.add_trace(go.Scatter(
+            x=live["date"], y=equity_series(live), name="Aujourd'hui", mode="markers",
+            marker=dict(symbol="circle-open", size=12, color=GAIN_COLOR, line=dict(width=2)),
+            hovertemplate="%{y:,.2f} € (actuel)<extra></extra>",
+        ))
+
+    fig.update_layout(
+        height=480, hovermode="x unified",
+        margin=dict(l=10, r=10, t=30, b=10),
+        yaxis=dict(ticksuffix=" €", rangemode="tozero"),
+        legend=dict(orientation="h", y=1.08, x=0),
+    )
+    return fig
+
+
+def build_cash_figure(df: pd.DataFrame) -> go.Figure:
+    """Cash disponible (CTO + PEA) dans le temps."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["date"], y=df["cash_eur"], name="Cash", mode="lines",
+        line=dict(color=LINE_COLOR, width=2.5),
+        hovertemplate="%{y:,.2f} €<extra>Cash</extra>",
+    ))
+
+    live = df[df["live"]] if "live" in df.columns else df.iloc[0:0]
+    if not live.empty:
+        fig.add_trace(go.Scatter(
+            x=live["date"], y=live["cash_eur"], name="Aujourd'hui", mode="markers",
+            marker=dict(symbol="circle-open", size=12, color=GAIN_COLOR, line=dict(width=2)),
+            hovertemplate="%{y:,.2f} € (actuel)<extra></extra>",
+        ))
+
+    fig.update_layout(
+        height=480, hovermode="x unified",
+        margin=dict(l=10, r=10, t=30, b=10),
+        yaxis=dict(ticksuffix=" €", rangemode="tozero"),
+        showlegend=False,
+    )
+    return fig
 
 
 def asset_snapshot_df(assets: list[dict]) -> pd.DataFrame:
@@ -221,10 +353,15 @@ def asset_snapshot_df(assets: list[dict]) -> pd.DataFrame:
 # --- Rendu Streamlit ---------------------------------------------------------------
 
 def _live_kpis() -> dict | None:
-    """KPIs du jour (même convention que la page d'accueil : cash exclu)."""
+    """KPIs du jour (dashboard.json), incluant le cash XTB pour le point 'maintenant'."""
     if not DATA_PATH.exists():
         return None
-    return compute_kpis(build_assets_df(load_data()))
+    data = load_data()
+    kpis = compute_kpis(build_assets_df(data))
+    cash_total = (data.get("cash") or {}).get("total") or {}
+    kpis["cash_eur"] = float(cash_total.get("cash_eur", 0.0))
+    kpis["net_contributions_eur"] = float(cash_total.get("net_contributions_eur", 0.0))
+    return kpis
 
 
 def render_history_page() -> None:
@@ -247,7 +384,9 @@ def render_history_page() -> None:
     period = c1.radio("Période", list(PERIODS), index=len(PERIODS) - 1, horizontal=True, label_visibility="collapsed")
     kpis = _live_kpis()
     show_live = c2.checkbox("Ajouter le point actuel", value=kpis is not None, disabled=kpis is None,
-                            help="Valeur et cost basis du jour (dashboard.json), cash exclu.")
+                            help="Valeur et cost basis du jour (dashboard.json), cash inclus.")
+
+    metric = st.radio("Mesure", METRICS, horizontal=True, label_visibility="collapsed")
 
     df = with_live_point(history, kpis) if (show_live and kpis) else history.assign(live=False)
     view = filter_period(df, PERIODS[period])
@@ -256,24 +395,64 @@ def render_history_page() -> None:
         st.info("Pas assez de points sur cette période pour tracer une courbe.")
         st.stop()
 
-    stats = period_stats(view)
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Valeur totale", f"{stats['value']:,.2f} €", f"{stats['value_delta']:+,.2f} €")
-    k2.metric("Cost basis", f"{stats['cost']:,.2f} €", f"{stats['cost_delta']:+,.2f} €", delta_color="off")
-    k3.metric("P&L", f"{stats['pnl']:+,.2f} €")
-    k4.metric("Performance", f"{stats['pnl_pct']:+.2f} %")
+    has_cash = view["cash_eur"].abs().sum() > 0
 
-    st.plotly_chart(build_history_figure(view), use_container_width=True)
-    st.caption(
-        "Courbe = valeur totale - cost basis (plus-value latente), cash exclu. Un achat ne la modifie pas "
-        "(valeur et cost basis montent ensemble) ; elle bouge avec les prix, et redescend quand tu "
-        "vends des positions gagnantes (la plus-value devient réalisée)."
-    )
+    if metric == "Plus-value latente (cash exclu)":
+        stats = period_stats(view)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Valeur totale", f"{stats['value']:,.2f} €", f"{stats['value_delta']:+,.2f} €")
+        k2.metric("Cost basis", f"{stats['cost']:,.2f} €", f"{stats['cost_delta']:+,.2f} €", delta_color="off")
+        k3.metric("P&L latent", f"{stats['pnl']:+,.2f} €")
+        k4.metric("Performance", f"{stats['pnl_pct']:+,.2f} %")
+        st.plotly_chart(build_history_figure(view), use_container_width=True)
+        st.caption(
+            "Courbe = valeur totale - cost basis (plus-value latente), cash exclu. Un achat ne la modifie pas "
+            "(valeur et cost basis montent ensemble) ; elle bouge avec les prix, et redescend quand tu "
+            "vends des positions gagnantes (la plus-value devient réalisée)."
+        )
 
+    elif metric == "Equity (titres + crypto + cash)":
+        if not has_cash:
+            st.warning(
+                "Aucune donnée cash dans history.json sur cette période. Relance "
+                "`cargo run -- --rebuild-history` pour backfiller le cash XTB (CTO + PEA)."
+            )
+        stats = equity_stats(view)
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Equity", f"{stats['equity']:,.2f} €", f"{stats['equity_delta']:+,.2f} €")
+        k2.metric("Apports nets", f"{stats['contributions']:,.2f} €", delta_color="off",
+                  help="Virements externes cumulés (dépôts - retraits). Fiable seulement si l'export remonte à l'ouverture du compte.")
+        k3.metric("Gain", f"{stats['gain']:+,.2f} €",
+                  help="Equity - apports nets = latent + réalisé + revenus.")
+        k4.metric("Performance", f"{stats['perf_pct']:+,.2f} %")
+        st.plotly_chart(build_equity_figure(view), use_container_width=True)
+        st.caption(
+            "Equity = titres + crypto + cash XTB (CTO + PEA). Apports nets = virements externes cumulés. "
+            "Gain = equity - apports nets (latent + réalisé + revenus). Un achat ou une vente ne change pas "
+            "l'equity (cash ↔ titres) ; il bouge avec les prix et les apports/retraits."
+        )
+
+    else:  # Cash disponible
+        if not has_cash:
+            st.warning(
+                "Aucune donnée cash dans history.json sur cette période. Relance "
+                "`cargo run -- --rebuild-history` pour backfiller le cash XTB (CTO + PEA)."
+            )
+        stats = cash_stats(view)
+        k1, k2 = st.columns(2)
+        k1.metric("Cash disponible", f"{stats['cash']:,.2f} €", f"{stats['cash_delta']:+,.2f} €")
+        k2.metric("Variation sur la période", f"{stats['cash_delta']:+,.2f} €", delta_color="off")
+        st.plotly_chart(build_cash_figure(view), use_container_width=True)
+        st.caption(
+            "Cash XTB disponible (CTO + PEA) dans le temps. Un achat diminue le cash, une vente l'augmente ; "
+            "les dividendes et intérêts l'augmentent, les taxes le diminuent."
+        )
+
+    # --- Prix incomplets (commun aux 3 vues) ---
     n_bad = int((~view["complete"]).sum())
     if n_bad:
         st.warning(
-            f"{n_bad} snapshot(s) avec un prix manquant ou reporté (croix rouges). "
+            f"{n_bad} snapshot(s) avec un prix manquant ou reporté. "
             "Ils sont recalculés automatiquement au prochain `cargo run` ; détail par actif ci-dessous."
         )
 

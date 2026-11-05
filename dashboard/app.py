@@ -16,7 +16,6 @@ PAGES = {
     "Portefeuille": [
         st.Page("pages/Home.py", title="Vue globale", icon="📈", url_path="accueil", default=True),
         st.Page("pages/2 🏷 vue par tag.py", title="Vue par tag", icon="🏷️", url_path="vue-par-tag"),
-        st.Page("pages/5_Historique.py", title="Historique", icon="🕒", url_path="historique"),
         st.Page("pages/7_Holding.py", title="Détention", icon="⏳", url_path="detention"),
     ],
     "Analyse": [

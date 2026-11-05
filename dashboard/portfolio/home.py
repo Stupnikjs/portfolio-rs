@@ -63,11 +63,22 @@ def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
     # --- Ligne principale ---
     h1, h2, h3 = st.columns(3)
     with h1.container(border=True):
-        st.metric(
-            "Valeur du portefeuille", fmt_eur(kpis["total_value_eur"]),
-            delta=_signed_delta(latent, latent_pct),
-            help="Titres + crypto, hors cash. Le delta est le P&L latent (valeur - cost basis).",
-        )
+        # Cash inclus (CTO + PEA) quand global_kpis est disponible : on affiche l'equity totale.
+        # Fallback hors cash si dashboard.json n'expose pas encore le champ cash.
+        if global_kpis is not None:
+            st.metric(
+                "Valeur du portefeuille", fmt_eur(global_kpis["equity_eur"]),
+                delta=_signed_delta(latent, latent_pct),
+                help="Titres + crypto + cash XTB (CTO + PEA). Le delta est le P&L latent "
+                     "(valeur des positions - cost basis des lots ouverts).",
+            )
+        else:
+            st.metric(
+                "Valeur du portefeuille", fmt_eur(kpis["total_value_eur"]),
+                delta=_signed_delta(latent, latent_pct),
+                help="Titres + crypto, hors cash (cash XTB indisponible dans dashboard.json). "
+                     "Le delta est le P&L latent (valeur - cost basis).",
+            )
     with h2.container(border=True):
         if global_kpis is not None:
             ret = global_kpis["return_pct"]
@@ -86,12 +97,10 @@ def render_kpis(kpis: dict, global_kpis: dict | None = None) -> None:
                 help="(P&L latent + réalisé) / capital engagé.",
             )
     with h3.container(border=True):
-        if global_kpis is not None:
-            st.metric("Titres + crypto + cash", fmt_eur(global_kpis["equity_eur"]),
-                      help="Valeur du portefeuille + cash XTB disponible.")
-        else:
-            st.metric("Capital engagé", fmt_eur(invested),
-                      help="Cost basis des lots ouverts + coût des lots déjà vendus.")
+        # h1 porte déjà l'equity (titres + crypto + cash) : h3 affiche le capital engagé,
+        # utile pour comparer avec la valeur du portefeuille.
+        st.metric("Capital engagé", fmt_eur(invested),
+                  help="Cost basis des lots ouverts + coût des lots déjà vendus.")
 
     # --- Ligne secondaire ---
     with st.container(border=True):

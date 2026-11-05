@@ -5420,7 +5420,7 @@ fn cash_kind_for(op_type: &str) -> Option<(TransactionKind, CashFlowKind)> {
         "Free funds interest" | "Dividend" => Some((K::Deposit, Income)),
         "Stock purchase" => Some((K::Withdraw, TradeLeg)),
         "Stock sell" | "Fractional shares" => Some((K::Deposit, TradeLeg)),
-        "Withholding tax" | "Tax IFTT" => Some((K::Fee, Tax)),
+        "Withholding tax" | "Tax IFTT" | "Free funds interest tax" | "SEC fee" => Some((K::Fee, Tax)),
         _ => None,
     }
 }
