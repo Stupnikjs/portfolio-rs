@@ -86,11 +86,14 @@ fn main() -> Result<()> {
 
     // 5. Corrélations et Dashboard
     let correlations = compute_correlations(&tx_store, &snapshot, &market_client);
-    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, correlations, holdings, sales);
+    let correlation_path = PathBuf::from("./data/correlation.json");
+    write_json(&correlation_path, &correlations)?;
+    println!("Corrélations écrites : {correlation_path:?}");
+
+    let dashboard = build_dashboard(&tx_store, &snapshot, &cost_basis, holdings, sales);
     let dashboard_path = PathBuf::from("./data/dashboard.json");
     write_json(&dashboard_path, &dashboard)?;
     println!("Dashboard écrit : {dashboard_path:?}");
-
     // 6. Sauvegarde des caches sur disque avant de quitter
     market_client.save_caches(&cache_dir);
     println!("Cache des prix 1h/1j sauvegardé : {cache_dir:?}");
@@ -283,7 +286,6 @@ fn build_dashboard(
     tx_store: &TxStore,
     snapshot: &PortfolioSnapshot,
     cost_basis: &CostBasisResult,
-    correlation_matrices: CorrelationMatrices,
     holdings: Vec<HoldingStats>,
     sales: Vec<ClosedSale>,
 ) -> DashboardData {
@@ -305,7 +307,6 @@ fn build_dashboard(
         trades: build_trades(tx_store),
         trade_frequency: build_trade_frequency(tx_store),
         assets,
-        correlation_matrices,
         holdings,
         closed_sales: sales,
         cash: cash_summary(tx_store, None),

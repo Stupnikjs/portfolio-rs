@@ -8,7 +8,7 @@ from pathlib import Path
 # On part de l'emplacement du fichier plutôt que du cwd : ça marche d'où que `streamlit run` soit lancé.
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent
 ROOT_DIR = DASHBOARD_DIR.parent
-
+CORRELATION_PATH = ROOT_DIR / "data" / "correlation.json"
 DATA_PATH = ROOT_DIR / "data" / "dashboard.json"
 HISTORY_PATH = ROOT_DIR / "data" / "history.json"
 ASSETS_DIR = ROOT_DIR / "data" / "assets"                # un fichier JSON par actif
@@ -38,4 +38,5 @@ BENCHMARK_TICKERS = {
     "NASDAQ": "^NDX",
     "SU.FR": "SU.PA",
 }
-BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())
+BENCHMARK_LABELS = set(BENCHMARK_TICKERS.keys())
+

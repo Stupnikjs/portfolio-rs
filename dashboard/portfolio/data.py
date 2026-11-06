@@ -1,4 +1,4 @@
-"""Chargement de dashboard.json (pipeline Rust), DataFrame des positions et KPIs."""
+"""Chargement de dashboard.json et correlation.json (pipeline Rust), DataFrame des positions et KPIs."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from portfolio.config import DATA_PATH, MIN_POSITION_VALUE_EUR
+from portfolio.config import CORRELATION_PATH, DATA_PATH, MIN_POSITION_VALUE_EUR
 
 CASH_KIND = "Cash"
 
@@ -17,6 +17,18 @@ def load_data(path: Path = DATA_PATH) -> dict:
     if not path.exists():
         st.error("Fichier dashboard.json introuvable. Lance d'abord le binaire Rust (`cargo run`).")
         st.stop()
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_correlations(path: Path = CORRELATION_PATH) -> dict:
+    """Charge correlation.json (écrit à part depuis la séparation du dashboard).
+
+    Renvoie {} si le fichier n'existe pas encore : la page Corrélation affichera
+    ses messages « données indisponibles » habituels, sans crasher.
+    """
+    if not path.exists():
+        return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -122,4 +134,4 @@ def small_positions_summary(df: pd.DataFrame, min_value_eur: float = MIN_POSITIO
     Les positions soldées (valeur nulle) ne comptent pas : on ne les « possède » plus.
     """
     dust = df[(df["value_eur"] > 0) & (df["value_eur"] < min_value_eur)]
-    return int(len(dust)), float(dust["value_eur"].sum())
+    return int(len(dust)), float(dust["value_eur"].sum())

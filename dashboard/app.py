@@ -21,6 +21,7 @@ PAGES = {
     "Analyse": [
         st.Page("pages/3_📊_Activite.py", title="Activité", icon="📊", url_path="activite"),
         st.Page("pages/6_🔗_Correlation.py", title="Corrélation", icon="🔗", url_path="correlation"),
+        st.Page("pages/8_Strategy.py", title="Stratégie", icon="🧭", url_path="strategie"),
         st.Page("pages/Comparer.py", title="Comparer", icon="⚖️", url_path="comparer"),
     ],
     "Organisation": [

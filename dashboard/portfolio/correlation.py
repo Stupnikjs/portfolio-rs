@@ -1,9 +1,7 @@
-"""Page Corrélation : matrices pré-calculées par le pipeline Rust (`correlation_matrices` de
-dashboard.json), corrélations par actif, regroupement automatique (clustering) et variation
-d'une paire d'actifs selon la fenêtre temporelle.
+"""Page Corrélation : par actif, groupes automatiques et variation selon la fenêtre.
 
-Le clustering regroupe les actifs par similarité de comportement, sans classification a priori :
-deux actifs très corrélés finissent dans le même groupe peu importe leur type (Action/Crypto/...).
+Les matrices de corrélation sont lues depuis `data/correlation.json` (séparé de
+dashboard.json depuis la refactorisation pour des raisons de lisibilité).
 """
 from __future__ import annotations
 
@@ -16,7 +14,7 @@ from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from scipy.spatial.distance import squareform
 
 from portfolio.config import BENCHMARK_LABELS, DEFAULT_WINDOW_ORDER, MIN_POSITION_VALUE_EUR, WINDOW_LABELS
-from portfolio.data import filter_small_positions, load_portfolio
+from portfolio.data import filter_small_positions, load_correlations, load_portfolio
 from portfolio.theme import BG_COLOR, GRID_COLOR, PASTEL_DARK_SEQUENCE
 
 
@@ -300,11 +298,16 @@ def _render_clusters(
         st.plotly_chart(fig_bar, use_container_width=True)
 
 
-def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
-    """Corrélations par actif + groupes automatiques, sur les positions `df` et les benchmarks."""
+def render_correlation_section(
+    df: pd.DataFrame, correlation_matrices: dict, total_portfolio_value: float,
+) -> None:
+    """Corrélations par actif + groupes automatiques, sur les positions `df` et les benchmarks.
+
+    `correlation_matrices` est lu depuis correlation.json (séparé de dashboard.json).
+    `total_portfolio_value` vient de dashboard.json (`data["total_value_eur"]`).
+    """
     st.subheader("🔥 Matrice de corrélation")
 
-    correlation_matrices = data.get("correlation_matrices", {})
     selected_window = _select_window(correlation_matrices)
 
     min_value_eur = st.number_input(
@@ -323,7 +326,7 @@ def render_correlation_section(df: pd.DataFrame, data: dict) -> None:
         selected_window,
         eligible_symbols - BENCHMARK_LABELS,  # clustering sur les positions uniquement
         df,
-        data["total_value_eur"],
+        total_portfolio_value,
     )
 
 
@@ -401,6 +404,9 @@ def render_correlation_page() -> None:
         st.info(f"Aucune position d'au moins {MIN_POSITION_VALUE_EUR:.0f} €.")
         st.stop()
 
-    render_correlation_section(df, data)
+    # Les matrices de corrélation sont lues depuis correlation.json (séparé de dashboard.json).
+    correlation_matrices = load_correlations()
+
+    render_correlation_section(df, correlation_matrices, data["total_value_eur"])
     st.divider()
-    render_window_variation(data.get("correlation_matrices", {}))
+    render_window_variation(correlation_matrices)

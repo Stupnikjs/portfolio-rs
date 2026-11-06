@@ -30,7 +30,6 @@ pub struct DashboardData {
     pub trades: Vec<DashboardTrade>,
     pub trade_frequency: TradeFrequency,
     pub assets: Vec<DashboardAsset>,
-    pub correlation_matrices: std::collections::HashMap<String, std::collections::HashMap<String, std::collections::HashMap<String, Option<f64>>>>,
     pub holdings: Vec<HoldingStats>,
     pub closed_sales: Vec<ClosedSale>,
     pub cash: CashSummary,
