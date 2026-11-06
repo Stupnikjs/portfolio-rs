@@ -1,8 +1,14 @@
 """Page Stratégie : analyse du timing des achats/ventes d'un actif face à son cours.
 
-Croise deux sources :
-  - history.json : prix hebdomadaires (un point par snapshot, le dimanche soir).
+Croise trois sources :
+  - cours quotidiens en EUR (yfinance), INDÉPENDANTS de la détention et avec une période
+    d'échauffement avant le 1er trade : MA, σ et pic sont déjà « chauds » à l'entrée.
+  - history.json : prix hebdomadaires, utilisés en REPLI seulement (ils n'existent que pendant
+    la détention : peu fiables autour des premières entrées).
   - dashboard.json -> trades : achats/ventes avec prix exact et timestamp.
+
+Toutes les références (MA, σ, pic) sont CAUSALES : un trade du jour J est comparé à la clôture
+de J-1, sans interpolation vers une observation postérieure au trade.
 
 But : visualiser si tu achètes haut et vends bas (ou l'inverse), et détecter l'overtrading
 (trades trop rapprochés). La moyenne mobile sert de référence de trend : un achat sous la MA
@@ -15,7 +21,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from portfolio.data import load_data, load_portfolio
+from portfolio.data import load_data, load_portfolio, yfinance_ticker_for
 from portfolio.history import PERIODS, load_history
 from portfolio.theme import BG_COLOR, GAIN_COLOR, LOSS_COLOR, PASTEL_DARK_SEQUENCE
 
@@ -25,12 +31,14 @@ BUY_COLOR = GAIN_COLOR                 # vert : achat
 SELL_COLOR = LOSS_COLOR                # rouge : vente
 MARGIN = dict(l=10, r=10, t=30, b=10)
 
-# Fenêtre par défaut de la moyenne mobile (en semaines de snapshot).
+# Fenêtre par défaut de la moyenne mobile (en semaines calendaires).
 DEFAULT_MA_WEEKS = 4  # ~1 mois
 # En dessous de ce seuil (jours moyens entre trades), on alerte sur l'overtrading.
 OVERTRADING_THRESHOLD_DAYS = 7
 # Seuils d'alerte sur le biais de timing (% vs MA).
 TIMING_BIAS_WARN_PCT = 5.0
+# Échauffement ajouté avant le 1er trade (>= plus grande fenêtre des curseurs : 26 semaines).
+WARMUP_WEEKS = 26
 
 
 # --- Extraction des données --------------------------------------------------------
@@ -84,6 +92,80 @@ def asset_trades(data: dict, symbol: str) -> pd.DataFrame:
     return df.sort_values("time").reset_index(drop=True)
 
 
+# --- Cours indépendants de la détention --------------------------------------------
+
+_EMPTY_PRICES = pd.DataFrame(columns=["date", "price_eur"])
+
+
+def _close_series(raw: pd.DataFrame) -> pd.Series:
+    """Colonne Close d'un téléchargement yfinance (MultiIndex ou non), index tz-naïf au jour."""
+    if raw is None or raw.empty or "Close" not in raw:
+        return pd.Series(dtype=float)
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close = close.dropna().astype(float)
+    close.index = pd.DatetimeIndex(close.index).tz_localize(None).normalize()
+    return close[~close.index.duplicated(keep="last")]
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_daily_prices_eur(ticker: str, start: str) -> pd.DataFrame:
+    """Clôtures quotidiennes converties en EUR (colonnes date, price_eur).
+
+    Cours BRUTS (auto_adjust=False) : tes trades sont à des prix réels, pas ajustés des dividendes.
+    Renvoie un DataFrame vide si yfinance est absent, si le ticker est introuvable ou si la
+    conversion en EUR est impossible (le repli sur history.json prend alors le relais).
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return _EMPTY_PRICES.copy()
+    try:
+        close = _close_series(yf.download(ticker, start=start, interval="1d", auto_adjust=False, progress=False))
+        if close.empty:
+            return _EMPTY_PRICES.copy()
+        currency = str(yf.Ticker(ticker).fast_info["currency"])
+        if currency == "GBp":  # pence
+            close, currency = close * 0.01, "GBP"
+        if currency.upper() != "EUR":
+            fx = _close_series(yf.download(f"EUR{currency.upper()}=X", start=start, interval="1d",
+                                           auto_adjust=False, progress=False))
+            if fx.empty:
+                return _EMPTY_PRICES.copy()
+            fx = fx.reindex(close.index.union(fx.index)).ffill().reindex(close.index)
+            close = (close / fx).dropna()
+        close = close[close > 0]
+        return pd.DataFrame({"date": close.index, "price_eur": close.values})
+    except Exception:
+        return _EMPTY_PRICES.copy()
+
+
+def ticker_for_symbol(df_all: pd.DataFrame, symbol: str) -> str | None:
+    """Ticker Yahoo d'un symbole du portefeuille (positions soldées comprises), sinon None."""
+    rows = df_all[df_all["symbol"] == symbol]
+    return None if rows.empty else yfinance_ticker_for(rows.iloc[0])
+
+
+def full_price_series(
+    history: pd.DataFrame | None, symbol: str, ticker: str | None, trades: pd.DataFrame,
+    warmup_weeks: int = WARMUP_WEEKS,
+) -> tuple[pd.DataFrame, str]:
+    """(cours, source) avec source = "daily" (cours complets) ou "held_only" (repli history.json)."""
+    held = asset_price_series(history, symbol)
+    firsts = []
+    if not trades.empty:
+        firsts.append(trades["time_naive"].min())
+    if not held.empty:
+        firsts.append(held["date"].min())
+    if ticker and firsts:
+        start = (min(firsts) - pd.Timedelta(weeks=warmup_weeks)).strftime("%Y-%m-%d")
+        daily = fetch_daily_prices_eur(ticker, start)
+        if len(daily) >= 10:
+            return daily, "daily"
+    return held, "held_only"
+
+
 def eligible_symbols(history: pd.DataFrame | None, data: dict) -> list[str]:
     """Symboles ayant soit des trades soit un historique de prix : candidats pour la page."""
     symbols: set[str] = set()
@@ -105,32 +187,48 @@ def eligible_symbols(history: pd.DataFrame | None, data: dict) -> list[str]:
 
 # --- Analyse du timing --------------------------------------------------------
 
+def _window(weeks: int) -> str:
+    """Fenêtre temporelle pandas en semaines calendaires (valable pour du quotidien comme de l'hebdo)."""
+    return f"{7 * weeks}D"
+
+
 def rolling_average(prices: pd.DataFrame, window: int = DEFAULT_MA_WEEKS) -> pd.Series:
-    """Moyenne mobile sur `window` snapshots hebdomadaires. Index = dates des prix."""
+    """Moyenne mobile sur `window` semaines calendaires. Index = dates des prix."""
     if prices.empty or window < 1:
         return pd.Series(dtype=float)
-    return prices.set_index("date")["price_eur"].rolling(window=window, min_periods=1).mean()
+    s = prices.set_index("date")["price_eur"].astype(float)
+    return s.rolling(_window(window), min_periods=min(3, window)).mean()
+
+
+def value_before(series: pd.Series, times) -> pd.Series:
+    """Dernière valeur de `series` datée STRICTEMENT avant le jour de chaque instant de `times`.
+
+    Pas d'interpolation : interpoler entre deux observations ferait entrer dans la référence le
+    cours d'APRÈS le trade (biais d'anticipation). Un trade du jour J est comparé à la clôture de J-1.
+    NaN si aucune observation ne précède le trade ou si la valeur n'est pas encore définie.
+    Résultat indexé comme `times`.
+    """
+    times = pd.DatetimeIndex(times)
+    series = series.sort_index()
+    if series.empty or len(times) == 0:
+        return pd.Series(np.nan, index=times)
+    obs = series.index.values.astype("datetime64[ns]")
+    days = times.normalize().values.astype("datetime64[ns]")
+    pos = np.searchsorted(obs, days, side="left") - 1
+    vals = series.to_numpy(dtype=float)
+    out = np.where(pos >= 0, vals[np.clip(pos, 0, None)], np.nan)
+    return pd.Series(out, index=times)
 
 
 def ma_at_trades(ma: pd.Series, trades: pd.DataFrame) -> pd.Series:
-    """Pour chaque trade, la valeur interpolée de la MA au moment exact du trade.
+    """Pour chaque trade, la MA à la clôture précédente (causale, sans interpolation).
 
-    La MA est calculée sur des dates de snapshots (dimanches). Les trades arrivent n'importe
-    quel jour : on interpole linéairement pour obtenir la valeur de la MA au moment du trade.
-    Avant le 1er snapshot : clamp à la 1re valeur de MA.
+    Indexé comme `trades`. NaN avant la première valeur de MA.
     """
     if ma.empty or trades.empty:
         return pd.Series(dtype=float)
-    ma = ma.dropna()
-    if ma.empty:
-        return pd.Series([np.nan] * len(trades), index=trades.index)
-
-    # np.interp veut des coordonnées numériques : on convertit les dates en nanosecondes.
-    ma_x = ma.index.asi8
-    ma_y = ma.values
-    trade_x = pd.DatetimeIndex(trades["time_naive"]).asi8
-    interpolated = np.interp(trade_x, ma_x, ma_y)
-    return pd.Series(interpolated, index=trades.index)
+    ref = value_before(ma, trades["time_naive"])
+    return pd.Series(ref.values, index=trades.index)
 
 
 def timing_analysis(trades: pd.DataFrame, prices: pd.DataFrame, ma_window: int = DEFAULT_MA_WEEKS) -> dict:
@@ -222,6 +320,96 @@ def net_flow(trades: pd.DataFrame) -> dict:
     bought = float(trades.loc[trades["kind"] == "Buy", "value_eur"].sum())
     sold = float(trades.loc[trades["kind"] == "Sell", "value_eur"].sum())
     return {"bought": bought, "sold": sold, "net": bought - sold}
+
+
+# --- Volatilité et suffisance du repli -------------------------------------------
+
+# Fenêtre par défaut pour le pic récent et la volatilité (en semaines calendaires).
+DEFAULT_DIP_WINDOW = 8  # ~2 mois
+# Seuils du score de suffisance (|drawdown| / (σ × √n), voir dip_indicators).
+DIP_SCORE_DEEP = 2.0       # >= 2σ : repli très profond
+DIP_SCORE_SIGNIFICANT = 1.0  # >= 1σ : repli significatif
+DIP_SCORE_MODERATE = 0.5    # >= 0.5σ : repli modéré
+# En dessous de 0.5σ : superficiel (trop tôt).
+
+
+def dip_indicators(prices: pd.DataFrame, window_weeks: int = DEFAULT_DIP_WINDOW) -> pd.DataFrame:
+    """Par date : drawdown depuis le pic de la fenêtre, σ par pas, pas écoulés depuis le pic, score.
+
+    Score = |drawdown| / (σ × √n), n = nombre d'observations écoulées depuis le pic.
+    Après n pas, l'amplitude « normale » d'une baisse croît en √n : comparer un drawdown de
+    plusieurs semaines à σ d'un seul pas gonflait le score. Au sommet (n = 0) le score vaut 0.
+    σ = écart-type des rendements d'un pas (jour avec des cours quotidiens, semaine en repli).
+    """
+    cols = ["drawdown_pct", "volatility_pct", "bars_since_peak", "dip_score"]
+    if prices.empty:
+        return pd.DataFrame(columns=cols, dtype=float)
+    s = prices.set_index("date")["price_eur"].astype(float)
+    win = _window(window_weeks)
+    peak = s.rolling(win, min_periods=1).max()
+    # a[::-1].argmax() = nombre d'observations depuis le DERNIER maximum de la fenêtre.
+    bars = s.rolling(win, min_periods=1).apply(lambda a: float(np.argmax(a[::-1])), raw=True)
+    vol = s.pct_change().rolling(win, min_periods=5).std() * 100
+    dd = (s / peak - 1) * 100
+    score = (dd.abs() / (vol * np.sqrt(bars))).where((bars > 0) & (vol > 0))
+    score = score.mask((bars == 0) & (vol > 0), 0.0)
+    return pd.DataFrame({"drawdown_pct": dd, "volatility_pct": vol, "bars_since_peak": bars, "dip_score": score})
+
+
+def dip_sufficiency_analysis(
+    buys: pd.DataFrame, prices: pd.DataFrame, window: int = DEFAULT_DIP_WINDOW,
+) -> pd.DataFrame:
+    """Pour chaque achat : drawdown depuis pic récent, volatilité, et score de suffisance.
+
+    Les indicateurs sont ceux de la clôture PRÉCÉDENTE (causal). Score (voir `dip_indicators`) :
+      >= 2.0 : repli très profond ; 1.0–2.0 : significatif ; 0.5–1.0 : modéré ;
+      < 0.5 : superficiel ; achat alors que la veille était un sommet de fenêtre : « Au sommet ».
+
+    Colonnes ajoutées : price, drawdown_pct, volatility_pct, dip_score, dip_verdict.
+    """
+    nan_cols = dict(price=np.nan, drawdown_pct=np.nan, volatility_pct=np.nan, dip_score=np.nan, dip_verdict="—")
+    if buys.empty or len(prices) < 6:
+        return buys.assign(**nan_cols)
+
+    ind = dip_indicators(prices, window)
+    buy_times = pd.DatetimeIndex(buys["time_naive"])
+
+    result = buys.copy()
+    # Alias `price` = `unit_price_eur` : cohérence avec buy_progression_analysis et les figures.
+    result["price"] = result["unit_price_eur"]
+    for col in ("drawdown_pct", "volatility_pct", "dip_score"):
+        result[col] = value_before(ind[col], buy_times).values
+
+    def _verdict(score: float, drawdown: float) -> str:
+        if pd.isna(score):
+            return "—"
+        if score >= DIP_SCORE_DEEP:
+            return "Très profond"
+        if score >= DIP_SCORE_SIGNIFICANT:
+            return "Significatif"
+        if score >= DIP_SCORE_MODERATE:
+            return "Modéré"
+        return "Au sommet" if drawdown == 0 else "Superficiel"
+
+    result["dip_verdict"] = [_verdict(sc, dd) for sc, dd in zip(result["dip_score"], result["drawdown_pct"])]
+    return result
+
+
+def dip_sufficiency_summary(dip_df: pd.DataFrame) -> dict:
+    """Résumé de la suffisance des replis sur tous les achats."""
+    out = {
+        "avg_volatility_pct": None, "avg_drawdown_pct": None,
+        "avg_dip_score": None, "pct_sufficient": None, "n_sufficient": 0,
+    }
+    valid = dip_df["dip_score"].dropna()
+    if valid.empty:
+        return out
+    out["avg_volatility_pct"] = float(dip_df["volatility_pct"].dropna().mean())
+    out["avg_drawdown_pct"] = float(dip_df["drawdown_pct"].dropna().mean())
+    out["avg_dip_score"] = float(valid.mean())
+    out["n_sufficient"] = int((valid >= DIP_SCORE_SIGNIFICANT).sum())
+    out["pct_sufficient"] = out["n_sufficient"] / len(valid) * 100
+    return out
 
 
 # --- Analyse progression (renforcement sur repli / vente par palier) ---------------
@@ -352,9 +540,8 @@ def strategy_figure(prices: pd.DataFrame, trades: pd.DataFrame, ma: pd.Series | 
     if not prices.empty:
         fig.add_trace(go.Scatter(
             x=prices["date"], y=prices["price_eur"],
-            name="Cours", mode="lines+markers",
+            name="Cours", mode="lines",
             line=dict(color=LINE_COLOR, width=2),
-            marker=dict(size=4),
             hovertemplate="%{x|%d/%m/%Y} : %{y:.2f} €<extra>Cours</extra>",
         ))
 
@@ -549,6 +736,83 @@ def sell_progression_figure(prog: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def volatility_figure(prices: pd.DataFrame, dip_df: pd.DataFrame, ma_window: int) -> go.Figure:
+    """Bandes de Bollinger (MA ± 2σ des cours) + achats colorés par suffisance du repli.
+
+    La bande est centrée sur la MA et mesurée sur les COURS ; la couleur des achats vient du
+    score de repli (drawdown depuis le pic récent, normalisé en σ √n). Ce sont deux références
+    distinctes : un achat sous la bande n'a pas forcément un score ≈ 2.
+    Couleurs : vert foncé = très profond, vert = significatif, orange = modéré,
+    rouge = superficiel ou au sommet.
+    """
+    fig = go.Figure()
+
+    if prices.empty:
+        return fig
+
+    s = prices.set_index("date")["price_eur"].astype(float)
+    roll = s.rolling(_window(ma_window), min_periods=min(3, ma_window))
+    ma, sd = roll.mean(), roll.std()
+    upper, lower = ma + 2 * sd, ma - 2 * sd
+
+    fig.add_trace(go.Scatter(
+        x=upper.index, y=upper.values,
+        name="MA + 2σ", mode="lines",
+        line=dict(color="#444", width=0),
+        hovertemplate="%{x|%d/%m/%Y} : %{y:.2f} €<extra>MA + 2σ</extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=lower.index, y=lower.values,
+        name="MA − 2σ", mode="lines",
+        line=dict(color="#444", width=0),
+        fill="tonexty", fillcolor="rgba(100,100,100,0.12)",
+        hovertemplate="%{x|%d/%m/%Y} : %{y:.2f} €<extra>MA − 2σ</extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=ma.index, y=ma.values,
+        name="MA", mode="lines",
+        line=dict(color=MA_COLOR, width=1.5, dash="dash"),
+        hovertemplate="%{x|%d/%m/%Y} : %{y:.2f} €<extra>MA</extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=prices["date"], y=prices["price_eur"],
+        name="Cours", mode="lines",
+        line=dict(color=LINE_COLOR, width=2),
+        hovertemplate="%{x|%d/%m/%Y} : %{y:.2f} €<extra>Cours</extra>",
+    ))
+
+    if not dip_df.empty:
+        verdict_colors = {
+            "Très profond": "#1a7a4b",   # vert foncé
+            "Significatif": GAIN_COLOR,   # vert
+            "Modéré": "#F5B942",          # orange
+            "Superficiel": LOSS_COLOR,    # rouge
+            "Au sommet": LOSS_COLOR,      # rouge : aucun repli
+            "—": "#888",
+        }
+        colors = [verdict_colors.get(v, "#888") for v in dip_df["dip_verdict"]]
+        fig.add_trace(go.Scatter(
+            x=dip_df["time_naive"], y=dip_df["price"],
+            name="Achats", mode="markers",
+            marker=dict(symbol="triangle-up", size=13, color=colors,
+                        line=dict(width=1, color=BG_COLOR)),
+            customdata=dip_df[["drawdown_pct", "volatility_pct", "dip_score", "dip_verdict"]].values,
+            hovertemplate=(
+                "Achat %{x|%d/%m/%Y}<br>Prix : %{y:.2f} €<br>"
+                "Drawdown : %{customdata[0]:+.1f}%<br>"
+                "σ : %{customdata[1]:.1f}%<br>"
+                "Score : %{customdata[2]:.2f} (%{customdata[3]})<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        height=420, hovermode="x unified", margin=MARGIN,
+        yaxis=dict(ticksuffix=" €"),
+        legend=dict(orientation="h", y=1.08, x=0),
+    )
+    return fig
+
+
 # --- Rendu --------------------------------------------------------------------------
 
 def render_strategy_page() -> None:
@@ -574,16 +838,24 @@ def render_strategy_page() -> None:
 
     # --- Choix ---
     with st.container(border=True):
-        c1, c2, c3 = st.columns([3, 2, 2])
+        c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
         symbol = c1.selectbox("Actif", symbols, help="Tous les actifs ayant des trades ou un historique de prix.")
         period = c2.radio("Période", list(PERIODS), index=len(PERIODS) - 1, horizontal=True)
         ma_window = c3.slider(
-            "Moyenne mobile (semaines)", min_value=1, max_value=12, value=DEFAULT_MA_WEEKS,
-            help="Fenêtre de la moyenne mobile sur les snapshots hebdomadaires."
+            "MA (semaines)", min_value=1, max_value=12, value=DEFAULT_MA_WEEKS,
+            help="Fenêtre de la moyenne mobile, en semaines calendaires."
+        )
+        dip_window = c4.slider(
+            "Volatilité / pic (semaines)", min_value=4, max_value=26, value=DEFAULT_DIP_WINDOW,
+            help="Fenêtre pour le calcul de la volatilité (σ) et du drawdown depuis pic récent.",
         )
 
-    prices = asset_price_series(history, symbol)
-    all_trades = asset_trades(data, symbol)  # non filtré : l'analyse progression part du 1er achat/vente
+    # Trades non filtrés : l'analyse progression part du 1er achat/vente réel.
+    all_trades = asset_trades(data, symbol)
+    # Cours complets (échauffement inclus). Les indicateurs sont TOUJOURS calculés sur toute la série,
+    # puis seulement affichés sur la période choisie : changer de période ne change pas les verdicts.
+    prices_full, price_source = full_price_series(history, symbol, ticker_for_symbol(df_all, symbol), all_trades)
+    prices = prices_full.copy()  # copie d'AFFICHAGE : filtrée par période juste après
 
     if prices.empty and all_trades.empty:
         st.info(f"Aucune donnée pour {symbol}.")
@@ -593,6 +865,7 @@ def render_strategy_page() -> None:
     # L'analyse progression utilise `all_trades` (non filtré) pour partir du 1er achat/vente réel.
     trades = all_trades
     days = PERIODS[period]
+    cutoff_naive = None
     if days is not None:
         cutoff_naive = pd.Timestamp.now() - pd.Timedelta(days=days)
         if not trades.empty:
@@ -610,8 +883,16 @@ def render_strategy_page() -> None:
             "L'analyse de timing (vs moyenne mobile) est désactivée ; seuls les trades sont affichés."
         )
 
+    if price_source == "held_only" and not prices_full.empty:
+        st.warning(
+            "Cours quotidiens indisponibles (yfinance absent, ticker introuvable ou conversion en EUR "
+            "impossible) : repli sur history.json, qui ne contient les cours que PENDANT la détention. "
+            "MA, σ et drawdown sont peu fiables autour de tes premières entrées."
+        )
+
     # --- KPIs ---
-    timing = timing_analysis(trades, prices, ma_window)
+    # Référence calculée sur la série COMPLÈTE (échauffement), pas sur la fenêtre affichée.
+    timing = timing_analysis(trades, prices_full, ma_window)
     freq = trade_frequency_stats(trades)
     flow = net_flow(trades)
 
@@ -653,7 +934,9 @@ def render_strategy_page() -> None:
                   help="Total acheté - total vendu. Positif = tu as plus investi que retiré.")
 
     # --- Graphique principal ---
-    ma = rolling_average(prices, ma_window) if not prices.empty else None
+    ma = rolling_average(prices_full, ma_window) if not prices_full.empty else None
+    if ma is not None and cutoff_naive is not None:
+        ma = ma[ma.index >= cutoff_naive]  # affichage seulement : la MA a été calculée sur toute la série
     st.plotly_chart(strategy_figure(prices, trades, ma), use_container_width=True)
     st.caption(
         "Triangles verts (↑) = achats, triangles rouges (↓) = ventes, positionnés au prix exact du trade. "
@@ -702,6 +985,102 @@ def render_strategy_page() -> None:
             f"Pas de biais de timing détecté : {buy_timing_pct:.0f} % d'achats sous MA, "
             f"{sell_timing_pct:.0f} % de ventes au-dessus. Continue comme ça."
         )
+
+    # --- Volatilité et suffisance du repli ---
+    # Utilise `prices_full` (non filtré par période) et `all_trades` pour calculer la volatilité
+    # et le drawdown depuis le pic récent sur toute la vie de l'actif.
+    all_buys = all_trades[all_trades["kind"] == "Buy"].sort_values("time_naive").reset_index(drop=True) if not all_trades.empty else pd.DataFrame()
+    if not all_buys.empty and len(prices_full) >= 6:
+        dip_df = dip_sufficiency_analysis(all_buys, prices_full, dip_window)
+        step = "quotidien" if price_source == "daily" else "hebdomadaire"
+        step_unit = "jours" if price_source == "daily" else "semaines"
+        dip_sum = dip_sufficiency_summary(dip_df)
+
+        if dip_sum["avg_dip_score"] is not None:
+            st.subheader("📉 Volatilité et suffisance du repli")
+            st.caption(
+                f"σ {step} sur {dip_window} semaines. Score de suffisance = |drawdown depuis le pic| / "
+                f"(σ × √n), n = {step_unit} écoulés depuis le pic (une baisse « normale » croît en √n). "
+                f"≥ {DIP_SCORE_DEEP} = très profond, ≥ {DIP_SCORE_SIGNIFICANT} = significatif, "
+                f"≥ {DIP_SCORE_MODERATE} = modéré, < {DIP_SCORE_MODERATE} = superficiel ; « au sommet » = "
+                f"la veille était un plus haut de la fenêtre. Références prises à la clôture précédente."
+            )
+
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric(
+                f"Volatilité {step} (σ)",
+                f"{dip_sum['avg_volatility_pct']:.1f} %",
+                help="Écart-type moyen des rendements d'un pas (jour ou semaine) : le bruit normal de l'actif.",
+            )
+            d2.metric(
+                "Drawdown moyen au moment de l'achat",
+                f"{dip_sum['avg_drawdown_pct']:+.1f} %",
+                help="Baisse moyenne du prix depuis son pic récent quand tu as acheté. "
+                     "Négatif = tu as acheté sous le récent sommet.",
+            )
+            d3.metric(
+                "Score de suffisance moyen",
+                f"{dip_sum['avg_dip_score']:.2f}",
+                help=f"|Drawdown| / (σ × √n). ≥ {DIP_SCORE_SIGNIFICANT} = le repli était significatif "
+                     f"relativement à la volatilité de l'actif sur la durée écoulée depuis le pic.",
+            )
+            d4.metric(
+                "Achats avec repli suffisant",
+                f"{dip_sum['pct_sufficient']:.0f} %",
+                delta=f"{dip_sum['n_sufficient']}/{len(dip_df['dip_score'].dropna())}",
+                delta_color="off",
+                help=f"Part des achats avec score ≥ {DIP_SCORE_SIGNIFICANT}. Un achat au sommet compte comme insuffisant.",
+            )
+
+            # Graphique Bollinger + achats colorés
+            st.plotly_chart(
+                volatility_figure(prices_full, dip_df, ma_window),
+                use_container_width=True,
+            )
+            st.caption(
+                "Bande grise = MA ± 2σ des cours (Bollinger), indépendante du score. Couleurs des "
+                "triangles (score de repli depuis le pic) : 🟩 très profond, 🟢 significatif, "
+                "🟧 modéré, 🟥 superficiel ou au sommet."
+            )
+
+            # Verdict global
+            if dip_sum["pct_sufficient"] >= 60:
+                st.success(
+                    f"{dip_sum['pct_sufficient']:.0f} % de tes achats ont un repli suffisant "
+                    f"(≥ 1σ) : tu attends bien des dips significatifs avant de renforcer."
+                )
+            elif dip_sum["pct_sufficient"] < 40:
+                st.warning(
+                    f"Seulement {dip_sum['pct_sufficient']:.0f} % de tes achats ont un repli suffisant : "
+                    f"tu achètes souvent sur des replis superficiels (score < 1). Envisage d'attendre un "
+                    f"repli plus net depuis le pic récent avant de renforcer."
+                )
+
+            # Tableau détaillé
+            dp_view = dip_df[["time_naive", "price", "drawdown_pct", "volatility_pct", "dip_score", "dip_verdict"]].copy()
+            dp_view["time_naive"] = pd.to_datetime(dp_view["time_naive"])
+            st.dataframe(
+                dp_view.rename(columns={
+                    "time_naive": "Date", "price": "Prix (€)",
+                    "drawdown_pct": "Drawdown (%)", "volatility_pct": "σ (%)",
+                    "dip_score": "Score", "dip_verdict": "Verdict",
+                }),
+                hide_index=True, use_container_width=True,
+                column_config={
+                    "Date": st.column_config.DatetimeColumn("Date", format="DD/MM/YYYY"),
+                    "Prix (€)": st.column_config.NumberColumn("Prix", format="%.2f €"),
+                    "Drawdown (%)": st.column_config.NumberColumn(
+                        "Drawdown", format="%+.1f %%",
+                        help="Baisse depuis le pic des dernières semaines. Négatif = sous le sommet récent."),
+                    "σ (%)": st.column_config.NumberColumn(
+                        "σ", format="%.1f %%",
+                        help="Volatilité d'un pas (jour ou semaine) : le bruit normal de l'actif."),
+                    "Score": st.column_config.NumberColumn(
+                        "Score", format="%.2f",
+                        help="|Drawdown| / (σ × √n). ≥ 2 = très profond, ≥ 1 = significatif, < 0.5 = superficiel."),
+                    "Verdict": "Verdict",
+                },
+            )
 
     # --- Renforcement sur repli (achats) ---
     # Utilise `all_trades` (non filtré par période) pour partir du tout 1er achat de l'actif.
